@@ -1771,7 +1771,7 @@ mod tests {
     fn filter_removes_keywords_and_redacts_sensitive_text() {
         let audit = Arc::new(Mutex::new(GuardAudit::default()));
         let text = filter_text(
-            "公益 通知群:129129929 mail a@test.com https://x.test 手机 13800138000",
+            "公益 通知群:100000000 mail user@example.test https://x.test 手机 13000000000",
             &config(),
             &audit,
         );
@@ -1862,12 +1862,12 @@ mod tests {
             mode: GuardProxyMode::FilterAndFail,
             ..config()
         };
-        let payload = r#"{"output_text":"公益token2通知群104138863 希望人人token自由"}"#.as_bytes();
+        let payload = r#"{"output_text":"公益token2通知群100000000 希望人人token自由"}"#.as_bytes();
 
         let guarded = guard_json_payload(payload, &config, &audit);
         assert_eq!(guarded.status_override, None);
         let text = String::from_utf8(guarded.payload).unwrap();
-        assert!(!text.contains("104138863"));
+        assert!(!text.contains("100000000"));
         assert!(!text.contains("token自由"));
         assert!(text.contains("本地保护层"));
         assert!(audit

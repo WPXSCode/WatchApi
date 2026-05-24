@@ -2831,8 +2831,8 @@ mod tests {
 
     #[test]
     fn portable_path_strips_windows_verbatim_prefix() {
-        let base = PathBuf::from(r"C:\Users\WPX\Downloads");
-        let path = PathBuf::from(r"\\?\C:\Users\WPX\Downloads\keys.txt");
+        let base = PathBuf::from(r"C:\Users\ExampleUser\Downloads");
+        let path = PathBuf::from(r"\\?\C:\Users\ExampleUser\Downloads\keys.txt");
         let unc_path = PathBuf::from(r"\\?\UNC\server\share\keys.txt");
 
         assert_eq!(portable_path(&base, &path), PathBuf::from("keys.txt"));

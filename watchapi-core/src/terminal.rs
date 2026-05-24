@@ -1152,7 +1152,7 @@ mod tests {
     #[test]
     fn wraps_windows_cmd_shim_for_pty_spawn() {
         let (program, args) = adapt_windows_wrapper(
-            r"C:\Users\WPX\AppData\Roaming\npm\some-tool.cmd".to_string(),
+            r"C:\Users\ExampleUser\AppData\Roaming\npm\some-tool.cmd".to_string(),
             vec!["--no-alt-screen".to_string()],
         );
 
@@ -1163,12 +1163,15 @@ mod tests {
                 vec![
                     "/d".to_string(),
                     "/c".to_string(),
-                    r"C:\Users\WPX\AppData\Roaming\npm\some-tool.cmd".to_string(),
+                    r"C:\Users\ExampleUser\AppData\Roaming\npm\some-tool.cmd".to_string(),
                     "--no-alt-screen".to_string()
                 ]
             );
         } else {
-            assert_eq!(program, r"C:\Users\WPX\AppData\Roaming\npm\some-tool.cmd");
+            assert_eq!(
+                program,
+                r"C:\Users\ExampleUser\AppData\Roaming\npm\some-tool.cmd"
+            );
             assert_eq!(args, vec!["--no-alt-screen".to_string()]);
         }
     }

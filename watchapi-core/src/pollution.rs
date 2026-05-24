@@ -1975,7 +1975,7 @@ mod tests {
     #[test]
     fn detects_free_token_contact_id_advertising_variants() {
         for text in [
-            "公益token2通知群104138863 希望人人token自由",
+            "公益token2通知群100000000 希望人人token自由",
             "公\u{200b}益 t0k3n 通-知-群 １０４１３８８６３",
             "free api t0ken join QQ group 104 138 863",
         ] {

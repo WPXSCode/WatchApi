@@ -9870,6 +9870,7 @@ fn paint_terminal_view(
         paint_terminal_text_runs(
             ui,
             render_row,
+            visible_cols,
             origin.x,
             y,
             char_width,
@@ -10059,6 +10060,7 @@ fn paint_terminal_selection_runs(
 fn paint_terminal_text_runs(
     ui: &egui::Ui,
     row: &mut TerminalRenderRow,
+    visible_cols: usize,
     origin_x: f32,
     y: f32,
     char_width: f32,
@@ -10087,6 +10089,7 @@ fn paint_terminal_text_runs(
                     glyph.width_cells,
                     char_width,
                     line_height,
+                    run.start + glyph.cell_offset + glyph.width_cells >= visible_cols,
                 );
                 ui.painter()
                     .with_clip_rect(clip_rect)
@@ -10096,8 +10099,13 @@ fn paint_terminal_text_runs(
             let galley = terminal_text_run_galley(ui, run, font_id);
             let cell_pos = egui::pos2(origin_x + run.start as f32 * char_width, y);
             let text_pos = cell_pos + vec2(0.0, text_y_offset);
-            let clip_rect =
-                terminal_text_run_clip_rect(cell_pos, run.width_cells, char_width, line_height);
+            let clip_rect = terminal_text_run_clip_rect(
+                cell_pos,
+                run.width_cells,
+                char_width,
+                line_height,
+                run.start + run.width_cells >= visible_cols,
+            );
             ui.painter()
                 .with_clip_rect(clip_rect)
                 .galley(text_pos, galley, run.color);
@@ -10130,9 +10138,14 @@ fn terminal_text_run_clip_rect(
     width_cells: usize,
     char_width: f32,
     line_height: f32,
+    is_line_end: bool,
 ) -> Rect {
     let width = width_cells as f32 * char_width;
-    let glyph_bleed_x = (char_width * 0.35).clamp(1.0, 3.0);
+    let glyph_bleed_x = if is_line_end {
+        char_width
+    } else {
+        (char_width * 0.35).clamp(1.0, 3.0)
+    };
     let glyph_bleed_y = (line_height * 0.15).clamp(1.0, 3.0);
     Rect::from_min_max(
         egui::pos2(text_pos.x, text_pos.y - glyph_bleed_y),
@@ -13241,12 +13254,12 @@ const GLOBAL_AGENT_FIELDS: &[GlobalFieldSpec] = &[
     GlobalFieldSpec {
         key: "codex_config_path",
         label: "Codex 配置",
-        hint: "Codex config.toml 路径。",
+        hint: "Codex config.toml 路径；留空则使用 Codex Home 下的 config.toml。",
     },
     GlobalFieldSpec {
         key: "codex_auth_path",
         label: "Codex Key",
-        hint: "Codex auth.json 路径。",
+        hint: "Codex auth.json 路径；留空则使用 Codex Home 下的 auth.json。",
     },
     GlobalFieldSpec {
         key: "codex_home",
@@ -13669,8 +13682,8 @@ fn default_config_data() -> Value {
         "agent_driver": "codex",
         "agent_command": default_agent_command_for_driver("codex").unwrap_or_else(|| vec!["codex".to_string()]),
         "agent_home": "",
-        "codex_config_path": home_dir().join(".codex").join("config.toml").to_string_lossy(),
-        "codex_auth_path": home_dir().join(".codex").join("auth.json").to_string_lossy(),
+        "codex_config_path": "",
+        "codex_auth_path": "",
         "codex_home": home_dir().join(".codex").to_string_lossy(),
         "session_state_path": ".watchapi-state.json",
         "restore_sessions": true,
@@ -15267,6 +15280,17 @@ mod tests {
         let mut provider = blank_provider();
         provider["name"] = json!(name);
         provider
+    }
+
+    #[test]
+    fn default_config_leaves_codex_files_derived_from_codex_home() {
+        let config = default_config_data();
+
+        assert_eq!(config["codex_config_path"], json!(""));
+        assert_eq!(config["codex_auth_path"], json!(""));
+        assert!(config["codex_home"]
+            .as_str()
+            .is_some_and(|path| !path.is_empty()));
     }
 
     fn write_config_refs(path: &Path, refs: &[&str]) {
@@ -19331,12 +19355,22 @@ mod tests {
     #[test]
     fn terminal_text_run_clip_allows_small_glyph_bleed() {
         let pos = egui::pos2(10.0, 20.0);
-        let clip = terminal_text_run_clip_rect(pos, 4, 8.0, 16.0);
+        let clip = terminal_text_run_clip_rect(pos, 4, 8.0, 16.0, false);
 
         assert_eq!(clip.left(), pos.x);
         assert!(clip.right() > pos.x + 32.0);
         assert!(clip.top() < pos.y);
         assert!(clip.bottom() > pos.y + 16.0);
+    }
+
+    #[test]
+    fn terminal_line_end_clip_allows_extra_right_glyph_bleed() {
+        let pos = egui::pos2(10.0, 20.0);
+        let middle_clip = terminal_text_run_clip_rect(pos, 1, 8.0, 16.0, false);
+        let line_end_clip = terminal_text_run_clip_rect(pos, 1, 8.0, 16.0, true);
+
+        assert!(line_end_clip.right() >= pos.x + 16.0);
+        assert!(line_end_clip.right() > middle_clip.right());
     }
 
     #[test]
@@ -21167,7 +21201,7 @@ mod tests {
 
     #[test]
     fn editor_save_syncs_workspace_and_generated_agent_id() {
-        let workspace = PathBuf::from(r"D:\Works\SelfWorks\WatchApi");
+        let workspace = PathBuf::from(r"D:\Workspaces\ExampleProject");
         let mut editor_json = default_config_data();
         editor_json["config_name"] = json!("主 配置/一");
         editor_json["agent_driver"] = json!("claude-code");
@@ -21415,8 +21449,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn session_key_normalizes_windows_verbatim_prefix() {
-        let plain = PathBuf::from(r"C:\Users\WPX\config.json");
-        let prefixed = PathBuf::from(r"\\?\C:\Users\WPX\config.json");
+        let plain = PathBuf::from(r"C:\Users\ExampleUser\config.json");
+        let prefixed = PathBuf::from(r"\\?\C:\Users\ExampleUser\config.json");
 
         assert_eq!(
             session_key_for_path(&plain),

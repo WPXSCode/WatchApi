@@ -1328,8 +1328,8 @@ mod tests {
 
     #[test]
     fn normalize_config_path_strips_windows_verbatim_prefix_for_display() {
-        let plain = PathBuf::from(r"C:\Users\WPX\Desktop\TEST\config.json");
-        let prefixed = PathBuf::from(r"\\?\C:\Users\WPX\Desktop\TEST\config.json");
+        let plain = PathBuf::from(r"C:\Users\ExampleUser\Desktop\TEST\config.json");
+        let prefixed = PathBuf::from(r"\\?\C:\Users\ExampleUser\Desktop\TEST\config.json");
         let unc_prefixed = PathBuf::from(r"\\?\UNC\server\share\config.json");
 
         #[cfg(windows)]

@@ -313,6 +313,11 @@ impl AppConfig {
         let agent_command = parse_agent_command(command_value, &driver)?;
 
         let home = home_dir();
+        let codex_home = optional_path(raw.codex_home).unwrap_or_else(|| home.join(".codex"));
+        let codex_config_path =
+            optional_path(raw.codex_config_path).unwrap_or_else(|| codex_home.join("config.toml"));
+        let codex_auth_path =
+            optional_path(raw.codex_auth_path).unwrap_or_else(|| codex_home.join("auth.json"));
         Ok(Self {
             agent_id: raw
                 .agent_id
@@ -386,22 +391,10 @@ impl AppConfig {
             )?,
             agent_driver: driver,
             agent_command,
-            agent_home: raw.agent_home.as_deref().map(expand_path),
-            codex_config_path: raw
-                .codex_config_path
-                .as_deref()
-                .map(expand_path)
-                .unwrap_or_else(|| home.join(".codex").join("config.toml")),
-            codex_auth_path: raw
-                .codex_auth_path
-                .as_deref()
-                .map(expand_path)
-                .unwrap_or_else(|| home.join(".codex").join("auth.json")),
-            codex_home: raw
-                .codex_home
-                .as_deref()
-                .map(expand_path)
-                .unwrap_or_else(|| home.join(".codex")),
+            agent_home: optional_path(raw.agent_home),
+            codex_config_path,
+            codex_auth_path,
+            codex_home,
             session_state_path: raw
                 .session_state_path
                 .as_deref()
@@ -724,6 +717,12 @@ fn non_empty_or_default(value: Option<String>, default: &str) -> String {
     value
         .and_then(trim_non_empty)
         .unwrap_or_else(|| default.to_string())
+}
+
+fn optional_path(value: Option<String>) -> Option<PathBuf> {
+    value
+        .and_then(trim_non_empty)
+        .map(|value| expand_path(&value))
 }
 
 fn positive_float(value: Option<f64>, default: f64, key: &str) -> Result<f64, ConfigError> {
@@ -1098,6 +1097,29 @@ mod tests {
             3
         );
         assert_eq!(config.endpoints[0].guard_proxy.max_tokens, Some(-1));
+    }
+
+    #[test]
+    fn codex_config_and_auth_default_to_codex_home_when_blank() {
+        let text = sample_config().replace(
+            r#""agent_command": ["codex", "--no-alt-screen"],"#,
+            r#""agent_command": ["codex", "--no-alt-screen"],
+            "codex_home": "D:/CodexHome",
+            "codex_config_path": "",
+            "codex_auth_path": "","#,
+        );
+
+        let config = AppConfig::from_json_str(&text).unwrap();
+
+        assert_eq!(config.codex_home, PathBuf::from("D:/CodexHome"));
+        assert_eq!(
+            config.codex_config_path,
+            PathBuf::from("D:/CodexHome").join("config.toml")
+        );
+        assert_eq!(
+            config.codex_auth_path,
+            PathBuf::from("D:/CodexHome").join("auth.json")
+        );
     }
 
     #[test]
