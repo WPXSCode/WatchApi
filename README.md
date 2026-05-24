@@ -1,7 +1,9 @@
 # WatchApi Rust
 
-WatchApi Rust 是一个面向 Codex、Claude Code、OpenCode 等 Agent 的接口管理和自动续航工具。
+WatchApi Rust 是一个当前主要面向 Codex 的接口管理和自动续航工具。
 它可以统一管理多个 OpenAI 兼容接口，自动探测可用性、按权重选择线路、处理冷却/限流，并在 Agent 中断或无进展时按配置继续任务。
+
+> 兼容性说明：作者目前只使用 Codex 做过完整测试；Claude Code、OpenCode 等其它 Agent 的适配仍在完善中，暂不保证达到 Codex 同等体验。
 
 用户使用说明见 [docs/USER_MANUAL.md](docs/USER_MANUAL.md)。
 
