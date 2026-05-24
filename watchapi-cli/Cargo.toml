@@ -1,0 +1,11 @@
+[package]
+name = "watchapi-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ctrlc.workspace = true
+tokio.workspace = true
+watchapi-core = { path = "../watchapi-core" }
