@@ -1,7 +1,9 @@
 use crate::codex_files::{
     apply_codex_endpoint, ensure_codex_unattended_state, get_current_model_provider,
 };
-use crate::config::{AgentCommand, AgentDriver as AgentDriverKind, AppConfig, EndpointConfig};
+use crate::config::{
+    AgentCommand, AgentDriver as AgentDriverKind, AppConfig, ContinuationMode, EndpointConfig,
+};
 use crate::cooldown::cooldown_seconds_from_text;
 use crate::sessions::{
     ClaudeSessionIndex, ClaudeSessionMonitor, CodexSessionIndex, CodexSessionMonitor,
@@ -999,7 +1001,11 @@ pub fn build_agent_launch_with_policy(
                 missing_policy,
             )?;
             Ok(AgentLaunch {
-                command: resume_command(&config.agent_command, "resume", session_id.as_deref()),
+                command: codex_resume_command(
+                    &codex_goal_feature_command(config),
+                    &endpoint.workdir,
+                    session_id.as_deref(),
+                ),
                 resumed: session_id.is_some(),
                 session_id,
             })
@@ -1150,9 +1156,57 @@ fn agent_driver_key(driver: AgentDriverKind) -> String {
     .to_string()
 }
 
-fn resume_command(
+fn codex_goal_feature_command(config: &AppConfig) -> AgentCommand {
+    if config.continuation_mode != ContinuationMode::Goal
+        || !config.agent_goal.enabled
+        || config.agent_goal.text.trim().is_empty()
+    {
+        return config.agent_command.clone();
+    }
+    match &config.agent_command {
+        AgentCommand::Args(items) => {
+            if codex_enable_goals_present(items) {
+                return config.agent_command.clone();
+            }
+            let mut out = Vec::new();
+            if let Some(first) = items.first() {
+                out.push(first.clone());
+                out.push("--enable".to_string());
+                out.push("goals".to_string());
+                out.extend(items.iter().skip(1).cloned());
+            }
+            AgentCommand::Args(out)
+        }
+        AgentCommand::Shell(_) => config.agent_command.clone(),
+    }
+}
+
+fn codex_enable_goals_present(items: &[String]) -> bool {
+    let mut iter = items.iter();
+    while let Some(item) = iter.next() {
+        if item == "--enable" && iter.next().is_some_and(|value| value == "goals") {
+            return true;
+        }
+        if item == "--enable=goals" {
+            return true;
+        }
+        if item == "-c"
+            && iter
+                .next()
+                .is_some_and(|value| value == "features.goals=true")
+        {
+            return true;
+        }
+        if item == "-c=features.goals=true" || item == "--config=features.goals=true" {
+            return true;
+        }
+    }
+    false
+}
+
+fn codex_resume_command(
     command: &AgentCommand,
-    resume_arg: &str,
+    workdir: &Path,
     session_id: Option<&str>,
 ) -> AgentCommand {
     let Some(session_id) = session_id else {
@@ -1163,14 +1217,36 @@ fn resume_command(
             let mut out = Vec::new();
             if let Some(first) = items.first() {
                 out.push(first.clone());
-                out.push(resume_arg.to_string());
-                out.extend(items.iter().skip(1).cloned());
+                out.push("resume".to_string());
+                out.push("-C".to_string());
+                out.push(workdir.to_string_lossy().to_string());
+                out.extend(strip_codex_cd_args(items.iter().skip(1)));
                 out.push(session_id.to_string());
             }
             AgentCommand::Args(out)
         }
         AgentCommand::Shell(_) => command.clone(),
     }
+}
+
+fn strip_codex_cd_args<'a>(items: impl Iterator<Item = &'a String>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut skip_next = false;
+    for item in items {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if item == "-C" || item == "--cd" {
+            skip_next = true;
+            continue;
+        }
+        if item.starts_with("--cd=") {
+            continue;
+        }
+        out.push(item.clone());
+    }
+    out
 }
 
 fn claude_resume_command(command: &AgentCommand, session_id: Option<&str>) -> AgentCommand {
@@ -1845,6 +1921,8 @@ mod tests {
             endpoints: vec![endpoint(workdir.clone())],
             config_path: None,
             workdir,
+            continuation_mode: ContinuationMode::Auto,
+            agent_goal: Default::default(),
             probe_interval_seconds: 1.0,
             healthy_probe_interval_seconds: 300.0,
             polluted_endpoint_cooldown_seconds: 300.0,
@@ -2004,10 +2082,95 @@ mod tests {
             AgentCommand::Args(vec![
                 "codex".to_string(),
                 "resume".to_string(),
+                "-C".to_string(),
+                cfg.workdir.to_string_lossy().to_string(),
                 "latest-session".to_string()
             ])
         );
         assert!(launch.resumed);
+    }
+
+    #[test]
+    fn codex_resume_command_pins_current_workdir_to_avoid_directory_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let stale_workdir = tmp.path().join("old-project");
+        fs::create_dir_all(&stale_workdir).unwrap();
+        let codex_home = tmp.path().join(".codex");
+        let session_file = codex_home.join("sessions/2026/05/17/bound.jsonl");
+        fs::create_dir_all(session_file.parent().unwrap()).unwrap();
+        fs::write(
+            &session_file,
+            serde_json::json!({"type": "session_meta", "payload": {"id": "bound-session", "cwd": workdir.to_string_lossy()}}).to_string() + "\n",
+        )
+        .unwrap();
+        let cfg = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Args(vec![
+                "codex".to_string(),
+                "--no-alt-screen".to_string(),
+                "--cd".to_string(),
+                stale_workdir.to_string_lossy().to_string(),
+            ]),
+            tmp.path().join("state.json"),
+            codex_home,
+        );
+        let endpoint = endpoint(workdir.clone());
+        let mut store = SessionStore::new(cfg.session_state_path.clone());
+        store
+            .set_bound_session_id(&session_binding_key(&cfg, &endpoint), "bound-session", None)
+            .unwrap();
+        let index = CodexSessionIndex::new(cfg.codex_home.clone());
+
+        let launch = build_agent_launch(&cfg, &endpoint, &mut store, &index, false).unwrap();
+
+        assert_eq!(
+            launch.command,
+            AgentCommand::Args(vec![
+                "codex".to_string(),
+                "resume".to_string(),
+                "-C".to_string(),
+                workdir.to_string_lossy().to_string(),
+                "--no-alt-screen".to_string(),
+                "bound-session".to_string()
+            ])
+        );
+        assert!(launch.resumed);
+    }
+
+    #[test]
+    fn codex_goal_mode_enables_goals_feature_on_launch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let mut cfg = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Args(vec!["codex".to_string(), "--no-alt-screen".to_string()]),
+            tmp.path().join("state.json"),
+            tmp.path().join(".codex"),
+        );
+        cfg.continuation_mode = ContinuationMode::Goal;
+        cfg.agent_goal.enabled = true;
+        cfg.agent_goal.text = "修复终端渲染".to_string();
+        let endpoint = endpoint(workdir);
+        let mut store = SessionStore::new(cfg.session_state_path.clone());
+        let index = CodexSessionIndex::new(cfg.codex_home.clone());
+
+        let launch = build_agent_launch(&cfg, &endpoint, &mut store, &index, false).unwrap();
+
+        assert_eq!(
+            launch.command,
+            AgentCommand::Args(vec![
+                "codex".to_string(),
+                "--enable".to_string(),
+                "goals".to_string(),
+                "--no-alt-screen".to_string()
+            ])
+        );
+        assert!(!launch.resumed);
     }
 
     #[test]

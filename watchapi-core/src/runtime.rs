@@ -1,6 +1,6 @@
 use crate::agent::AgentProcess;
 use crate::atomic_write::write_text_atomic;
-use crate::config::{AppConfig, EndpointConfig};
+use crate::config::{AgentDriver, AppConfig, ContinuationMode, EndpointConfig};
 use crate::control::{
     enqueue_manual_prompt, pop_manual_prompt, read_control_state, update_control_state,
 };
@@ -126,6 +126,7 @@ pub struct RuntimeCore {
     last_event_snapshot: Mutex<Option<RuntimeSnapshot>>,
     last_event_signature: Mutex<Option<RuntimeEventSignature>>,
     pending_initial_prompt: Option<String>,
+    pending_goal_prompt: Option<String>,
     last_prompt_at: Option<Instant>,
     last_auto_prompt_signature: Option<(String, String)>,
     waiting_for_assistant_progress: bool,
@@ -193,6 +194,7 @@ impl RuntimeCore {
             last_event_snapshot: Mutex::new(None),
             last_event_signature: Mutex::new(None),
             pending_initial_prompt: None,
+            pending_goal_prompt: None,
             last_prompt_at: None,
             last_auto_prompt_signature: None,
             waiting_for_assistant_progress: false,
@@ -451,6 +453,7 @@ impl RuntimeCore {
         self.confirm_current_probe_once = false;
         self.force_full_probe_once = false;
         self.pending_initial_prompt = None;
+        self.pending_goal_prompt = None;
         self.last_prompt_at = None;
         self.last_auto_prompt_signature = None;
         self.waiting_for_assistant_progress = false;
@@ -581,6 +584,7 @@ impl RuntimeCore {
         self.stop_agent();
         self.current_endpoint = None;
         self.pending_initial_prompt = None;
+        self.pending_goal_prompt = None;
         self.last_prompt_at = None;
         self.last_auto_prompt_signature = None;
         self.waiting_for_assistant_progress = false;
@@ -1196,11 +1200,19 @@ impl RuntimeCore {
         self.current_endpoint = Some(endpoint.name.clone());
         self.started_at_by_endpoint
             .insert(endpoint.name.clone(), now);
-        self.pending_initial_prompt = agent
+        self.pending_goal_prompt = agent
             .launch
             .as_ref()
-            .filter(|launch| !launch.resumed)
-            .map(|_| endpoint.initial_prompt.clone());
+            .and_then(|launch| self.goal_prompt_for_new_session(launch.resumed));
+        self.pending_initial_prompt = if self.pending_goal_prompt.is_some() {
+            None
+        } else {
+            agent
+                .launch
+                .as_ref()
+                .filter(|launch| !launch.resumed)
+                .map(|_| endpoint.initial_prompt.clone())
+        };
         self.last_prompt_at = None;
         self.last_auto_prompt_signature = None;
         self.waiting_for_assistant_progress = false;
@@ -1209,6 +1221,36 @@ impl RuntimeCore {
         self.agent = Some(agent);
         self.publish_snapshot_event();
         Ok(())
+    }
+
+    fn goal_prompt_for_new_session(&self, resumed: bool) -> Option<String> {
+        if resumed
+            || self.config.agent_driver != AgentDriver::Codex
+            || self.config.continuation_mode != ContinuationMode::Goal
+            || !self.config.agent_goal.enabled
+        {
+            return None;
+        }
+        let text = self.config.agent_goal.text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        Some(format!("/goal {text}"))
+    }
+
+    fn goal_fallback_prompt(&self) -> Option<String> {
+        if self.config.continuation_mode != ContinuationMode::Goal
+            || !self.config.agent_goal.enabled
+            || !self.config.agent_goal.fallback_enabled
+            || self.config.agent_goal.text.trim().is_empty()
+        {
+            return None;
+        }
+        let prompt = self.config.agent_goal.fallback_prompt.trim();
+        if prompt.is_empty() {
+            return None;
+        }
+        Some(prompt.to_string())
     }
 
     fn maybe_drive_prompt(&mut self, endpoint: &EndpointConfig) {
@@ -1269,6 +1311,17 @@ impl RuntimeCore {
             .get("auto_paused")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
+        if self.pending_goal_prompt.is_none() {
+            self.pending_goal_prompt = control_state_goal_prompt(&control_state);
+            if self.pending_goal_prompt.is_some() {
+                if let Some(config_path) = &self.config.config_path {
+                    let _ = update_control_state(
+                        config_path,
+                        &[("goal_request", serde_json::Value::Null)],
+                    );
+                }
+            }
+        }
         let manual_prompt = self
             .config
             .config_path
@@ -1278,7 +1331,10 @@ impl RuntimeCore {
             at.elapsed() >= Duration::from_secs_f64(self.config.min_prompt_interval_seconds)
         });
         let automatic_requested = trigger_now_requested
-            || (!auto_paused && (self.pending_initial_prompt.is_some() || can_send_by_interval));
+            || (!auto_paused
+                && (self.pending_goal_prompt.is_some()
+                    || self.pending_initial_prompt.is_some()
+                    || can_send_by_interval));
         if manual_prompt.is_none()
             && automatic_requested
             && self.auto_prompt_blocked_by_endpoint_cooldown(&endpoint.name)
@@ -1294,14 +1350,20 @@ impl RuntimeCore {
             return;
         }
         let is_manual = manual_prompt.is_some();
+        let mut restore_goal_prompt = false;
         let mut restore_initial_prompt = false;
-        let prompt = if let Some(prompt) = manual_prompt {
-            prompt
+        let (prompt, is_goal_command) = if let Some(prompt) = manual_prompt {
+            (prompt, false)
+        } else if let Some(prompt) = self.pending_goal_prompt.take() {
+            restore_goal_prompt = true;
+            (prompt, true)
         } else if let Some(prompt) = self.pending_initial_prompt.take() {
             restore_initial_prompt = true;
-            prompt
+            (prompt, false)
+        } else if let Some(prompt) = self.goal_fallback_prompt() {
+            (prompt, false)
         } else {
-            self.latest_auto_prompt(endpoint)
+            (self.latest_auto_prompt(endpoint), false)
         };
         if prompt.trim().is_empty() {
             self.publish_snapshot_event();
@@ -1312,6 +1374,8 @@ impl RuntimeCore {
                 if let Some(config_path) = &self.config.config_path {
                     let _ = enqueue_manual_prompt(config_path, &prompt);
                 }
+            } else if restore_goal_prompt {
+                self.pending_goal_prompt = Some(prompt);
             } else if restore_initial_prompt {
                 self.pending_initial_prompt = Some(prompt);
             }
@@ -1319,7 +1383,9 @@ impl RuntimeCore {
         };
         if agent.send_prompt(&prompt).is_ok() {
             self.last_prompt_at = Some(Instant::now());
-            self.last_auto_prompt_signature = Some((endpoint.name.clone(), prompt));
+            if !is_goal_command {
+                self.last_auto_prompt_signature = Some((endpoint.name.clone(), prompt));
+            }
             self.waiting_for_assistant_progress = !is_manual;
             let mut cleanup_error = None;
             if trigger_now {
@@ -1344,6 +1410,8 @@ impl RuntimeCore {
             if let Some(config_path) = &self.config.config_path {
                 let _ = enqueue_manual_prompt(config_path, &prompt);
             }
+        } else if restore_goal_prompt {
+            self.pending_goal_prompt = Some(prompt);
         } else if restore_initial_prompt {
             self.pending_initial_prompt = Some(prompt);
         }
@@ -2011,6 +2079,16 @@ fn usage_key(endpoint: &EndpointConfig) -> String {
     )
 }
 
+fn control_state_goal_prompt(state: &Value) -> Option<String> {
+    let goal = state
+        .get("goal_request")
+        .and_then(|request| request.get("text"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())?;
+    Some(format!("/goal {goal}"))
+}
+
 fn guard_proxy_port_registry_path(config: &AppConfig) -> Option<PathBuf> {
     config
         .config_path
@@ -2193,6 +2271,8 @@ mod tests {
             endpoints: vec![endpoint("high", 100), endpoint("low", 10)],
             config_path: None,
             workdir: PathBuf::from("."),
+            continuation_mode: crate::config::ContinuationMode::Auto,
+            agent_goal: Default::default(),
             probe_interval_seconds: 1.0,
             healthy_probe_interval_seconds: 300.0,
             polluted_endpoint_cooldown_seconds: 300.0,
@@ -2337,6 +2417,7 @@ mod tests {
         let mut runtime = RuntimeCore::new(config());
         runtime.current_endpoint = Some("high".to_string());
         runtime.pending_initial_prompt = Some("old prompt".to_string());
+        runtime.pending_goal_prompt = Some("/goal old goal".to_string());
         runtime.last_prompt_at = Some(Instant::now());
         runtime.last_auto_prompt_signature = Some(("high".to_string(), "prompt".to_string()));
         runtime.waiting_for_assistant_progress = true;
@@ -2349,6 +2430,7 @@ mod tests {
         assert_eq!(runtime.current_endpoint, None);
         assert_eq!(runtime.state, RuntimeState::WaitingAvailable);
         assert_eq!(runtime.pending_initial_prompt, None);
+        assert_eq!(runtime.pending_goal_prompt, None);
         assert_eq!(runtime.last_prompt_at, None);
         assert_eq!(runtime.last_auto_prompt_signature, None);
         assert!(!runtime.waiting_for_assistant_progress);
@@ -3067,14 +3149,92 @@ mod tests {
             .expect("maybe_drive_prompt block should be discoverable");
 
         assert!(
-            block.contains(
-                "!auto_paused && (self.pending_initial_prompt.is_some() || can_send_by_interval)"
-            ),
-            "暂停自动续航时 pending_initial_prompt 也不能自动发送，否则启动终端后仍会自动续航"
+            block.contains("!auto_paused")
+                && block.contains("self.pending_goal_prompt.is_some()")
+                && block.contains("self.pending_initial_prompt.is_some()")
+                && block.contains("can_send_by_interval"),
+            "暂停自动续航时 pending goal/initial prompt 都不能自动发送，否则启动终端后仍会自动续航"
         );
         assert!(
             block.contains("let automatic_requested = trigger_now"),
             "手动立即触发仍应绕过暂停状态"
+        );
+    }
+
+    #[test]
+    fn goal_mode_queues_goal_instead_of_initial_prompt_for_new_codex_session() {
+        let source = include_str!("runtime.rs");
+        let switch_block = source
+            .split("fn switch_to(&mut self, endpoint: EndpointConfig)")
+            .nth(1)
+            .and_then(|tail| tail.split("fn maybe_drive_prompt").next())
+            .expect("switch_to block should be discoverable");
+
+        assert!(switch_block.contains("pending_goal_prompt"));
+        assert!(switch_block.contains("goal_prompt_for_new_session"));
+        assert!(switch_block
+            .contains("self.pending_initial_prompt = if self.pending_goal_prompt.is_some()"));
+    }
+
+    #[test]
+    fn goal_mode_sends_goal_before_auto_prompt_without_counting_as_auto_prompt() {
+        let source = include_str!("runtime.rs");
+        let prompt_block = source
+            .split("fn maybe_drive_prompt")
+            .nth(1)
+            .and_then(|tail| tail.split("fn record_agent_usage").next())
+            .expect("maybe_drive_prompt block should be discoverable");
+
+        assert!(prompt_block.contains("pending_goal_prompt"));
+        assert!(prompt_block.contains("is_goal_command"));
+        assert!(prompt_block.contains("!is_goal_command"));
+        assert!(
+            prompt_block.find("pending_goal_prompt") < prompt_block.find("pending_initial_prompt"),
+            "queued goal command must be chosen before initial or auto prompts"
+        );
+    }
+
+    #[test]
+    fn control_state_goal_request_builds_codex_goal_command() {
+        let state = json!({
+            "goal_request": {
+                "text": "  修复终端渲染  "
+            }
+        });
+
+        assert_eq!(
+            control_state_goal_prompt(&state),
+            Some("/goal 修复终端渲染".to_string())
+        );
+        assert_eq!(
+            control_state_goal_prompt(&json!({"goal_request": {"text": ""}})),
+            None
+        );
+    }
+
+    #[test]
+    fn goal_mode_uses_fallback_prompt_instead_of_auto_prompt_when_idle() {
+        let mut cfg = config();
+        cfg.continuation_mode = crate::config::ContinuationMode::Goal;
+        cfg.agent_goal.enabled = true;
+        cfg.agent_goal.text = "修复终端渲染".to_string();
+        cfg.agent_goal.fallback_prompt = "继续围绕当前 /goal 推进".to_string();
+        let runtime = RuntimeCore::new(cfg);
+
+        assert_eq!(
+            runtime.goal_fallback_prompt(),
+            Some("继续围绕当前 /goal 推进".to_string())
+        );
+
+        let source = include_str!("runtime.rs");
+        let prompt_block = source
+            .split("fn maybe_drive_prompt")
+            .nth(1)
+            .and_then(|tail| tail.split("fn record_agent_usage").next())
+            .expect("maybe_drive_prompt block should be discoverable");
+        assert!(
+            prompt_block.find("goal_fallback_prompt") < prompt_block.find("latest_auto_prompt"),
+            "Goal fallback must be selected before ordinary auto_prompt"
         );
     }
 

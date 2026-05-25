@@ -36,6 +36,8 @@ pub struct AppConfig {
     pub endpoints: Vec<EndpointConfig>,
     pub config_path: Option<PathBuf>,
     pub workdir: PathBuf,
+    pub continuation_mode: ContinuationMode,
+    pub agent_goal: AgentGoalConfig,
     pub probe_interval_seconds: f64,
     pub healthy_probe_interval_seconds: f64,
     pub polluted_endpoint_cooldown_seconds: f64,
@@ -66,6 +68,40 @@ pub struct AppConfig {
     pub polluted_context_window: usize,
     pub polluted_check_max_chars: usize,
     pub completion_pause_keywords: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationMode {
+    Auto,
+    Goal,
+    Manual,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentGoalConfig {
+    pub enabled: bool,
+    pub text: String,
+    pub sync_on_new_session: bool,
+    pub sync_on_resume: bool,
+    pub fallback_enabled: bool,
+    pub fallback_idle_seconds: f64,
+    pub fallback_prompt: String,
+}
+
+impl Default for AgentGoalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            text: String::new(),
+            sync_on_new_session: true,
+            sync_on_resume: false,
+            fallback_enabled: true,
+            fallback_idle_seconds: 180.0,
+            fallback_prompt:
+                "继续围绕当前 /goal 推进。如果目标已完成，请说明完成证据；否则继续下一步。"
+                    .to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -153,6 +189,8 @@ struct RawConfig {
     endpoint_refs: Option<Vec<RawEndpointRef>>,
     providers: Option<Vec<RawEndpointProvider>>,
     workdir: Option<String>,
+    continuation_mode: Option<String>,
+    agent_goal: Option<RawAgentGoal>,
     initial_prompt: Option<String>,
     auto_prompt: Option<String>,
     probe_interval_seconds: Option<f64>,
@@ -186,6 +224,17 @@ struct RawConfig {
     polluted_context_window: Option<usize>,
     polluted_check_max_chars: Option<usize>,
     completion_pause_keywords: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAgentGoal {
+    enabled: Option<bool>,
+    text: Option<String>,
+    sync_on_new_session: Option<bool>,
+    sync_on_resume: Option<bool>,
+    fallback_enabled: Option<bool>,
+    fallback_idle_seconds: Option<f64>,
+    fallback_prompt: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -327,6 +376,8 @@ impl AppConfig {
             endpoints,
             config_path: None,
             workdir,
+            continuation_mode: parse_continuation_mode(raw.continuation_mode.as_deref())?,
+            agent_goal: parse_agent_goal(raw.agent_goal)?,
             probe_interval_seconds: positive_float(
                 raw.probe_interval_seconds,
                 1.0,
@@ -447,6 +498,52 @@ fn load_provider_library(
         providers.push(provider);
     }
     Ok(EndpointProviderLibrary { providers })
+}
+
+fn parse_continuation_mode(value: Option<&str>) -> Result<ContinuationMode, ConfigError> {
+    match value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("auto")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "auto" => Ok(ContinuationMode::Auto),
+        "goal" => Ok(ContinuationMode::Goal),
+        "manual" => Ok(ContinuationMode::Manual),
+        other => Err(ConfigError::Validation(format!(
+            "continuation_mode must be one of: auto, goal, manual; got {other}"
+        ))),
+    }
+}
+
+fn parse_agent_goal(raw: Option<RawAgentGoal>) -> Result<AgentGoalConfig, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(AgentGoalConfig::default());
+    };
+    let default = AgentGoalConfig::default();
+    Ok(AgentGoalConfig {
+        enabled: raw.enabled.unwrap_or(default.enabled),
+        text: raw
+            .text
+            .map(|value| value.trim().to_string())
+            .unwrap_or(default.text),
+        sync_on_new_session: raw
+            .sync_on_new_session
+            .unwrap_or(default.sync_on_new_session),
+        sync_on_resume: raw.sync_on_resume.unwrap_or(default.sync_on_resume),
+        fallback_enabled: raw.fallback_enabled.unwrap_or(default.fallback_enabled),
+        fallback_idle_seconds: positive_float(
+            raw.fallback_idle_seconds,
+            default.fallback_idle_seconds,
+            "agent_goal.fallback_idle_seconds",
+        )?,
+        fallback_prompt: raw
+            .fallback_prompt
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(default.fallback_prompt),
+    })
 }
 
 fn load_provider(raw: RawEndpointProvider) -> Result<EndpointProviderConfig, ConfigError> {
@@ -917,6 +1014,32 @@ mod tests {
             }]
         }"#
         .to_string()
+    }
+
+    #[test]
+    fn loads_agent_goal_continuation_config() {
+        let mut value: serde_json::Value = serde_json::from_str(&sample_config()).unwrap();
+        value["continuation_mode"] = serde_json::json!("goal");
+        value["agent_goal"] = serde_json::json!({
+            "enabled": true,
+            "text": "修复终端渲染",
+            "sync_on_new_session": true,
+            "sync_on_resume": false,
+            "fallback_enabled": true,
+            "fallback_idle_seconds": 180,
+            "fallback_prompt": "继续围绕当前 /goal 推进"
+        });
+
+        let config = AppConfig::from_json_str(&value.to_string()).unwrap();
+
+        assert_eq!(config.continuation_mode, ContinuationMode::Goal);
+        assert!(config.agent_goal.enabled);
+        assert_eq!(config.agent_goal.text, "修复终端渲染");
+        assert!(config.agent_goal.sync_on_new_session);
+        assert!(!config.agent_goal.sync_on_resume);
+        assert!(config.agent_goal.fallback_enabled);
+        assert_eq!(config.agent_goal.fallback_idle_seconds, 180.0);
+        assert_eq!(config.agent_goal.fallback_prompt, "继续围绕当前 /goal 推进");
     }
 
     #[test]

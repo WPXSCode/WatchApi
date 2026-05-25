@@ -7,7 +7,8 @@ use crate::gui_support::{
 };
 use crate::litellm_proxy::SmartProxyKeyRow;
 use crate::litellm_proxy::{
-    discover_clash_verge_group, next_available_proxy_port, portable_path, write_litellm_config,
+    discover_clash_verge_group, next_available_proxy_port, portable_path,
+    prune_missing_route_upstreams, rename_upstream_references, write_litellm_config,
     KeyBatchConfig, KeyBatchFormat, ProxyConfig, ProxyEngine, ProxyRegistry, ProxySummary,
     RouteConfig, SmartProxyServer, UpstreamConfig,
 };
@@ -1842,63 +1843,70 @@ impl WatchApiApp {
             }
         });
         ui.add_space(6.0);
-        let upstream = &mut proxy.upstreams[selected_upstream];
-        edit_text_row_hint(
-            ui,
-            96.0,
-            "上游名称",
-            "路由中引用这个名字；同一个代理内必须唯一。",
-            &mut upstream.name,
-        );
-        edit_text_row_hint(
-            ui,
-            96.0,
-            "Base URL",
-            "真实上游接口地址，通常填写到 /v1 结尾。",
-            &mut upstream.base_url,
-        );
-        edit_text_row_hint(
-            ui,
-            96.0,
-            "模型前缀",
-            "LiteLLM 使用的 provider 前缀，通常填 openai；模型名已带 provider/ 时可留空。",
-            &mut upstream.provider_prefix,
-        );
-        edit_optional_u32_row_hint(
-            ui,
-            96.0,
-            "最大 QPS",
-            "此上游每秒最多请求数；留空表示不限制。",
-            &mut upstream.max_qps,
-        );
-        edit_optional_u32_row_hint(
-            ui,
-            96.0,
-            "最大 RPM",
-            "此上游每分钟最多请求数；留空表示不限制。",
-            &mut upstream.max_rpm,
-        );
-        edit_u32_row_hint(
-            ui,
-            96.0,
-            "最大并发",
-            "此上游同时进行中的请求数量上限，建议从 1 开始。",
-            &mut upstream.max_concurrency,
-        );
-        edit_optional_u32_row_hint(
-            ui,
-            96.0,
-            "冷却秒",
-            "此上游触发限流或网络失败后的冷却时间；留空使用代理全局失败冷却秒。",
-            &mut upstream.cooldown_seconds,
-        );
-        edit_text_row_hint(
-            ui,
-            96.0,
-            "出口备注",
-            "用于标记出口线路、IP 或机器名，只在本地排行表展示。",
-            &mut upstream.egress_note,
-        );
+        let old_upstream_name = proxy.upstreams[selected_upstream].name.clone();
+        {
+            let upstream = &mut proxy.upstreams[selected_upstream];
+            edit_text_row_hint(
+                ui,
+                96.0,
+                "上游名称",
+                "路由中引用这个名字；同一个代理内必须唯一。",
+                &mut upstream.name,
+            );
+            edit_text_row_hint(
+                ui,
+                96.0,
+                "Base URL",
+                "真实上游接口地址，通常填写到 /v1 结尾。",
+                &mut upstream.base_url,
+            );
+            edit_text_row_hint(
+                ui,
+                96.0,
+                "模型前缀",
+                "LiteLLM 使用的 provider 前缀，通常填 openai；模型名已带 provider/ 时可留空。",
+                &mut upstream.provider_prefix,
+            );
+            edit_optional_u32_row_hint(
+                ui,
+                96.0,
+                "最大 QPS",
+                "此上游每秒最多请求数；留空表示不限制。",
+                &mut upstream.max_qps,
+            );
+            edit_optional_u32_row_hint(
+                ui,
+                96.0,
+                "最大 RPM",
+                "此上游每分钟最多请求数；留空表示不限制。",
+                &mut upstream.max_rpm,
+            );
+            edit_u32_row_hint(
+                ui,
+                96.0,
+                "最大并发",
+                "此上游同时进行中的请求数量上限，建议从 1 开始。",
+                &mut upstream.max_concurrency,
+            );
+            edit_optional_u32_row_hint(
+                ui,
+                96.0,
+                "冷却秒",
+                "此上游触发限流或网络失败后的冷却时间；留空使用代理全局失败冷却秒。",
+                &mut upstream.cooldown_seconds,
+            );
+            edit_text_row_hint(
+                ui,
+                96.0,
+                "出口备注",
+                "用于标记出口线路、IP 或机器名，只在本地排行表展示。",
+                &mut upstream.egress_note,
+            );
+        }
+        let new_upstream_name = proxy.upstreams[selected_upstream].name.clone();
+        if old_upstream_name.trim() != new_upstream_name.trim() {
+            rename_upstream_references(&mut proxy.routes, &old_upstream_name, &new_upstream_name);
+        }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new("Key 批次").strong());
@@ -1913,6 +1921,7 @@ impl WatchApiApp {
                 import_folder = true;
             }
         });
+        let upstream = &mut proxy.upstreams[selected_upstream];
         for index in 0..upstream.key_batches.len() {
             let mut remove = false;
             ui.horizontal_wrapped(|ui| {
@@ -1958,6 +1967,7 @@ impl WatchApiApp {
         let Some(proxy) = self.selected_proxy_mut() else {
             return;
         };
+        prune_missing_route_upstreams(proxy);
         ui.horizontal(|ui| {
             if circular_add_button(ui, "新增路由").clicked() {
                 add_route = true;
@@ -2698,6 +2708,9 @@ impl WatchApiApp {
         {
             self.force_full_probe_current_runtime();
         }
+        if circular_tool_button(ui, "设置 Goal", ToolButtonIcon::Apply, self.running).clicked() {
+            self.request_current_goal();
+        }
         let auto_paused = auto_paused_from_control_state(control_state).unwrap_or(true);
         let primary_icon = runtime_primary_icon(self.running, auto_paused);
         if circular_tool_button(
@@ -2963,6 +2976,8 @@ impl WatchApiApp {
 
     fn render_global_prompt_fields(&mut self, ui: &mut egui::Ui) {
         editor_section_frame(ui, "提示词", |ui| {
+            self.render_agent_goal_fields(ui);
+            ui.add_space(8.0);
             self.render_config_prompt_field(
                 ui,
                 "初始提示词",
@@ -2972,6 +2987,115 @@ impl WatchApiApp {
             );
             ui.add_space(8.0);
             self.render_config_prompt_field(ui, "续航提示词", "auto_prompt", PromptTarget::Auto, 4);
+        });
+    }
+
+    fn render_agent_goal_fields(&mut self, ui: &mut egui::Ui) {
+        config_param_hint(
+            ui,
+            "Goal 是 Agent 级长目标驱动；Codex 会使用原生 /goal，其它 Agent 会降级为提示词兜底。",
+        );
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [96.0, 28.0],
+                egui::Label::new(RichText::new("执行驱动").strong()),
+            );
+            let mut mode = self
+                .editor_json
+                .get("continuation_mode")
+                .and_then(Value::as_str)
+                .unwrap_or("auto")
+                .to_string();
+            egui::ComboBox::from_id_salt("continuation_mode_editor")
+                .selected_text(match mode.as_str() {
+                    "goal" => "Goal 续航",
+                    "manual" => "手动",
+                    _ => "普通续航",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut mode, "auto".to_string(), "普通续航");
+                    ui.selectable_value(&mut mode, "goal".to_string(), "Goal 续航");
+                    ui.selectable_value(&mut mode, "manual".to_string(), "手动");
+                });
+            self.editor_json["continuation_mode"] = json!(mode);
+            let mut enabled = self
+                .editor_json
+                .get("agent_goal")
+                .and_then(|goal| goal.get("enabled"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if ui.checkbox(&mut enabled, "启用 Goal").changed() {
+                self.editor_json["agent_goal"]["enabled"] = json!(enabled);
+            }
+        });
+
+        ui.add_space(6.0);
+        self.render_agent_goal_text_field(ui, "目标", "text", 4);
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let mut fallback_enabled = self
+                .editor_json
+                .get("agent_goal")
+                .and_then(|goal| goal.get("fallback_enabled"))
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if ui
+                .checkbox(&mut fallback_enabled, "Goal 卡住时兜底")
+                .changed()
+            {
+                self.editor_json["agent_goal"]["fallback_enabled"] = json!(fallback_enabled);
+            }
+            let mut seconds = self
+                .editor_json
+                .get("agent_goal")
+                .and_then(|goal| goal.get("fallback_idle_seconds"))
+                .and_then(Value::as_f64)
+                .unwrap_or(180.0);
+            ui.label("空闲秒数");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut seconds)
+                        .range(30.0..=3600.0)
+                        .speed(5.0),
+                )
+                .changed()
+            {
+                self.editor_json["agent_goal"]["fallback_idle_seconds"] = json!(seconds);
+            }
+        });
+        self.render_agent_goal_text_field(ui, "兜底提示", "fallback_prompt", 3);
+    }
+
+    fn render_agent_goal_text_field(
+        &mut self,
+        ui: &mut egui::Ui,
+        label: &str,
+        key: &str,
+        rows: usize,
+    ) {
+        let row_width = ui.available_width();
+        ui.horizontal_top(|ui| {
+            ui.add_sized(
+                [96.0, 28.0],
+                egui::Label::new(RichText::new(label).strong()),
+            );
+            let edit_width = (row_width - 104.0).max(180.0);
+            let mut text = self
+                .editor_json
+                .get("agent_goal")
+                .and_then(|goal| goal.get(key))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if ui
+                .add_sized(
+                    [edit_width, (rows as f32 * 22.0).max(76.0)],
+                    TextEdit::multiline(&mut text).desired_rows(rows),
+                )
+                .changed()
+            {
+                self.editor_json["agent_goal"][key] = json!(text);
+            }
         });
     }
 
@@ -7948,6 +8072,9 @@ impl WatchApiApp {
     }
 
     fn save_proxy_registry(&mut self) {
+        for proxy in &mut self.proxy_registry.proxies {
+            prune_missing_route_upstreams(proxy);
+        }
         let config_result = self
             .selected_proxy()
             .cloned()
@@ -7969,10 +8096,11 @@ impl WatchApiApp {
     }
 
     fn generate_selected_proxy_config(&mut self) {
-        let Some(proxy) = self.selected_proxy().cloned() else {
+        let Some(mut proxy) = self.selected_proxy().cloned() else {
             self.proxy_status = "请先选择代理".to_string();
             return;
         };
+        prune_missing_route_upstreams(&mut proxy);
         match self.write_litellm_config_for_proxy(&proxy) {
             Ok(path) => {
                 self.proxy_status = format!("已生成 LiteLLM 配置：{}", path.display());
@@ -7989,7 +8117,8 @@ impl WatchApiApp {
             .map_err(|err| err.to_string())
     }
 
-    fn start_proxy_instance(&mut self, proxy: ProxyConfig) -> ProxyStartOutcome {
+    fn start_proxy_instance(&mut self, mut proxy: ProxyConfig) -> ProxyStartOutcome {
+        prune_missing_route_upstreams(&mut proxy);
         let key = proxy_runtime_key(&proxy);
         if self.proxy_processes.contains_key(&key) {
             self.proxy_status = "代理已经在运行".to_string();
@@ -9122,6 +9251,34 @@ impl WatchApiApp {
             );
         } else {
             self.set_auto_pause(true);
+        }
+    }
+
+    fn request_current_goal(&mut self) {
+        let Some(path) = self.config_path_path() else {
+            self.status = "请先选择配置".to_string();
+            return;
+        };
+        let Some(config) = self.config.as_ref() else {
+            self.status = "请先加载配置".to_string();
+            return;
+        };
+        let goal = config.agent_goal.text.trim();
+        if goal.is_empty() {
+            self.status = "请先在配置里填写 Goal 目标".to_string();
+            return;
+        }
+        match update_control_state(
+            &path,
+            &[(
+                "goal_request",
+                json!({
+                    "text": goal
+                }),
+            )],
+        ) {
+            Ok(_) => self.status = "Goal 已排队，等待 Agent 空闲后设置".to_string(),
+            Err(err) => self.status = format!("设置 Goal 失败：{err}"),
         }
     }
 
@@ -13659,6 +13816,15 @@ fn sanitize_filename(name: &str) -> String {
 }
 
 fn default_config_data() -> Value {
+    let agent_goal = json!({
+        "enabled": false,
+        "text": "",
+        "sync_on_new_session": true,
+        "sync_on_resume": false,
+        "fallback_enabled": true,
+        "fallback_idle_seconds": 180,
+        "fallback_prompt": "继续围绕当前 /goal 推进。如果目标已完成，请说明完成证据；否则继续下一步。"
+    });
     json!({
         "config_name": "新配置",
         "agent_id": "default",
@@ -13693,6 +13859,8 @@ fn default_config_data() -> Value {
         "polluted_response_keywords": [],
         "completion_pause_keywords": ["任务完成", "测试通过", "没有剩余任务"],
         "workdir": std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).to_string_lossy(),
+        "continuation_mode": "auto",
+        "agent_goal": agent_goal,
         "initial_prompt": "你现在是一个新会话。先初始化上下文，明确接下来要持续推进的任务和输出方式。",
         "auto_prompt": "继续执行当前任务。如果已经完成，就简要说明结果；如果还没完成，就继续推进。",
         "endpoint_refs": [{
@@ -19852,6 +20020,49 @@ mod tests {
             prompt_block.contains("TextEdit::multiline"),
             "初始提示词和续航提示词需要在配置编辑器中可直接修改"
         );
+    }
+
+    #[test]
+    fn global_config_editor_exposes_agent_goal_controls() {
+        let source = include_str!("app.rs");
+        let prompt_block = source
+            .split("fn render_global_prompt_fields")
+            .nth(1)
+            .and_then(|tail| tail.split("fn render_config_prompt_field").next())
+            .expect("global prompt editor block should be discoverable");
+        let default_block = source
+            .split("fn default_config_data")
+            .nth(1)
+            .and_then(|tail| tail.split("fn workspace_default_config_data").next())
+            .expect("default config block should be discoverable");
+
+        assert!(prompt_block.contains("self.render_agent_goal_fields(ui);"));
+        assert!(source.contains("fn render_agent_goal_fields"));
+        assert!(source.contains("\"continuation_mode\""));
+        assert!(source.contains("\"agent_goal\""));
+        assert!(source.contains("\"fallback_prompt\""));
+        assert!(default_block.contains("\"continuation_mode\": \"auto\""));
+        assert!(default_block.contains("\"agent_goal\""));
+    }
+
+    #[test]
+    fn runtime_action_buttons_expose_goal_request() {
+        let source = include_str!("app.rs");
+        let action_block = source
+            .split("fn render_runtime_action_buttons")
+            .nth(1)
+            .and_then(|tail| tail.split("fn load_config").next())
+            .expect("runtime action button block should be discoverable");
+        let request_block = source
+            .split("fn request_current_goal")
+            .nth(1)
+            .and_then(|tail| tail.split("fn restart_current_agent").next())
+            .expect("goal request helper should be discoverable");
+
+        assert!(action_block.contains("设置 Goal"));
+        assert!(action_block.contains("self.request_current_goal();"));
+        assert!(request_block.contains("\"goal_request\""));
+        assert!(request_block.contains("config.agent_goal.text.trim()"));
     }
 
     #[test]

@@ -944,6 +944,36 @@ impl ProxyConfig {
     }
 }
 
+pub fn rename_upstream_references(routes: &mut [RouteConfig], old_name: &str, new_name: &str) {
+    let old_name = old_name.trim();
+    let new_name = new_name.trim();
+    if old_name.is_empty() || new_name.is_empty() || old_name == new_name {
+        return;
+    }
+    for route in routes {
+        for upstream in &mut route.upstreams {
+            if upstream.trim() == old_name {
+                *upstream = new_name.to_string();
+            }
+        }
+        route.upstreams.dedup();
+    }
+}
+
+pub fn prune_missing_route_upstreams(proxy: &mut ProxyConfig) {
+    let upstream_names = proxy
+        .upstreams
+        .iter()
+        .map(|upstream| upstream.name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect::<HashSet<_>>();
+    for route in &mut proxy.routes {
+        route
+            .upstreams
+            .retain(|name| upstream_names.contains(name.trim()));
+    }
+}
+
 impl UpstreamConfig {
     pub fn blank() -> Self {
         Self {
@@ -2879,6 +2909,28 @@ mod tests {
         }];
 
         proxy.validate(temp.path()).unwrap();
+    }
+
+    #[test]
+    fn renaming_upstream_updates_route_references() {
+        let mut proxy = ProxyConfig::blank(1);
+        proxy.upstreams[0].name = "聚合ai2".to_string();
+        proxy.routes[0].upstreams = vec!["聚合ai2".to_string()];
+
+        rename_upstream_references(&mut proxy.routes, "聚合ai2", "主线路");
+
+        assert_eq!(proxy.routes[0].upstreams, vec!["主线路".to_string()]);
+    }
+
+    #[test]
+    fn prune_missing_route_upstreams_removes_hidden_stale_history() {
+        let mut proxy = ProxyConfig::blank(1);
+        proxy.upstreams[0].name = "主线路".to_string();
+        proxy.routes[0].upstreams = vec!["聚合ai2".to_string(), "主线路".to_string()];
+
+        prune_missing_route_upstreams(&mut proxy);
+
+        assert_eq!(proxy.routes[0].upstreams, vec!["主线路".to_string()]);
     }
 
     #[test]

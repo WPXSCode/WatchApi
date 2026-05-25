@@ -620,6 +620,8 @@ mod tests {
             endpoints: vec![endpoint],
             config_path: None,
             workdir: PathBuf::from("."),
+            continuation_mode: crate::config::ContinuationMode::Auto,
+            agent_goal: Default::default(),
             probe_interval_seconds: 1.0,
             healthy_probe_interval_seconds: 300.0,
             polluted_endpoint_cooldown_seconds: 300.0,
