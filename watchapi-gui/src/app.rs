@@ -41,9 +41,9 @@ use watchapi_core::terminal_emulator::{
     TerminalCursorShape, TerminalModeView, TerminalRgb, TerminalView,
 };
 use watchapi_core::{
-    recent_session_detail_summary, AppConfig, ClaudeSessionIndex, CodexSessionIndex,
-    EndpointConfig, EndpointRow, HttpProbe, RuntimeCore, RuntimeEvent, SessionBindingKey,
-    SessionCandidate, SessionStore,
+    latest_codex_session_goal_record, recent_session_detail_summary, AppConfig, ClaudeSessionIndex,
+    CodexSessionGoalRecord, CodexSessionIndex, EndpointConfig, EndpointRow, HttpProbe, RuntimeCore,
+    RuntimeEvent, SessionBindingKey, SessionCandidate, SessionStore,
 };
 
 pub struct WatchApiApp {
@@ -156,6 +156,18 @@ struct SessionCandidateResult {
     config_path: PathBuf,
     candidates: Vec<SessionCandidate>,
     source: SessionBindSource,
+}
+
+#[derive(Debug, Clone)]
+struct SessionCandidateScanContext {
+    driver: watchapi_core::AgentDriver,
+    codex_home: PathBuf,
+    agent_home: Option<PathBuf>,
+    workdir: PathBuf,
+    config_name: String,
+    agent_id: String,
+    session_state_path: PathBuf,
+    dialog_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -2212,8 +2224,8 @@ impl WatchApiApp {
                                         .on_hover_text(row.key_label.clone());
                                 });
                                 row_ui.col(|ui| {
-                                    ui.label(row.egress_note.as_str())
-                                        .on_hover_text(row.egress_note.clone());
+                                    ui.label(row.egress_display_text())
+                                        .on_hover_text(row.egress_hover_text());
                                 });
                                 row_ui.col(|ui| {
                                     ui.label(format!("{:.0}", row.score));
@@ -2388,16 +2400,16 @@ impl WatchApiApp {
             })
             .response;
         let hover_text = workspace.path.to_string_lossy();
-        let row_response = if let (Some(toggle), Some(add)) = (&toggle_response, add_response) {
-            toggle.union(add).union(response)
-        } else if let Some(toggle) = &toggle_response {
-            toggle.union(response)
-        } else {
-            response
+        let mut row_response = response;
+        if let Some(toggle) = &toggle_response {
+            row_response = row_response.union(toggle.clone());
         }
-        .on_hover_text(hover_text);
+        if let Some(add) = add_response {
+            row_response = row_response.union(add);
+        }
+        let row_response = row_response.on_hover_text(hover_text);
         if add_config_clicked {
-            self.registry.selected_workspace_id = Some(workspace.id.clone());
+            self.select_workspace_row(workspace.id.clone(), false);
             self.prepare_new_config();
         } else if toggle_response
             .as_ref()
@@ -2445,6 +2457,7 @@ impl WatchApiApp {
     fn select_workspace_row(&mut self, workspace_id: String, toggle_expanded: bool) {
         self.stash_current_session();
         self.registry.selected_workspace_id = Some(workspace_id.clone());
+        self.registry.selected_path = None;
         self.clear_active_runtime_state_for_config_switch();
         self.config_path.clear();
         self.config = None;
@@ -2708,20 +2721,49 @@ impl WatchApiApp {
         {
             self.force_full_probe_current_runtime();
         }
-        if circular_tool_button(ui, "设置 Goal", ToolButtonIcon::Apply, self.running).clicked() {
-            self.request_current_goal();
-        }
         let auto_paused = auto_paused_from_control_state(control_state).unwrap_or(true);
-        let primary_icon = runtime_primary_icon(self.running, auto_paused);
-        if circular_tool_button(
+        let mut auto_running = self.running && !auto_paused;
+        if runtime_switch(
             ui,
-            primary_runtime_button_label(self.running, auto_paused),
-            primary_icon,
+            "自动",
+            &mut auto_running,
             true,
+            "继续/暂停自动续航",
+            ToolButtonIcon::Play,
         )
-        .clicked()
+        .changed()
         {
-            self.toggle_runtime_pause();
+            if !self.running && auto_running {
+                self.start_runtime();
+                if self.running {
+                    self.trigger_auto_prompt_now();
+                    let _ = self.send_runtime_command(
+                        RuntimeCommand::ConfirmCurrentProbe,
+                        "启动自动续航前确认接口",
+                    );
+                }
+            } else if auto_running {
+                self.trigger_auto_prompt_now();
+                let _ = self.send_runtime_command(
+                    RuntimeCommand::ConfirmCurrentProbe,
+                    "恢复自动续航前确认接口",
+                );
+            } else {
+                self.set_auto_pause(true);
+            }
+        }
+        let mut goal_enabled = goal_enabled_from_control_state(control_state).unwrap_or(false);
+        if runtime_switch(
+            ui,
+            "Goal",
+            &mut goal_enabled,
+            true,
+            "开启/关闭 Goal 模式",
+            ToolButtonIcon::Apply,
+        )
+        .changed()
+        {
+            self.set_goal_mode_enabled(goal_enabled);
         }
     }
 
@@ -3095,6 +3137,9 @@ impl WatchApiApp {
                 .changed()
             {
                 self.editor_json["agent_goal"][key] = json!(text);
+                if key == "text" {
+                    mark_agent_goal_user_edit(&mut self.editor_json);
+                }
             }
         });
     }
@@ -4101,7 +4146,8 @@ impl WatchApiApp {
             .small()
             .color(md_error()),
         );
-        let config = self.editor_config_for_session_binding();
+        let config_result = self.editor_config_for_session_binding_result();
+        let config = config_result.as_ref().ok();
         let bound = config
             .as_ref()
             .and_then(|config| {
@@ -4124,9 +4170,9 @@ impl WatchApiApp {
                     .unwrap_or_else(|| "未绑定，新启动会创建新会话".to_string()),
             );
         });
-        if config.is_none() {
+        if let Some(err) = config_result.as_ref().err() {
             ui.label(
-                RichText::new("当前配置还不能解析，保存前请补全必填项。")
+                RichText::new(format!("当前配置还不能解析：{err}"))
                     .small()
                     .color(muted()),
             );
@@ -4148,14 +4194,19 @@ impl WatchApiApp {
                     "扫描并选择会话"
                 },
                 ToolButtonIcon::Search,
-                !scanning && config.is_some(),
+                !scanning && (config_result.is_ok() || self.registry.current_workspace().is_some()),
             )
             .clicked()
             {
                 self.open_editor_session_bind_dialog();
             }
-            if circular_tool_button(ui, "清除绑定", ToolButtonIcon::Unlink, config.is_some())
-                .clicked()
+            if circular_tool_button(
+                ui,
+                "清除绑定",
+                ToolButtonIcon::Unlink,
+                config_result.is_ok(),
+            )
+            .clicked()
             {
                 self.clear_editor_session_binding();
             }
@@ -6889,13 +6940,14 @@ impl WatchApiApp {
     }
 
     fn open_editor_session_bind_dialog(&mut self) {
-        let Some(config) = self.editor_config_for_session_binding() else {
-            self.status = "当前配置还不能解析，请先补全必填项".to_string();
+        let Some(scan_context) = self.editor_session_candidate_scan_context() else {
+            self.status = "当前配置还不能解析，也没有选中的工作区".to_string();
             return;
         };
+        let scan_workdir = scan_context.workdir.clone();
         let path = self
             .config_path_path()
-            .unwrap_or_else(|| new_config_path(self.config_name()));
+            .unwrap_or_else(|| scan_context.dialog_path.clone());
         self.session_bind_dialog = Some(SessionBindDialog {
             config_path: path.clone(),
             candidates: Vec::new(),
@@ -6904,10 +6956,9 @@ impl WatchApiApp {
             page: 0,
             source: SessionBindSource::Editor,
         });
-        let endpoint_index = self.selected_endpoint;
         let (tx, rx) = std::sync::mpsc::channel();
         thread::spawn(move || {
-            let candidates = session_candidates_for_config_data(&config, endpoint_index);
+            let candidates = session_candidates_for_scan_context(scan_context);
             let _ = tx.send(SessionCandidateResult {
                 config_path: path,
                 candidates,
@@ -6916,7 +6967,7 @@ impl WatchApiApp {
         });
         self.session_candidate_rx = Some(rx);
         self.session_candidate_loading = true;
-        self.status = "正在扫描可导入会话".to_string();
+        self.status = format!("正在扫描可导入会话：{}", scan_workdir.display());
     }
 
     fn poll_session_candidate_result(&mut self) {
@@ -6979,13 +7030,82 @@ impl WatchApiApp {
         let key = session_binding_key_for_config(&config, endpoint);
         match store.set_bound_session_id(&key, &candidate.session_id, Some(&candidate.path)) {
             Ok(()) => {
-                self.status = format!("已绑定会话：{}", short_session_id(&candidate.session_id));
+                let goal_status = self.import_goal_from_bound_session(&config, source, candidate);
+                self.status = goal_status.unwrap_or_else(|| {
+                    format!("已绑定会话：{}", short_session_id(&candidate.session_id))
+                });
                 self.session_bind_dialog = None;
                 if source == SessionBindSource::Startup {
                     self.start_runtime_with_restart_reset(true);
                 }
             }
             Err(err) => self.status = format!("绑定会话失败：{err}"),
+        }
+    }
+
+    fn import_goal_from_bound_session(
+        &mut self,
+        config: &AppConfig,
+        source: SessionBindSource,
+        candidate: &SessionCandidate,
+    ) -> Option<String> {
+        if config.agent_driver != watchapi_core::AgentDriver::Codex {
+            return None;
+        }
+        let goal = latest_codex_session_goal_record(&candidate.path)?;
+        match source {
+            SessionBindSource::Editor => {
+                if !import_session_goal_into_editor_json(
+                    &mut self.editor_json,
+                    &goal,
+                    &candidate.session_id,
+                ) {
+                    return Some(format!(
+                        "已绑定会话：{}；Goal 编辑框已有内容，保留当前配置",
+                        short_session_id(&candidate.session_id)
+                    ));
+                }
+                match self.write_current_editor_json() {
+                    Ok(()) => Some(format!(
+                        "已绑定会话：{}；已从历史会话导入 Goal",
+                        short_session_id(&candidate.session_id)
+                    )),
+                    Err(err) => Some(format!(
+                        "已绑定会话：{}；导入历史 Goal 失败：{err}",
+                        short_session_id(&candidate.session_id)
+                    )),
+                }
+            }
+            SessionBindSource::Startup => {
+                let Some(path) = self.config_path_path() else {
+                    return None;
+                };
+                let mut editor_json = load_json_or_default(&path);
+                if !import_session_goal_into_editor_json(
+                    &mut editor_json,
+                    &goal,
+                    &candidate.session_id,
+                ) {
+                    return Some(format!(
+                        "已绑定会话：{}；Goal 编辑框已有内容，保留当前配置",
+                        short_session_id(&candidate.session_id)
+                    ));
+                }
+                match save_config_json_without_endpoint_validation(&path, &editor_json) {
+                    Ok(()) => {
+                        self.editor_json = editor_json;
+                        self.load_config();
+                        Some(format!(
+                            "已绑定会话：{}；已从历史会话导入 Goal",
+                            short_session_id(&candidate.session_id)
+                        ))
+                    }
+                    Err(err) => Some(format!(
+                        "已绑定会话：{}；导入历史 Goal 失败：{err}",
+                        short_session_id(&candidate.session_id)
+                    )),
+                }
+            }
         }
     }
 
@@ -7277,6 +7397,10 @@ impl WatchApiApp {
             self.editor_config_path = None;
             self.editor_json = default_config_data();
             self.provider_json = load_global_provider_json();
+            align_default_endpoint_refs_to_provider_library(
+                &mut self.editor_json,
+                &self.provider_json,
+            );
         }
         self.editor_tab = EditorTab::Global;
         self.selected_endpoint = 0;
@@ -7956,14 +8080,75 @@ impl WatchApiApp {
     }
 
     fn editor_config_for_session_binding(&self) -> Option<AppConfig> {
+        self.editor_config_for_session_binding_result().ok()
+    }
+
+    fn editor_session_candidate_scan_context(&self) -> Option<SessionCandidateScanContext> {
+        if self.config_path_path().is_some() {
+            if let Ok(config) = self.editor_config_for_session_binding_result() {
+                if let Some(endpoint) = config.endpoints.get(self.selected_endpoint) {
+                    return Some(SessionCandidateScanContext {
+                        driver: config.agent_driver.clone(),
+                        codex_home: config.codex_home.clone(),
+                        agent_home: config.agent_home.clone(),
+                        workdir: endpoint.workdir.clone(),
+                        config_name: config
+                            .config_path
+                            .as_ref()
+                            .and_then(|path| path.file_stem())
+                            .map(|stem| stem.to_string_lossy().to_string())
+                            .unwrap_or_else(|| config.agent_id.clone()),
+                        agent_id: config.agent_id.clone(),
+                        session_state_path: config.session_state_path.clone(),
+                        dialog_path: config
+                            .config_path
+                            .clone()
+                            .unwrap_or_else(|| new_config_path(self.config_name())),
+                    });
+                }
+            }
+        }
+        let workspace = self.registry.current_workspace()?;
+        let workspace_host_dir = self.current_workspace_host_dir()?;
+        let defaults = default_config_data();
+        let driver_text = value_to_string(self.editor_json.get("agent_driver"))
+            .if_empty(value_to_string(defaults.get("agent_driver")).as_str());
+        let driver = session_scan_agent_driver(&driver_text);
+        let codex_home = value_to_string(self.editor_json.get("codex_home"))
+            .if_empty(value_to_string(defaults.get("codex_home")).as_str());
+        let agent_home = value_to_string(self.editor_json.get("agent_home"));
+        let agent_id = value_to_string(self.editor_json.get("agent_id"))
+            .if_empty(value_to_string(defaults.get("agent_id")).as_str());
+        let config_name = self.config_name();
+        let session_state = value_to_string(self.editor_json.get("session_state_path"))
+            .if_empty(value_to_string(defaults.get("session_state_path")).as_str());
+        let mut session_state_path = PathBuf::from(session_state);
+        if session_state_path.is_relative() {
+            session_state_path = workspace_host_dir.join(session_state_path);
+        }
+        Some(SessionCandidateScanContext {
+            driver,
+            codex_home: PathBuf::from(codex_home),
+            agent_home: (!agent_home.trim().is_empty()).then(|| PathBuf::from(agent_home)),
+            workdir: workspace.path.clone(),
+            config_name: config_name.clone(),
+            agent_id,
+            session_state_path,
+            dialog_path: workspace_session_scan_dialog_path(&workspace_host_dir),
+        })
+    }
+
+    fn editor_config_for_session_binding_result(&self) -> Result<AppConfig, String> {
         let mut data = self.editor_json.clone();
         data["providers"] = self
             .provider_json
             .get("providers")
             .cloned()
             .unwrap_or_else(|| json!([]));
-        let text = serde_json::to_string(&data).ok()?;
-        let mut config = AppConfig::from_json_str(&text).ok()?;
+        let valid_providers = provider_name_set(&self.provider_json);
+        prune_endpoint_refs_not_in_set(&mut data, &valid_providers);
+        let text = serde_json::to_string(&data).map_err(|err| err.to_string())?;
+        let mut config = AppConfig::from_json_str(&text).map_err(|err| err.to_string())?;
         config.config_path = self.config_path_path().or_else(|| {
             self.current_workspace_host_dir()
                 .map(|dir| hosted_config_path_for_workspace(&dir, &self.config_name()))
@@ -7973,7 +8158,7 @@ impl WatchApiApp {
                 config.session_state_path = config_dir.join(&config.session_state_path);
             }
         }
-        Some(config)
+        Ok(config)
     }
 
     fn clear_editor_session_binding(&mut self) {
@@ -8709,7 +8894,7 @@ impl WatchApiApp {
             == Some(key.as_str())
         {
             return if self.terminal_running {
-                "运行中".to_string()
+                running_session_status_label(path, &self.status)
             } else if self.running {
                 "启动中".to_string()
             } else if self.status.contains("异常") || self.status.contains("失败") {
@@ -8722,7 +8907,7 @@ impl WatchApiApp {
             .get(&key)
             .map(|session| {
                 if session.terminal_running {
-                    "运行中"
+                    return running_session_status_label(Path::new(&session.config_path), &session.status);
                 } else if session.running {
                     "启动中"
                 } else if session.status.contains("异常") || session.status.contains("失败") {
@@ -9034,6 +9219,7 @@ impl WatchApiApp {
         thread::spawn(move || stop_exit_runtime_cleanup(cleanup));
         let id = self.registry.open_workspace(path);
         self.registry.selected_workspace_id = Some(id);
+        self.registry.selected_path = None;
         self.config_path.clear();
         self.config = None;
         self.clear_editor_state_for_workspace_switch();
@@ -9114,6 +9300,7 @@ impl WatchApiApp {
         }
         self.editor_json = default_config_data();
         self.provider_json = load_global_provider_json();
+        align_default_endpoint_refs_to_provider_library(&mut self.editor_json, &self.provider_json);
         self.editor_tab = EditorTab::Global;
         self.selected_endpoint = 0;
         self.editor_config_path = None;
@@ -9134,6 +9321,7 @@ impl WatchApiApp {
         self.editor_open = false;
         self.editor_creating_new_config = false;
         self.editor_config_path = None;
+        let session_binding_clear_result = clear_session_bindings_for_config_path(&path);
         self.registry.remove(path);
         let registry_save_error = self.registry.save().err();
         if let Some(next) = self.registry.selected_path.clone() {
@@ -9147,9 +9335,11 @@ impl WatchApiApp {
             self.stop_tx = None;
             self.last_rows.clear();
         }
-        self.status = match registry_save_error {
-            Some(err) => format!("配置已移除，但保存配置列表失败：{err}"),
-            None => "配置已移除".to_string(),
+        self.status = match (registry_save_error, session_binding_clear_result) {
+            (Some(err), _) => format!("配置已移除，但保存配置列表失败：{err}"),
+            (None, Err(err)) => format!("配置已移除，但清除绑定失败：{err}"),
+            (None, Ok(cleared)) if cleared > 0 => format!("配置已移除，并清除 {cleared} 个会话绑定"),
+            (None, Ok(_)) => "配置已移除".to_string(),
         };
     }
 
@@ -9222,6 +9412,33 @@ impl WatchApiApp {
         }
     }
 
+    fn set_goal_mode_enabled(&mut self, enabled: bool) {
+        let Some(path) = self.config_path_path() else {
+            self.status = "请先选择配置".to_string();
+            return;
+        };
+        if enabled {
+            self.request_current_goal();
+            return;
+        }
+        let updates = vec![
+            ("goal_enabled", json!(false)),
+            ("goal_request", Value::Null),
+            ("goal_completed", json!(false)),
+        ];
+        match update_control_state(&path, &updates) {
+            Ok(_) => {
+                self.status = if enabled {
+                    "Goal 模式已开启"
+                } else {
+                    "Goal 模式已关闭"
+                }
+                .to_string();
+            }
+            Err(err) => self.status = format!("更新 Goal 模式失败：{err}"),
+        }
+    }
+
     fn apply_startup_auto_pause(&mut self) {
         let Some(path) = self.config_path_path() else {
             return;
@@ -9235,6 +9452,11 @@ impl WatchApiApp {
     fn is_auto_paused(&self) -> bool {
         let state = self.current_control_state();
         auto_paused_from_control_state(state.as_ref()).unwrap_or(true)
+    }
+
+    fn is_goal_mode_enabled(&self) -> bool {
+        let state = self.current_control_state();
+        goal_enabled_from_control_state(state.as_ref()).unwrap_or(false)
     }
 
     fn toggle_runtime_pause(&mut self) {
@@ -9268,16 +9490,38 @@ impl WatchApiApp {
             self.status = "请先在配置里填写 Goal 目标".to_string();
             return;
         }
+        let control_state = read_control_state(&path);
+        let resume_imported_goal = should_resume_imported_goal(config, Some(&control_state));
+        let action = if resume_imported_goal {
+            "resume"
+        } else {
+            "set"
+        };
         match update_control_state(
             &path,
-            &[(
-                "goal_request",
-                json!({
-                    "text": goal
-                }),
-            )],
+            &[
+                (
+                    "goal_request",
+                    json!({
+                        "action": action,
+                        "text": goal,
+                        "revision": config.agent_goal.revision,
+                        "source": config.agent_goal.source,
+                        "source_session_id": config.agent_goal.source_session_id,
+                        "source_goal_signature": config.agent_goal.source_goal_signature
+                    }),
+                ),
+                ("goal_enabled", json!(true)),
+                ("goal_completed", json!(false)),
+            ],
         ) {
-            Ok(_) => self.status = "Goal 已排队，等待 Agent 空闲后设置".to_string(),
+            Ok(_) => {
+                self.status = if resume_imported_goal {
+                    "Goal 恢复已排队，等待 Agent 空闲后执行 /goal resume".to_string()
+                } else {
+                    "Goal 已排队，等待 Agent 空闲后设置".to_string()
+                }
+            }
             Err(err) => self.status = format!("设置 Goal 失败：{err}"),
         }
     }
@@ -9784,6 +10028,63 @@ fn runtime_primary_icon(running: bool, auto_paused: bool) -> ToolButtonIcon {
 
 fn auto_paused_from_control_state(state: Option<&Value>) -> Option<bool> {
     state.and_then(|state| state.get("auto_paused").and_then(Value::as_bool))
+}
+
+fn goal_enabled_from_control_state(state: Option<&Value>) -> Option<bool> {
+    state.and_then(|state| state.get("goal_enabled").and_then(Value::as_bool))
+}
+
+fn running_session_status_label(path: &Path, status: &str) -> String {
+    if status.contains("异常") || status.contains("失败") {
+        return "异常".to_string();
+    }
+    let state = read_control_state(path);
+    let auto_paused = auto_paused_from_control_state(Some(&state)).unwrap_or(false);
+    let completion_pause_detected = completion_pause_detected_from_control_state(Some(&state));
+    let goal_enabled = goal_enabled_from_control_state(Some(&state)).unwrap_or(false);
+    if auto_paused && completion_pause_detected {
+        "完成暂停".to_string()
+    } else if auto_paused {
+        "暂停中".to_string()
+    } else if goal_enabled {
+        "Goal中".to_string()
+    } else {
+        "运行中".to_string()
+    }
+}
+
+fn should_resume_imported_goal(config: &AppConfig, state: Option<&Value>) -> bool {
+    config.agent_goal.source == "session_import"
+        && !config.agent_goal.source_goal_signature.trim().is_empty()
+        && config.agent_goal.last_user_edit_revision < config.agent_goal.revision
+        && !completed_imported_goal_matches(config, state)
+}
+
+fn completed_imported_goal_matches(config: &AppConfig, state: Option<&Value>) -> bool {
+    let Some(state) = state else {
+        return false;
+    };
+    if !state
+        .get("goal_completed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let completed_revision = state
+        .get("goal_completed_revision")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if completed_revision != 0 && completed_revision == config.agent_goal.revision {
+        return true;
+    }
+    let completed_signature = state
+        .get("goal_completed_source_goal_signature")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    !completed_signature.is_empty()
+        && completed_signature == config.agent_goal.source_goal_signature.trim()
 }
 
 fn completion_pause_detected_from_control_state(state: Option<&Value>) -> bool {
@@ -11829,6 +12130,100 @@ fn circular_tool_button(
     response
 }
 
+fn runtime_switch(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut bool,
+    enabled: bool,
+    hover_text: &str,
+    icon: ToolButtonIcon,
+) -> egui::Response {
+    const SWITCH_W: f32 = 54.0;
+    const SWITCH_KNOB_RADIUS: f32 = 7.0;
+    const SWITCH_KNOB_MARGIN: f32 = 10.0;
+    const SWITCH_LABEL_FONT: f32 = 11.0;
+
+    let size = vec2(SWITCH_W, CIRCULAR_ADD_BUTTON_SIZE);
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    let mut response = response.on_hover_text(hover_text);
+    if enabled && response.clicked() {
+        *value = !*value;
+        response.mark_changed();
+    }
+    let active = *value;
+    let fill = if !enabled {
+        md_surface_dim()
+    } else if active {
+        md_primary_container()
+    } else {
+        md_surface()
+    };
+    let border = if active && enabled {
+        accent()
+    } else {
+        md_outline_faint()
+    };
+    let pixels_per_point = ui.ctx().pixels_per_point();
+    let snap = |value: f32| (value * pixels_per_point).round() / pixels_per_point;
+    let track_rect = egui::Rect::from_min_max(
+        pos2(snap(rect.left()), snap(rect.top())),
+        pos2(snap(rect.right()), snap(rect.bottom())),
+    )
+    .shrink(0.5);
+    let paint_capsule = |painter: &egui::Painter, capsule: egui::Rect, color: Color32| {
+        let radius = (capsule.height() * 0.5).max(0.0);
+        let center_y = capsule.center().y;
+        let left_center = pos2(capsule.left() + radius, center_y);
+        let right_center = pos2(capsule.right() - radius, center_y);
+        let middle = egui::Rect::from_min_max(
+            pos2(left_center.x, capsule.top()),
+            pos2(right_center.x, capsule.bottom()),
+        );
+        painter.rect_filled(middle, egui::CornerRadius::same(0), color);
+        painter.circle_filled(left_center, radius, color);
+        painter.circle_filled(right_center, radius, color);
+    };
+    paint_capsule(ui.painter(), track_rect, border);
+    paint_capsule(ui.painter(), track_rect.shrink(1.0), fill);
+    let knob_center = if active {
+        pos2(rect.right() - SWITCH_KNOB_MARGIN, rect.center().y)
+    } else {
+        pos2(rect.left() + SWITCH_KNOB_MARGIN, rect.center().y)
+    };
+    let knob_fill = if active && enabled {
+        accent()
+    } else {
+        md_surface_2()
+    };
+    ui.painter()
+        .circle_filled(knob_center, SWITCH_KNOB_RADIUS, knob_fill);
+    paint_tool_button_icon(
+        ui,
+        knob_center,
+        icon,
+        Stroke::new(1.0, if enabled { md_text() } else { muted() }),
+        if enabled { md_text() } else { muted() },
+    );
+    let text_pos = if active {
+        pos2(rect.left() + 7.0, rect.center().y - 6.5)
+    } else {
+        pos2(rect.left() + 21.0, rect.center().y - 6.5)
+    };
+    ui.painter().text(
+        text_pos,
+        egui::Align2::LEFT_TOP,
+        label,
+        FontId::proportional(SWITCH_LABEL_FONT),
+        if enabled { md_text() } else { muted() },
+    );
+    response
+}
+
 fn paint_tool_button_icon(
     ui: &egui::Ui,
     center: egui::Pos2,
@@ -12787,6 +13182,42 @@ fn session_candidates_for_config_data(
     }
 }
 
+fn session_candidates_for_scan_context(
+    context: SessionCandidateScanContext,
+) -> Vec<SessionCandidate> {
+    let store = SessionStore::new(context.session_state_path);
+    match context.driver {
+        watchapi_core::AgentDriver::Codex => CodexSessionIndex::new(context.codex_home)
+            .ranked_candidates(
+                &context.workdir,
+                &context.config_name,
+                &context.agent_id,
+                &store,
+            ),
+        watchapi_core::AgentDriver::ClaudeCode => {
+            let home = context
+                .agent_home
+                .unwrap_or_else(|| home_dir().join(".claude"));
+            ClaudeSessionIndex::new(home).ranked_candidates(
+                &context.workdir,
+                &context.config_name,
+                &context.agent_id,
+                &store,
+            )
+        }
+        watchapi_core::AgentDriver::OpenCode | watchapi_core::AgentDriver::Generic => Vec::new(),
+    }
+}
+
+fn session_scan_agent_driver(text: &str) -> watchapi_core::AgentDriver {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "claude" | "claude-code" | "claude_code" => watchapi_core::AgentDriver::ClaudeCode,
+        "opencode" | "open-code" | "open_code" => watchapi_core::AgentDriver::OpenCode,
+        "generic" => watchapi_core::AgentDriver::Generic,
+        _ => watchapi_core::AgentDriver::Codex,
+    }
+}
+
 fn agent_driver_key(config: &AppConfig) -> String {
     match config.agent_driver {
         watchapi_core::AgentDriver::Codex => "codex",
@@ -12795,6 +13226,76 @@ fn agent_driver_key(config: &AppConfig) -> String {
         watchapi_core::AgentDriver::Generic => "generic",
     }
     .to_string()
+}
+
+fn clear_session_bindings_for_config_path(path: &Path) -> Result<usize, String> {
+    let config = AppConfig::load(path).map_err(|err| err.to_string())?;
+    let mut store = SessionStore::new(config.session_state_path.clone());
+    let mut cleared = 0usize;
+    for endpoint in &config.endpoints {
+        let key = session_binding_key_for_config(&config, endpoint);
+        if store.get_bound_session_id(&key).is_some() {
+            store
+                .delete_bound_session_id(&key)
+                .map_err(|err| err.to_string())?;
+            cleared += 1;
+        }
+    }
+    Ok(cleared)
+}
+
+fn import_session_goal_into_editor_json(
+    editor_json: &mut Value,
+    goal: &CodexSessionGoalRecord,
+    session_id: &str,
+) -> bool {
+    let goal_text = goal.text.trim();
+    if goal_text.is_empty() {
+        return false;
+    }
+    let current = editor_json
+        .get("agent_goal")
+        .and_then(|value| value.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if !current.is_empty() {
+        return false;
+    }
+    if !editor_json.get("agent_goal").is_some_and(Value::is_object) {
+        editor_json["agent_goal"] = json!({});
+    }
+    let revision = next_agent_goal_revision(editor_json);
+    editor_json["continuation_mode"] = json!("goal");
+    editor_json["agent_goal"]["enabled"] = json!(true);
+    editor_json["agent_goal"]["text"] = json!(goal_text);
+    editor_json["agent_goal"]["revision"] = json!(revision);
+    editor_json["agent_goal"]["source"] = json!("session_import");
+    editor_json["agent_goal"]["source_session_id"] = json!(session_id);
+    editor_json["agent_goal"]["source_goal_signature"] = json!(goal.signature);
+    editor_json["agent_goal"]["sync_on_resume"] = json!(true);
+    true
+}
+
+fn mark_agent_goal_user_edit(editor_json: &mut Value) {
+    if !editor_json.get("agent_goal").is_some_and(Value::is_object) {
+        editor_json["agent_goal"] = json!({});
+    }
+    let revision = next_agent_goal_revision(editor_json);
+    editor_json["agent_goal"]["revision"] = json!(revision);
+    editor_json["agent_goal"]["last_user_edit_revision"] = json!(revision);
+    editor_json["agent_goal"]["source"] = json!("user_edit");
+    editor_json["agent_goal"]["source_session_id"] = json!("");
+    editor_json["agent_goal"]["source_goal_signature"] = json!("");
+}
+
+fn next_agent_goal_revision(editor_json: &Value) -> u64 {
+    editor_json
+        .get("agent_goal")
+        .and_then(|goal| goal.get("revision"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(1)
 }
 
 fn short_session_id(session_id: &str) -> String {
@@ -13692,6 +14193,10 @@ fn hosted_config_path_for_workspace(workspace_dir: &Path, desired_name: &str) ->
     )
 }
 
+fn workspace_session_scan_dialog_path(workspace_dir: &Path) -> PathBuf {
+    workspace_dir.join(".watchapi-session-scan.json")
+}
+
 fn generated_agent_id(agent_driver: &str, config_name: &str) -> String {
     let driver = agent_driver.trim();
     let name = config_name.trim();
@@ -14269,6 +14774,35 @@ fn prune_endpoint_refs_not_in_set(
             .unwrap_or(false)
     });
     items.len() != before
+}
+
+fn align_default_endpoint_refs_to_provider_library(editor_json: &mut Value, provider_json: &Value) {
+    let Some(first_provider) = provider_json
+        .get("providers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|provider| provider.get("name").and_then(Value::as_str))
+        .map(str::trim)
+        .find(|name| !name.is_empty())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let valid_providers = provider_name_set(provider_json);
+    let has_valid_ref = editor_json
+        .get("endpoint_refs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("provider").and_then(Value::as_str))
+        .any(|name| valid_providers.contains(&name.trim().to_ascii_lowercase()));
+    if !has_valid_ref {
+        editor_json["endpoint_refs"] = json!([{
+            "provider": first_provider,
+            "enabled": true
+        }]);
+    }
 }
 
 fn save_config_json_without_endpoint_validation(path: &Path, value: &Value) -> Result<(), String> {
@@ -16117,7 +16651,7 @@ mod tests {
         assert!(!action_buttons.contains("self.stop_runtime();"));
         assert!(action_buttons.contains("ToolButtonIcon::Refresh"));
         assert!(action_buttons.contains("ToolButtonIcon::Stop"));
-        assert!(action_buttons.contains("runtime_primary_icon("));
+        assert!(action_buttons.contains("runtime_switch("));
     }
 
     #[test]
@@ -16141,7 +16675,7 @@ mod tests {
                 ),
             "启动/重启控制应放在当前配置标题行右侧，并在按钮前显示运行计时"
         );
-        assert!(action_buttons.contains("runtime_primary_icon("));
+        assert!(action_buttons.contains("runtime_switch("));
         assert!(action_buttons.contains("ToolButtonIcon::Refresh"));
         assert!(action_buttons.contains("self.restart_current_agent();"));
         assert!(action_buttons.contains("ToolButtonIcon::Stop"));
@@ -16154,8 +16688,8 @@ mod tests {
                 && action_buttons.find("self.interrupt_current_terminal_task();")
                     < action_buttons.find("self.force_full_probe_current_runtime();")
                 && action_buttons.find("self.force_full_probe_current_runtime();")
-                    < action_buttons.find("runtime_primary_icon("),
-            "停止当前任务按钮应放在重启按钮右侧，强制重新探测按钮应放在停止按钮右侧、播放/暂停按钮左侧"
+                    < action_buttons.find("runtime_switch("),
+            "停止当前任务按钮应放在重启按钮右侧，强制重新探测按钮应放在停止按钮右侧、自动/Goal 开关左侧"
         );
         assert!(!action_buttons.contains("egui::Button::new(\"\\u{21bb}\")"));
         assert!(!action_buttons.contains("egui::Button::new(\"重启\")"));
@@ -16242,7 +16776,7 @@ mod tests {
         assert!(clear_switch.contains("self.runtime_started_at = None;"));
         assert!(source.contains("ui.ctx().request_repaint_after(Duration::from_secs(1));"));
         assert!(source.contains("fn format_runtime_elapsed"));
-        assert!(source.contains("fn runtime_primary_icon"));
+        assert!(source.contains("fn runtime_switch"));
     }
 
     #[test]
@@ -16629,10 +17163,10 @@ mod tests {
         assert!(
             workspace_row.contains("新建配置项")
                 && workspace_row
-                    .contains("self.registry.selected_workspace_id = Some(workspace.id.clone())")
+                    .contains("self.select_workspace_row(workspace.id.clone(), false);")
                 && workspace_row.contains("self.prepare_new_config();")
                 && !workspace_row.contains("self.add_config_dialog();"),
-            "工作区行右侧加号表示新建配置项，不能继续打开导入配置文件流程"
+            "工作区行右侧加号必须先完整切换到该工作区，再新建配置项，不能沿用旧配置上下文"
         );
         assert!(
             workspace_row.contains("circular_add_button(ui, \"新建配置项\")")
@@ -16651,7 +17185,7 @@ mod tests {
         assert!(
             workspace_row.contains("toggle_response")
                 && workspace_row.contains("add_response")
-                && workspace_row.contains("toggle.union(add).union(response)")
+                && workspace_row.contains("row_response = row_response.union(add)")
                 && workspace_row.contains("let toggle_width =")
                 && workspace_row
                     .contains("let (toggle_rect, label_response) = ui.allocate_exact_size")
@@ -18654,37 +19188,28 @@ mod tests {
     }
 
     #[test]
-    fn runtime_primary_button_toggles_start_pause_resume() {
-        assert_eq!(
-            primary_runtime_button_label(false, false),
-            "\u{542f}\u{52a8}"
-        );
-        assert_eq!(
-            primary_runtime_button_label(true, false),
-            "\u{6682}\u{505c}"
-        );
-        assert_eq!(primary_runtime_button_label(true, true), "\u{7ee7}\u{7eed}");
-
+    fn runtime_switches_toggle_auto_and_goal_modes() {
         let source = include_str!("app.rs");
-        let toggle_block = source
-            .split("fn toggle_runtime_pause")
+        let action_block = source
+            .split("fn render_runtime_action_buttons")
             .nth(1)
-            .and_then(|tail| tail.split("fn restart_current_agent").next())
-            .expect("runtime pause toggle helper should be discoverable");
+            .and_then(|tail| tail.split("fn load_config").next())
+            .expect("runtime action buttons should be discoverable");
 
-        assert!(toggle_block.contains("self.start_runtime();"));
-        assert!(toggle_block.contains("let was_paused = self.is_auto_paused();"));
-        assert!(toggle_block.contains("self.trigger_auto_prompt_now();"));
-        assert!(toggle_block.contains("self.set_auto_pause(true);"));
-        assert!(toggle_block.contains("RuntimeCommand::ConfirmCurrentProbe"));
+        assert!(action_block.contains("runtime_switch("));
+        assert!(action_block.contains("\"自动\""));
+        assert!(action_block.contains("\"Goal\""));
+        assert!(action_block.contains("self.trigger_auto_prompt_now();"));
+        assert!(action_block.contains("self.set_auto_pause(true);"));
+        assert!(action_block.contains("self.set_goal_mode_enabled(goal_enabled);"));
+        assert!(action_block.contains("RuntimeCommand::ConfirmCurrentProbe"));
+        assert!(action_block.contains("self.start_runtime();"));
+        assert!(action_block
+            .contains("if self.running {\n                    self.trigger_auto_prompt_now();"));
         assert!(
-            toggle_block.find("self.trigger_auto_prompt_now();")
-                < toggle_block.find("RuntimeCommand::ConfirmCurrentProbe"),
+            action_block.find("self.trigger_auto_prompt_now();")
+                < action_block.find("RuntimeCommand::ConfirmCurrentProbe"),
             "恢复自动续航时应先解除暂停并设置 trigger_now，再请求 runtime 按间隔确认当前接口"
-        );
-        assert!(
-            !toggle_block.contains("\u{6682}\u{505c}\u{81ea}\u{52a8}\u{7eed}\u{822a}"),
-            "主按钮应显示短标签“暂停/继续”，不能回退到旧的长标签"
         );
     }
 
@@ -19085,6 +19610,52 @@ mod tests {
         assert!(cleanup_block.contains("runtime: self.runtime.take()"));
         assert!(cleanup_block.contains("worker: self.worker.take()"));
         assert!(cleanup_block.contains("stop_tx: self.stop_tx.take()"));
+    }
+
+    #[test]
+    fn remove_current_config_clears_bound_session_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let workdir = temp.path().join("project");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let config_path = temp.path().join("config.json");
+        let state_path = temp.path().join("session-state.json");
+        let mut config_json = default_config_data();
+        config_json["workdir"] = json!(workdir.to_string_lossy().to_string());
+        config_json["session_state_path"] = json!(state_path.to_string_lossy().to_string());
+        config_json["endpoint_refs"] = json!([{ "provider": "high", "enabled": true }]);
+        config_json["providers"] = json!([{
+            "name": "high",
+            "base_url": "http://127.0.0.1:8787/v1",
+            "api_key": "key",
+            "model": "gpt-5.4",
+            "reasoning_effort": "high",
+            "weight": 100
+        }]);
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&config_json).unwrap(),
+        )
+        .unwrap();
+        let config = AppConfig::load(&config_path).unwrap();
+        let endpoint = config.endpoints.first().unwrap();
+        let binding_key = session_binding_key_for_config(&config, endpoint);
+        let mut store = SessionStore::new(config.session_state_path.clone());
+        store
+            .set_bound_session_id(&binding_key, "session-1", None)
+            .unwrap();
+
+        let mut app = WatchApiApp::new(Some(String::new()));
+        app.registry = GuiConfigRegistry::new(temp.path().join(".watchapi-gui.json"));
+        let workspace_id = app.registry.open_workspace(&workdir);
+        app.registry
+            .register_config_in_workspace(&workspace_id, config_path.clone());
+        app.config_path = config_path.to_string_lossy().into_owned();
+
+        app.remove_current_config();
+
+        let reloaded = SessionStore::new(config.session_state_path.clone());
+        assert_eq!(reloaded.get_bound_session_id(&binding_key), None);
+        assert!(app.status.contains("清除 1 个会话绑定"));
     }
 
     #[test]
@@ -19834,6 +20405,7 @@ mod tests {
         assert!(paused_updates.contains(&("auto_paused", json!(true))));
         assert!(paused_updates.contains(&("trigger_now", json!(false))));
         assert!(paused_updates.contains(&("completion_pause_detected", json!(false))));
+        assert!(!paused_updates.iter().any(|(key, _)| *key == "goal_enabled"));
         assert!(unpaused_updates.contains(&("auto_paused", json!(false))));
         assert!(unpaused_updates.contains(&("trigger_now", json!(false))));
         assert!(unpaused_updates.contains(&("completion_pause_detected", json!(false))));
@@ -20059,10 +20631,142 @@ mod tests {
             .and_then(|tail| tail.split("fn restart_current_agent").next())
             .expect("goal request helper should be discoverable");
 
-        assert!(action_block.contains("设置 Goal"));
-        assert!(action_block.contains("self.request_current_goal();"));
+        assert!(action_block.contains("\"Goal\""));
+        assert!(action_block.contains("runtime_switch("));
+        assert!(action_block.contains("self.set_goal_mode_enabled(goal_enabled);"));
+        assert!(source.contains("fn set_goal_mode_enabled"));
+        assert!(source.contains("self.request_current_goal();"));
         assert!(request_block.contains("\"goal_request\""));
+        assert!(request_block.contains("\"goal_enabled\""));
         assert!(request_block.contains("config.agent_goal.text.trim()"));
+    }
+
+    #[test]
+    fn importing_session_goal_fills_empty_goal_config() {
+        let mut editor_json = default_config_data();
+        editor_json["continuation_mode"] = json!("auto");
+        editor_json["agent_goal"]["enabled"] = json!(false);
+        editor_json["agent_goal"]["text"] = json!("");
+
+        assert!(import_session_goal_into_editor_json(
+            &mut editor_json,
+            &CodexSessionGoalRecord {
+                text: "完成历史目标回填".to_string(),
+                signature: "line:1:hash:a".to_string(),
+            },
+            "session-1",
+        ));
+        assert_eq!(editor_json["continuation_mode"], json!("goal"));
+        assert_eq!(editor_json["agent_goal"]["enabled"], json!(true));
+        assert_eq!(editor_json["agent_goal"]["text"], json!("完成历史目标回填"));
+        assert_eq!(editor_json["agent_goal"]["revision"], json!(1));
+        assert_eq!(editor_json["agent_goal"]["source"], json!("session_import"));
+        assert_eq!(
+            editor_json["agent_goal"]["source_session_id"],
+            json!("session-1")
+        );
+        assert_eq!(
+            editor_json["agent_goal"]["source_goal_signature"],
+            json!("line:1:hash:a")
+        );
+        assert_eq!(editor_json["agent_goal"]["sync_on_resume"], json!(true));
+    }
+
+    #[test]
+    fn importing_session_goal_preserves_user_goal_text_after_binding() {
+        let mut editor_json = default_config_data();
+        editor_json["continuation_mode"] = json!("goal");
+        editor_json["agent_goal"]["enabled"] = json!(true);
+        editor_json["agent_goal"]["text"] = json!("已有目标");
+        editor_json["agent_goal"]["revision"] = json!(7);
+        editor_json["agent_goal"]["source"] = json!("user_edit");
+
+        assert!(!import_session_goal_into_editor_json(
+            &mut editor_json,
+            &CodexSessionGoalRecord {
+                text: "历史目标".to_string(),
+                signature: "line:2:hash:b".to_string(),
+            },
+            "session-2",
+        ));
+        assert_eq!(editor_json["agent_goal"]["text"], json!("已有目标"));
+        assert_eq!(editor_json["agent_goal"]["revision"], json!(7));
+        assert_eq!(editor_json["agent_goal"]["source"], json!("user_edit"));
+    }
+
+    #[test]
+    fn user_goal_edits_increment_revision_each_time() {
+        let mut editor_json = default_config_data();
+        editor_json["agent_goal"]["revision"] = json!(1);
+        editor_json["agent_goal"]["source"] = json!("session_import");
+        editor_json["agent_goal"]["source_session_id"] = json!("session-1");
+        editor_json["agent_goal"]["source_goal_signature"] = json!("line:1:hash:a");
+
+        mark_agent_goal_user_edit(&mut editor_json);
+        assert_eq!(editor_json["agent_goal"]["revision"], json!(2));
+        assert_eq!(
+            editor_json["agent_goal"]["last_user_edit_revision"],
+            json!(2)
+        );
+        assert_eq!(editor_json["agent_goal"]["source"], json!("user_edit"));
+        assert_eq!(
+            editor_json["agent_goal"]["source_goal_signature"],
+            json!("")
+        );
+
+        mark_agent_goal_user_edit(&mut editor_json);
+        assert_eq!(editor_json["agent_goal"]["revision"], json!(3));
+        assert_eq!(
+            editor_json["agent_goal"]["last_user_edit_revision"],
+            json!(3)
+        );
+    }
+
+    #[test]
+    fn completed_imported_goal_does_not_resume_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "workdir": "D:/Works/SelfWorks/WatchApi",
+                "initial_prompt": "init",
+                "auto_prompt": "auto",
+                "agent_command": ["codex", "--no-alt-screen"],
+                "endpoint_refs": [{ "provider": "high" }],
+                "providers": [{
+                    "name": "high",
+                    "base_url": "http://127.0.0.1:8787/v1",
+                    "api_key": "key",
+                    "model": "gpt-5.4",
+                    "reasoning_effort": "high",
+                    "weight": 100
+                }],
+                "continuation_mode": "goal",
+                "agent_goal": {
+                    "enabled": true,
+                    "text": "历史目标",
+                    "revision": 4,
+                    "last_user_edit_revision": 0,
+                    "source": "session_import",
+                    "source_session_id": "session-1",
+                    "source_goal_signature": "line:7:hash:abc",
+                    "sync_on_resume": true
+                }
+            }"#,
+        )
+        .unwrap();
+        let config = AppConfig::load(&config_path).unwrap();
+
+        assert!(should_resume_imported_goal(&config, None));
+        assert!(!should_resume_imported_goal(
+            &config,
+            Some(&json!({
+                "goal_completed": true,
+                "goal_completed_revision": 4,
+                "goal_completed_source_goal_signature": "line:7:hash:abc"
+            }))
+        ));
     }
 
     #[test]
@@ -20495,6 +21199,16 @@ mod tests {
             endpoint_ref_names(&load_json_or_default(&config_path)),
             vec!["keep"]
         );
+    }
+
+    #[test]
+    fn new_config_endpoint_ref_follows_existing_provider_library() {
+        let mut editor_json = default_config_data();
+        let provider_json = json!({"providers": [provider_named("dc")]});
+
+        align_default_endpoint_refs_to_provider_library(&mut editor_json, &provider_json);
+
+        assert_eq!(endpoint_ref_names(&editor_json), vec!["dc"]);
     }
 
     #[test]
@@ -20982,7 +21696,7 @@ mod tests {
 
     #[test]
     fn running_endpoint_change_refreshes_config_rows_without_restarting_runtime() {
-        let mut app = WatchApiApp::default();
+        let mut app = WatchApiApp::new(Some(String::new()));
         let temp = tempfile::tempdir().unwrap();
         app.config_path = temp
             .path()
@@ -21059,8 +21773,10 @@ mod tests {
             .and_then(|tail| tail.split("fn render_inline_session_candidates").next())
             .expect("session binding block should be discoverable");
 
-        assert!(block.contains("let config = self.editor_config_for_session_binding();"));
-        assert!(block.contains("config.is_none()"));
+        assert!(
+            block.contains("let config_result = self.editor_config_for_session_binding_result();")
+        );
+        assert!(block.contains("let config = config_result.as_ref().ok();"));
         assert!(block.contains("\"扫描并选择会话\""));
         assert!(block.contains("\"清除绑定\""));
         assert!(block.contains("\"启动时新建\""));
@@ -21068,6 +21784,20 @@ mod tests {
             !block.contains("let Some(config) = self.editor_config_for_session_binding() else"),
             "会话绑定页不能因配置解析失败提前 return，否则搜索/清除/新建按钮会全部消失"
         );
+    }
+
+    #[test]
+    fn session_binding_page_shows_config_parse_error_detail() {
+        let source = include_str!("app.rs");
+        let block = source
+            .split("fn render_endpoint_session_binding_block")
+            .nth(1)
+            .and_then(|tail| tail.split("fn render_inline_session_candidates").next())
+            .expect("session binding block should be discoverable");
+
+        assert!(source.contains("fn editor_config_for_session_binding_result"));
+        assert!(block.contains("config_result.as_ref().err()"));
+        assert!(block.contains("当前配置还不能解析：{err}"));
     }
 
     #[test]
@@ -21243,7 +21973,14 @@ mod tests {
         );
         assert!(clear_block.contains("config.endpoints.get(self.selected_endpoint)"));
         assert!(bind_block.contains("SessionBindSource::Editor => self.selected_endpoint"));
-        assert!(scan_block.contains("let endpoint_index = self.selected_endpoint;"));
+        assert!(scan_block.contains("self.editor_session_candidate_scan_context()"));
+        assert!(source
+            .split("fn editor_session_candidate_scan_context")
+            .nth(1)
+            .and_then(|tail| tail
+                .split("fn editor_config_for_session_binding_result")
+                .next())
+            .is_some_and(|block| block.contains("config.endpoints.get(self.selected_endpoint)")));
         assert!(!binding_block.contains("config.endpoints.first()"));
         assert!(!clear_block.contains("config.endpoints.first()"));
 
@@ -21267,6 +22004,156 @@ mod tests {
                 .map(|endpoint| endpoint.name.as_str()),
             Some("second")
         );
+    }
+
+    #[test]
+    fn editor_session_scan_falls_back_to_current_workspace_without_valid_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_path = temp.path().join("HHHL");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+        let mut app = WatchApiApp::default();
+        let workspace_id = app.registry.open_workspace(&workspace_path);
+        app.registry.selected_workspace_id = Some(workspace_id.clone());
+        app.editor_json = default_config_data();
+        app.editor_json["endpoint_refs"] = json!([{ "provider": "missing-provider" }]);
+        app.provider_json = json!({ "providers": [] });
+        app.editor_json["codex_home"] = json!(temp.path().join(".codex").to_string_lossy());
+        app.editor_json["agent_id"] = json!("codex-主线");
+
+        let context = app
+            .editor_session_candidate_scan_context()
+            .expect("current workspace should be enough to scan sessions");
+
+        assert_eq!(context.driver, watchapi_core::AgentDriver::Codex);
+        assert_eq!(
+            normalize_config_path(context.workdir),
+            normalize_config_path(workspace_path)
+        );
+        assert!(context
+            .dialog_path
+            .starts_with(app.registry.workspace_host_dir(&app_root(), &workspace_id)));
+    }
+
+    #[test]
+    fn editor_workspace_session_scan_uses_stable_non_config_dialog_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_path = temp.path().join("HHHL");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+        let mut app = WatchApiApp::default();
+        let workspace_id = app.registry.open_workspace(&workspace_path);
+        app.registry.selected_workspace_id = Some(workspace_id.clone());
+        let host_dir = app.registry.workspace_host_dir(&app_root(), &workspace_id);
+        std::fs::create_dir_all(&host_dir).unwrap();
+        std::fs::write(host_dir.join("新配置.json"), "{}").unwrap();
+        app.editor_json = default_config_data();
+        app.editor_json["endpoint_refs"] = json!([{ "provider": "missing-provider" }]);
+        app.provider_json = json!({ "providers": [] });
+
+        let context = app
+            .editor_session_candidate_scan_context()
+            .expect("current workspace should be enough to scan sessions");
+
+        assert_eq!(
+            context.dialog_path,
+            host_dir.join(".watchapi-session-scan.json")
+        );
+    }
+
+    #[test]
+    fn editor_workspace_session_scan_ignores_stale_editor_json_without_selected_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let stale_workspace = temp.path().join("XAgent");
+        let current_workspace = temp.path().join("HHHL");
+        std::fs::create_dir_all(&stale_workspace).unwrap();
+        std::fs::create_dir_all(&current_workspace).unwrap();
+        let mut app = WatchApiApp::default();
+        let workspace_id = app.registry.open_workspace(&current_workspace);
+        app.registry.selected_workspace_id = Some(workspace_id);
+        app.config_path.clear();
+        app.editor_config_path = None;
+        app.editor_json = default_config_data();
+        app.provider_json = default_provider_library_data();
+        app.editor_json["workdir"] = json!(stale_workspace.to_string_lossy().to_string());
+
+        let context = app
+            .editor_session_candidate_scan_context()
+            .expect("selected workspace should be enough to scan sessions");
+
+        assert_eq!(
+            normalize_config_path(context.workdir),
+            normalize_config_path(current_workspace)
+        );
+    }
+
+    #[test]
+    fn editor_codex_session_scan_marks_candidates_with_history_goal() {
+        let temp = tempfile::tempdir().unwrap();
+        let codex_home = temp.path().join(".codex");
+        let workdir = temp.path().join("HHHL");
+        let session_dir = codex_home.join("sessions/2026/05/25");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&workdir).unwrap();
+        let session_file = session_dir.join("rollout-2026-05-25T00-34-07-test.jsonl");
+        std::fs::write(
+            &session_file,
+            [
+                json!({"type": "session_meta", "payload": {"id": "hhhl-goal", "cwd": workdir.to_string_lossy()}}).to_string(),
+                json!({"type": "event_msg", "payload": {"type": "thread_goal_updated", "goal": {"objective": "复刻 HHHL Web 端", "status": "active"}}}).to_string(),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let context = SessionCandidateScanContext {
+            driver: watchapi_core::AgentDriver::Codex,
+            codex_home,
+            agent_home: None,
+            workdir,
+            config_name: "hhhl".to_string(),
+            agent_id: "codex".to_string(),
+            session_state_path: temp.path().join("session-state.json"),
+            dialog_path: temp.path().join(".watchapi-session-scan.json"),
+        };
+
+        let candidates = session_candidates_for_scan_context(context);
+
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.session_id == "hhhl-goal")
+            .expect("HHHL goal session should be discovered by bind-dialog scan");
+        assert!(
+            candidate.reason.contains("含历史 Goal"),
+            "绑定对话扫描阶段就应标记候选包含历史 Goal，实际 reason: {}",
+            candidate.reason
+        );
+    }
+
+    #[test]
+    fn selecting_workspace_clears_persisted_selected_config_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = WatchApiApp::new(None);
+        let workspace_a = tmp.path().join("workspace-a");
+        let workspace_b = tmp.path().join("HHHL");
+        std::fs::create_dir_all(&workspace_a).unwrap();
+        std::fs::create_dir_all(&workspace_b).unwrap();
+        let old_config = tmp.path().join("old.json");
+        std::fs::write(&old_config, "{}").unwrap();
+        let workspace_a_id = app.registry.open_workspace(&workspace_a);
+        let old_config = app
+            .registry
+            .register_config_in_workspace(&workspace_a_id, old_config);
+        let workspace_b_id = app.registry.open_workspace(&workspace_b);
+        app.registry.selected_path = Some(old_config);
+        app.config_path = tmp.path().join("old.json").to_string_lossy().to_string();
+
+        app.select_workspace_row(workspace_b_id.clone(), false);
+
+        assert_eq!(
+            app.registry.selected_workspace_id.as_deref(),
+            Some(workspace_b_id.as_str())
+        );
+        assert!(app.registry.selected_path.is_none());
+        assert!(app.config_path.trim().is_empty());
     }
 
     #[test]
@@ -21623,6 +22510,50 @@ mod tests {
         assert_eq!(app.session_status_for_path(&path), "运行中");
         assert!(app.session_terminal_running(&path));
         assert_eq!(app.running_session_count(), 1);
+    }
+
+    #[test]
+    fn config_list_status_shows_paused_and_goal_running_modes() {
+        let mut app = WatchApiApp::default();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        app.config_path = path.to_string_lossy().into_owned();
+        app.running = true;
+        app.terminal_running = true;
+
+        update_control_state(
+            &path,
+            &[
+                ("auto_paused", json!(true)),
+                ("completion_pause_detected", json!(false)),
+                ("goal_enabled", json!(false)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(app.session_status_for_path(&path), "暂停中");
+
+        update_control_state(
+            &path,
+            &[
+                ("auto_paused", json!(true)),
+                ("completion_pause_detected", json!(true)),
+                ("goal_enabled", json!(false)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(app.session_status_for_path(&path), "完成暂停");
+
+        update_control_state(
+            &path,
+            &[
+                ("auto_paused", json!(false)),
+                ("completion_pause_detected", json!(false)),
+                ("goal_enabled", json!(true)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(app.session_status_for_path(&path), "Goal中");
     }
 
     #[test]

@@ -59,6 +59,7 @@ pub struct AgentProcess {
     handled_sandbox_setup_prompt: bool,
     observed_terminal_view_revision: u64,
     observed_terminal_view_text: String,
+    observed_current_input_placeholder: bool,
     last_prompt_sent_view_revision: Option<u64>,
     isolated_codex_home: Option<IsolatedCodexHome>,
     launched_at: Option<Instant>,
@@ -235,6 +236,7 @@ impl AgentProcess {
             handled_sandbox_setup_prompt: false,
             observed_terminal_view_revision: 0,
             observed_terminal_view_text: String::new(),
+            observed_current_input_placeholder: false,
             last_prompt_sent_view_revision: None,
             isolated_codex_home: None,
             launched_at: None,
@@ -594,6 +596,12 @@ impl AgentProcess {
         if self.awaiting_turn_completion || !self.startup_ready_for_prompt() {
             return false;
         }
+        if codex_prefilled_input_visible(
+            &self.observed_terminal_view_text,
+            self.observed_current_input_placeholder,
+        ) {
+            return false;
+        }
         if self.current_terminal_view_busy() {
             if self.stale_working_prompt_can_unlock() {
                 return true;
@@ -603,6 +611,43 @@ impl AgentProcess {
             );
         }
         true
+    }
+
+    pub fn auto_input_block_reason(&self) -> Option<&'static str> {
+        if self.awaiting_turn_completion {
+            return Some("等待上一轮完成");
+        }
+        if !self.startup_ready_for_prompt() {
+            if self.config.agent_driver == AgentDriverKind::Codex
+                && codex_update_prompt_visible(&self.recent_output)
+            {
+                return Some("等待 Codex 更新确认");
+            }
+            return Some("等待 Codex 就绪");
+        }
+        if codex_prefilled_input_visible(
+            &self.observed_terminal_view_text,
+            self.observed_current_input_placeholder,
+        ) {
+            return Some("输入框已有内容");
+        }
+        if self.current_terminal_view_busy() {
+            if self.stale_working_prompt_can_unlock()
+                || self.monitor.as_ref().is_some_and(
+                    AgentSessionMonitor::has_completed_assistant_message_since_wait_start,
+                )
+            {
+                return None;
+            }
+            if codex_queued_message_visible(&self.observed_terminal_view_text) {
+                return Some("已有排队消息");
+            }
+            if codex_working_prompt_visible(&self.observed_terminal_view_text) {
+                return Some("检测到 Working");
+            }
+            return Some("终端忙碌");
+        }
+        None
     }
 
     pub fn auto_wait_safely_released(&self) -> bool {
@@ -633,14 +678,16 @@ impl AgentProcess {
         if !self.startup_ready_for_prompt() {
             return false;
         }
-        if !self.awaiting_turn_completion {
-            return false;
-        }
         if self.current_terminal_view_busy() {
             return false;
         }
-        let visible_prefilled_input =
-            codex_prefilled_input_visible(&self.observed_terminal_view_text);
+        let visible_prefilled_input = codex_prefilled_input_visible(
+            &self.observed_terminal_view_text,
+            self.observed_current_input_placeholder,
+        );
+        if !self.awaiting_turn_completion && !visible_prefilled_input {
+            return false;
+        }
         if let Some(monitor) = &self.monitor {
             if !visible_prefilled_input
                 && (monitor.has_inflight_turn() || monitor.last_task_started())
@@ -857,6 +904,7 @@ impl AgentProcess {
         let Some(terminal) = self.terminal.as_ref() else {
             self.observed_terminal_view_revision = 0;
             self.observed_terminal_view_text.clear();
+            self.observed_current_input_placeholder = false;
             return;
         };
         let revision = terminal.view_revision();
@@ -864,9 +912,13 @@ impl AgentProcess {
             return;
         }
         self.observed_terminal_view_revision = revision;
-        let screen = terminal_view_visible_text(&terminal.view());
+        let view = terminal.view();
+        self.observed_current_input_placeholder = terminal_view_current_codex_input(&view)
+            .is_some_and(|input| !input.text.is_empty() && input.placeholder);
+        let screen = terminal_view_visible_text(&view);
         if screen.trim().is_empty() {
             self.observed_terminal_view_text.clear();
+            self.observed_current_input_placeholder = false;
         } else {
             self.observed_terminal_view_text = screen;
             let view_updated_after_prompt = self
@@ -1599,21 +1651,29 @@ fn codex_idle_prompt_visible(text: &str) -> bool {
         let Some((_, input)) = line.split_once('›') else {
             return false;
         };
-        let input = input.trim();
+        let input = codex_visible_input_text(input);
         input.is_empty() || codex_placeholder_input_visible(input)
     })
 }
 
-fn codex_prefilled_input_visible(text: &str) -> bool {
+fn codex_prefilled_input_visible(text: &str, current_input_placeholder: bool) -> bool {
     if codex_busy_prompt_visible(text) {
         return false;
     }
-    text.lines().any(|line| {
-        let Some((_, input)) = line.split_once('›') else {
-            return false;
-        };
-        let input = input.trim();
-        !input.is_empty() && !codex_placeholder_input_visible(input)
+    let Some(input) = codex_current_prompt_input(text) else {
+        return false;
+    };
+    !input.is_empty() && !current_input_placeholder && !codex_placeholder_input_visible(input)
+}
+
+fn codex_visible_input_text(input: &str) -> &str {
+    input.trim()
+}
+
+fn codex_current_prompt_input(text: &str) -> Option<&str> {
+    text.lines().rev().find_map(|line| {
+        line.split_once('›')
+            .map(|(_, input)| codex_visible_input_text(input))
     })
 }
 
@@ -1727,6 +1787,53 @@ fn terminal_view_visible_text(view: &TerminalView) -> String {
         text.push_str(line.trim_end());
     }
     text
+}
+
+struct CodexCurrentInput {
+    text: String,
+    placeholder: bool,
+}
+
+fn terminal_view_current_codex_input(view: &TerminalView) -> Option<CodexCurrentInput> {
+    if view.rows == 0 || view.cols == 0 {
+        return None;
+    }
+    for row in (0..view.rows).rev() {
+        let start = row.saturating_mul(view.cols);
+        let end = start.saturating_add(view.cols).min(view.cells.len());
+        let cells = &view.cells[start..end];
+        let Some(prompt_col) = cells
+            .iter()
+            .position(|cell| !cell.hidden && !cell.wide_spacer && cell.c == '›')
+        else {
+            continue;
+        };
+        let input_cells = &cells[prompt_col.saturating_add(1)..];
+        let first = input_cells
+            .iter()
+            .position(|cell| !cell.hidden && !cell.wide_spacer && !cell.c.is_whitespace())?;
+        let last = input_cells
+            .iter()
+            .rposition(|cell| !cell.hidden && !cell.wide_spacer && !cell.c.is_whitespace())?;
+        let visible = &input_cells[first..=last];
+        let text = visible
+            .iter()
+            .filter(|cell| !cell.hidden && !cell.wide_spacer)
+            .map(|cell| cell.c)
+            .collect::<String>();
+        let placeholder = visible
+            .iter()
+            .filter(|cell| !cell.hidden && !cell.wide_spacer && !cell.c.is_whitespace())
+            .all(|cell| cell.dim || is_muted_placeholder_rgb(cell.fg));
+        return Some(CodexCurrentInput { text, placeholder });
+    }
+    None
+}
+
+fn is_muted_placeholder_rgb(rgb: crate::terminal_emulator::TerminalRgb) -> bool {
+    let max = rgb.r.max(rgb.g).max(rgb.b);
+    let min = rgb.r.min(rgb.g).min(rgb.b);
+    max <= 180 && min >= 70 && max.saturating_sub(min) <= 40
 }
 
 fn is_endpoint_failure_text(text: &str) -> bool {
@@ -2472,6 +2579,32 @@ mod tests {
     }
 
     #[test]
+    fn submit_retry_resubmits_visible_prefilled_input_after_wait_gate_released() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let mut agent = AgentProcess::new(
+            config(
+                workdir.clone(),
+                AgentDriver::Codex,
+                AgentCommand::Args(vec!["codex".to_string()]),
+                tmp.path().join("state.json"),
+                tmp.path().join(".codex"),
+            ),
+            endpoint(workdir),
+            false,
+        );
+        agent.awaiting_turn_completion = false;
+        agent.saw_ready_banner = true;
+        agent.last_submit_attempt_at = Some(Instant::now() - Duration::from_secs(6));
+        agent.observed_terminal_view_text = "› 你现在是一个新会话。先初始化上下文\n\
+             继续执行当前任务。如果已经完成，就简要说明结果"
+            .to_string();
+
+        assert!(agent.needs_submit_retry(5.0));
+    }
+
+    #[test]
     fn turn_stall_detection_does_not_mark_endpoint_request_failure() {
         let source = include_str!("agent.rs");
         let block = source
@@ -2858,6 +2991,7 @@ mod tests {
             .to_string();
 
         assert!(!agent.can_send_prompt());
+        assert_eq!(agent.auto_input_block_reason(), Some("检测到 Working"));
     }
 
     #[test]
@@ -2886,6 +3020,7 @@ mod tests {
 
         assert!(agent.auto_wait_safely_released());
         assert!(agent.can_send_prompt());
+        assert_eq!(agent.auto_input_block_reason(), None);
     }
 
     #[test]
@@ -2942,6 +3077,224 @@ mod tests {
             .to_string();
 
         assert!(!agent.can_send_prompt());
+        assert_eq!(agent.auto_input_block_reason(), Some("已有排队消息"));
+    }
+
+    #[test]
+    fn can_send_prompt_rejects_visible_prefilled_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let mut agent = AgentProcess::new(
+            config(
+                workdir.clone(),
+                AgentDriver::Codex,
+                AgentCommand::Args(vec!["codex".to_string()]),
+                tmp.path().join("state.json"),
+                tmp.path().join(".codex"),
+            ),
+            endpoint(workdir),
+            false,
+        );
+        agent.awaiting_turn_completion = false;
+        agent.saw_ready_banner = true;
+        agent.observed_terminal_view_text = "› 你现在是一个新会话。先初始化上下文\n\
+             继续执行当前任务。如果已经完成，就简要说明结果\n\
+             gpt-5.5 xhigh · D:\\Works\\SelfWorks\\WatchApi"
+            .to_string();
+
+        assert!(!agent.can_send_prompt());
+        assert_eq!(agent.auto_input_block_reason(), Some("输入框已有内容"));
+    }
+
+    #[test]
+    fn can_send_prompt_ignores_old_prompt_when_current_input_is_placeholder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let mut agent = AgentProcess::new(
+            config(
+                workdir.clone(),
+                AgentDriver::Codex,
+                AgentCommand::Args(vec!["codex".to_string()]),
+                tmp.path().join("state.json"),
+                tmp.path().join(".codex"),
+            ),
+            endpoint(workdir),
+            false,
+        );
+        agent.awaiting_turn_completion = false;
+        agent.saw_ready_banner = true;
+        agent.observed_terminal_view_text = "› 继续执行当前任务。如果已经完成，就简要说明结果\n\
+             • 已完成。当前没有可继续推进的任务。\n\
+             › Write tests for @filename\n\
+             gpt-5.5 xhigh · D:\\Works\\SelfWorks\\WatchApi"
+            .to_string();
+
+        assert!(agent.can_send_prompt());
+        assert_eq!(agent.auto_input_block_reason(), None);
+    }
+
+    #[test]
+    fn can_send_prompt_rejects_current_english_user_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let mut agent = AgentProcess::new(
+            config(
+                workdir.clone(),
+                AgentDriver::Codex,
+                AgentCommand::Args(vec!["codex".to_string()]),
+                tmp.path().join("state.json"),
+                tmp.path().join(".codex"),
+            ),
+            endpoint(workdir),
+            false,
+        );
+        agent.awaiting_turn_completion = false;
+        agent.saw_ready_banner = true;
+        agent.observed_terminal_view_text = "› 继续执行当前任务。如果已经完成，就简要说明结果\n\
+             • 已完成。当前没有可继续推进的任务。\n\
+             › fix terminal rendering bug\n\
+             gpt-5.5 xhigh · D:\\Works\\SelfWorks\\WatchApi"
+            .to_string();
+
+        assert!(!agent.can_send_prompt());
+        assert_eq!(agent.auto_input_block_reason(), Some("输入框已有内容"));
+    }
+
+    #[test]
+    fn terminal_view_classifies_random_dim_codex_suggestion_as_placeholder() {
+        use crate::terminal_emulator::{
+            TerminalCellView, TerminalCursorShape, TerminalModeView, TerminalRgb, TerminalView,
+        };
+
+        fn cell(c: char, dim: bool) -> TerminalCellView {
+            TerminalCellView {
+                c,
+                fg: if dim {
+                    TerminalRgb {
+                        r: 130,
+                        g: 130,
+                        b: 130,
+                    }
+                } else {
+                    TerminalRgb {
+                        r: 220,
+                        g: 220,
+                        b: 220,
+                    }
+                },
+                bg: TerminalRgb { r: 0, g: 0, b: 0 },
+                bold: false,
+                dim,
+                italic: false,
+                underline: false,
+                strikeout: false,
+                inverse: false,
+                hidden: false,
+                wide: false,
+                wide_spacer: false,
+                wrapline: false,
+            }
+        }
+
+        let mut chars = "› Any rotating Codex suggestion"
+            .chars()
+            .collect::<Vec<_>>();
+        chars.resize(40, ' ');
+        let view = TerminalView {
+            revision: 1,
+            rows: 1,
+            cols: 40,
+            scrollback_lines: 0,
+            cursor_row: 0,
+            cursor_col: 2,
+            cursor_shape: TerminalCursorShape::Block,
+            display_offset: 0,
+            modes: TerminalModeView::default(),
+            cells: chars
+                .into_iter()
+                .enumerate()
+                .map(|(index, c)| cell(c, index > 0 && !c.is_whitespace()))
+                .collect(),
+        };
+
+        let input = terminal_view_current_codex_input(&view).unwrap();
+        assert_eq!(input.text, "Any rotating Codex suggestion");
+        assert!(input.placeholder);
+    }
+
+    #[test]
+    fn terminal_view_does_not_classify_normal_english_input_as_placeholder() {
+        use crate::terminal_emulator::{
+            TerminalCellView, TerminalCursorShape, TerminalModeView, TerminalRgb, TerminalView,
+        };
+
+        let mut chars = "› fix terminal rendering bug".chars().collect::<Vec<_>>();
+        chars.resize(40, ' ');
+        let cells = chars
+            .into_iter()
+            .map(|c| TerminalCellView {
+                c,
+                fg: TerminalRgb {
+                    r: 220,
+                    g: 220,
+                    b: 220,
+                },
+                bg: TerminalRgb { r: 0, g: 0, b: 0 },
+                bold: false,
+                dim: false,
+                italic: false,
+                underline: false,
+                strikeout: false,
+                inverse: false,
+                hidden: false,
+                wide: false,
+                wide_spacer: false,
+                wrapline: false,
+            })
+            .collect();
+        let view = TerminalView {
+            revision: 1,
+            rows: 1,
+            cols: 40,
+            scrollback_lines: 0,
+            cursor_row: 0,
+            cursor_col: 2,
+            cursor_shape: TerminalCursorShape::Block,
+            display_offset: 0,
+            modes: TerminalModeView::default(),
+            cells,
+        };
+
+        let input = terminal_view_current_codex_input(&view).unwrap();
+        assert_eq!(input.text, "fix terminal rendering bug");
+        assert!(!input.placeholder);
+    }
+
+    #[test]
+    fn can_send_prompt_block_reason_reports_startup_not_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let mut agent = AgentProcess::new(
+            config(
+                workdir.clone(),
+                AgentDriver::Codex,
+                AgentCommand::Args(vec!["codex".to_string()]),
+                tmp.path().join("state.json"),
+                tmp.path().join(".codex"),
+            ),
+            endpoint(workdir),
+            false,
+        );
+        agent.awaiting_turn_completion = false;
+        agent.saw_ready_banner = false;
+        agent.launched_at = Some(Instant::now());
+
+        assert!(!agent.can_send_prompt());
+        assert_eq!(agent.auto_input_block_reason(), Some("等待 Codex 就绪"));
     }
 
     #[test]
@@ -3064,6 +3417,7 @@ mod tests {
             .to_string();
 
         assert!(agent.can_send_prompt());
+        assert_eq!(agent.auto_input_block_reason(), None);
     }
 
     #[test]

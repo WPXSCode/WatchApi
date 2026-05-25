@@ -1043,6 +1043,66 @@ mod tests {
     }
 
     #[test]
+    fn registry_does_not_recover_unregistered_hosted_workspace_configs_from_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join(".watchapi-gui.json");
+        let workspace_path = tmp.path().join("HHHL");
+        fs::create_dir_all(&workspace_path).unwrap();
+        let workspace_id = workspace_id_for_path(&workspace_path);
+        let host_dir = tmp.path().join("Workspaces").join(&workspace_id);
+        fs::create_dir_all(&host_dir).unwrap();
+        let hosted = host_dir.join("新配置.json");
+        fs::write(
+            &hosted,
+            json!({
+                "config_name": "主线",
+                "workdir": workspace_path.to_string_lossy()
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            host_dir.join("其它.json"),
+            json!({
+                "config_name": "其它",
+                "workdir": tmp.path().join("Other").to_string_lossy()
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(host_dir.join(".watchapi-state.json"), "{}").unwrap();
+        fs::write(
+            &state,
+            json!({
+                "workspaces": [{
+                    "id": workspace_id,
+                    "path": workspace_path.to_string_lossy(),
+                    "expanded": true,
+                    "config_paths": []
+                }],
+                "selected_workspace": workspace_id
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut registry = GuiConfigRegistry::new(state);
+        registry.load();
+
+        let normalized = normalize_config_path(hosted);
+        let workspace = registry
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .unwrap();
+        assert!(
+            !workspace.config_paths.contains(&normalized),
+            "启动加载注册表不能把工作区目录里的残留 json 全部恢复到左侧配置树"
+        );
+        assert!(!registry.paths.contains(&normalized));
+    }
+
+    #[test]
     fn registry_reuses_workspace_by_normalized_path_and_stable_id() {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path().join("gui.json");

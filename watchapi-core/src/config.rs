@@ -81,6 +81,11 @@ pub enum ContinuationMode {
 pub struct AgentGoalConfig {
     pub enabled: bool,
     pub text: String,
+    pub revision: u64,
+    pub last_user_edit_revision: u64,
+    pub source: String,
+    pub source_session_id: String,
+    pub source_goal_signature: String,
     pub sync_on_new_session: bool,
     pub sync_on_resume: bool,
     pub fallback_enabled: bool,
@@ -93,6 +98,11 @@ impl Default for AgentGoalConfig {
         Self {
             enabled: false,
             text: String::new(),
+            revision: 0,
+            last_user_edit_revision: 0,
+            source: String::new(),
+            source_session_id: String::new(),
+            source_goal_signature: String::new(),
             sync_on_new_session: true,
             sync_on_resume: false,
             fallback_enabled: true,
@@ -230,6 +240,11 @@ struct RawConfig {
 struct RawAgentGoal {
     enabled: Option<bool>,
     text: Option<String>,
+    revision: Option<u64>,
+    last_user_edit_revision: Option<u64>,
+    source: Option<String>,
+    source_session_id: Option<String>,
+    source_goal_signature: Option<String>,
     sync_on_new_session: Option<bool>,
     sync_on_resume: Option<bool>,
     fallback_enabled: Option<bool>,
@@ -528,6 +543,22 @@ fn parse_agent_goal(raw: Option<RawAgentGoal>) -> Result<AgentGoalConfig, Config
             .text
             .map(|value| value.trim().to_string())
             .unwrap_or(default.text),
+        revision: raw.revision.unwrap_or(default.revision),
+        last_user_edit_revision: raw
+            .last_user_edit_revision
+            .unwrap_or(default.last_user_edit_revision),
+        source: raw
+            .source
+            .and_then(trim_non_empty)
+            .unwrap_or(default.source),
+        source_session_id: raw
+            .source_session_id
+            .and_then(trim_non_empty)
+            .unwrap_or(default.source_session_id),
+        source_goal_signature: raw
+            .source_goal_signature
+            .and_then(trim_non_empty)
+            .unwrap_or(default.source_goal_signature),
         sync_on_new_session: raw
             .sync_on_new_session
             .unwrap_or(default.sync_on_new_session),
@@ -1023,6 +1054,11 @@ mod tests {
         value["agent_goal"] = serde_json::json!({
             "enabled": true,
             "text": "修复终端渲染",
+            "revision": 7,
+            "last_user_edit_revision": 6,
+            "source": "session_import",
+            "source_session_id": "codex-session-1",
+            "source_goal_signature": "line:4:hash:abc",
             "sync_on_new_session": true,
             "sync_on_resume": false,
             "fallback_enabled": true,
@@ -1035,6 +1071,11 @@ mod tests {
         assert_eq!(config.continuation_mode, ContinuationMode::Goal);
         assert!(config.agent_goal.enabled);
         assert_eq!(config.agent_goal.text, "修复终端渲染");
+        assert_eq!(config.agent_goal.revision, 7);
+        assert_eq!(config.agent_goal.last_user_edit_revision, 6);
+        assert_eq!(config.agent_goal.source, "session_import");
+        assert_eq!(config.agent_goal.source_session_id, "codex-session-1");
+        assert_eq!(config.agent_goal.source_goal_signature, "line:4:hash:abc");
         assert!(config.agent_goal.sync_on_new_session);
         assert!(!config.agent_goal.sync_on_resume);
         assert!(config.agent_goal.fallback_enabled);

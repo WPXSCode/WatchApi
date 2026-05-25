@@ -32,7 +32,8 @@ pub use probe::ProbeResult;
 pub use runtime::{EndpointRow, RuntimeCore, RuntimeEvent, RuntimeSnapshot, RuntimeState};
 pub use selector::choose_best_endpoint;
 pub use sessions::{
-    binding_key_text, recent_session_detail_summary, ClaudeSessionIndex, CodexSessionIndex,
+    binding_key_text, latest_codex_session_goal, latest_codex_session_goal_record,
+    recent_session_detail_summary, ClaudeSessionIndex, CodexSessionGoalRecord, CodexSessionIndex,
     SessionBindingKey, SessionCandidate, SessionStore,
 };
 pub use terminal::{InputSource, TerminalEvent, TerminalSession, TerminalSnapshot};

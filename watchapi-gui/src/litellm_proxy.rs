@@ -195,8 +195,11 @@ pub struct SmartProxySnapshot {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SmartProxyKeyRow {
     pub upstream: String,
+    pub base_url: String,
     pub key_label: String,
     pub egress_note: String,
+    pub recent_clash_node: String,
+    pub recent_clash_egress_ip: String,
     pub score: f64,
     pub total_requests: u64,
     pub success_requests: u64,
@@ -207,6 +210,35 @@ pub struct SmartProxyKeyRow {
     pub cooldown_remaining_seconds: u64,
     pub in_flight: u32,
     pub limit_status: String,
+}
+
+impl SmartProxyKeyRow {
+    pub fn egress_display_text(&self) -> String {
+        if let Some(node) = non_empty_trimmed(&self.recent_clash_node) {
+            if let Some(ip) = non_empty_trimmed(&self.recent_clash_egress_ip) {
+                return format!("{node} / {ip}");
+            }
+            return node.to_string();
+        }
+        if let Some(ip) = non_empty_trimmed(&self.recent_clash_egress_ip) {
+            return ip.to_string();
+        }
+        non_empty_trimmed(&self.egress_note)
+            .or_else(|| non_empty_trimmed(&self.base_url))
+            .unwrap_or("-")
+            .to_string()
+    }
+
+    pub fn egress_hover_text(&self) -> String {
+        format!(
+            "上游名：{}\nBase URL：{}\n最近 Clash 节点：{}\nClash 出口 IP：{}\n出口备注：{}",
+            non_empty_trimmed(&self.upstream).unwrap_or("-"),
+            non_empty_trimmed(&self.base_url).unwrap_or("-"),
+            non_empty_trimmed(&self.recent_clash_node).unwrap_or("-"),
+            non_empty_trimmed(&self.recent_clash_egress_ip).unwrap_or("-"),
+            non_empty_trimmed(&self.egress_note).unwrap_or("-")
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -294,6 +326,7 @@ struct ClashVergeController {
     last_switch_at: Mutex<Option<Instant>>,
     group_rotations: Mutex<HashMap<String, usize>>,
     recent_nodes: Mutex<HashMap<String, Vec<(String, Instant)>>>,
+    egress_ip_cache: Mutex<HashMap<String, (String, Instant)>>,
 }
 
 impl Default for SmartKeyStats {
@@ -429,6 +462,24 @@ fn clash_group_rank(name: &str, group_type: &str) -> u8 {
     }
 }
 
+fn lookup_proxy_egress_ip(proxy_url: &str) -> Option<String> {
+    let proxy = reqwest::Proxy::all(proxy_url).ok()?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .proxy(proxy)
+        .build()
+        .ok()?;
+    let text = client
+        .get("http://api.ipify.org")
+        .send()
+        .ok()?
+        .text()
+        .ok()?;
+    let ip = text.trim();
+    ip.parse::<std::net::IpAddr>().ok()?;
+    Some(ip.to_string())
+}
+
 impl ClashVergeController {
     fn new(config: ClashVergeConfig) -> Result<Self> {
         let client = Client::builder().timeout(Duration::from_secs(1)).build()?;
@@ -438,6 +489,7 @@ impl ClashVergeController {
             last_switch_at: Mutex::new(None),
             group_rotations: Mutex::new(HashMap::new()),
             recent_nodes: Mutex::new(HashMap::new()),
+            egress_ip_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -588,6 +640,58 @@ impl ClashVergeController {
             let drop_count = entries.len() - window;
             entries.drain(0..drop_count);
         }
+    }
+
+    fn latest_group_node(&self) -> Option<String> {
+        let group_name = non_empty_trimmed(&self.config.group_name)?;
+        let ttl = Duration::from_secs(self.config.recent_node_ttl_seconds.max(1) as u64);
+        let now = Instant::now();
+        if let Ok(mut recent_nodes) = self.recent_nodes.lock() {
+            if let Some(entries) = recent_nodes.get_mut(group_name) {
+                entries.retain(|(_, seen_at)| now.duration_since(*seen_at) < ttl);
+                if let Some((name, _)) = entries.last() {
+                    return Some(name.clone());
+                }
+            }
+        }
+        self.current_group_node()
+    }
+
+    fn current_group_node(&self) -> Option<String> {
+        let group_name = non_empty_trimmed(&self.config.group_name)?;
+        let controller_url = non_empty_trimmed(&self.config.controller_url)?;
+        let group = url_encode_component(group_name);
+        let url = format!("{}/proxies/{}", controller_url.trim_end_matches('/'), group);
+        let response = self.authorized(self.client.get(&url)).send().ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let payload: Value = response.json().ok()?;
+        payload
+            .get("now")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+    }
+
+    fn latest_group_node_egress_ip(&self, node: &str) -> Option<String> {
+        let node = non_empty_trimmed(node)?;
+        let proxy_url = non_empty_trimmed(&self.config.proxy_url)?;
+        let cache_key = format!("{proxy_url}\n{node}");
+        let ttl = Duration::from_secs(60);
+        let now = Instant::now();
+        if let Ok(mut cache) = self.egress_ip_cache.lock() {
+            cache.retain(|_, (_, seen_at)| now.duration_since(*seen_at) < ttl);
+            if let Some((ip, _)) = cache.get(&cache_key) {
+                return Some(ip.clone());
+            }
+        }
+        let ip = lookup_proxy_egress_ip(proxy_url)?;
+        if let Ok(mut cache) = self.egress_ip_cache.lock() {
+            cache.insert(cache_key, (ip.clone(), Instant::now()));
+        }
+        Some(ip)
     }
 }
 
@@ -1197,8 +1301,11 @@ impl SmartProxyServer {
                     .into_iter()
                     .map(|row| SmartProxyKeyRow {
                         upstream: row.upstream,
+                        base_url: row.base_url,
                         key_label: row.key_label,
                         egress_note: row.egress_note,
+                        recent_clash_node: row.recent_clash_node,
+                        recent_clash_egress_ip: row.recent_clash_egress_ip,
                         score: row.score,
                         total_requests: row.total_requests,
                         success_requests: row.success_requests,
@@ -1213,7 +1320,11 @@ impl SmartProxyServer {
                     .collect(),
             };
         }
-        snapshot_from_deployments(&self.deployments, &self.upstreams)
+        snapshot_from_deployments(
+            &self.deployments,
+            &self.upstreams,
+            self.clash_verge.as_ref(),
+        )
     }
 
     pub fn endpoint_base_url(&self) -> String {
@@ -1420,8 +1531,10 @@ fn build_smart_deployments(proxy: &ProxyConfig, base_dir: &Path) -> Result<Vec<S
                 .ok_or_else(|| anyhow!("路由引用了不存在的上游：{upstream_name}"))?;
             for batch in &upstream.key_batches {
                 for record in load_key_batch(batch, base_dir)? {
+                    let upstream_name = upstream.name.trim();
+                    let egress_note = upstream.egress_note.trim().to_string();
                     deployments.push(SmartDeployment {
-                        upstream: upstream.name.trim().to_string(),
+                        upstream: upstream_name.to_string(),
                         base_url: upstream.base_url.trim_end_matches('/').to_string(),
                         public_model: public_model.to_string(),
                         actual_model: actual_model.to_string(),
@@ -1429,7 +1542,7 @@ fn build_smart_deployments(proxy: &ProxyConfig, base_dir: &Path) -> Result<Vec<S
                         max_rpm: upstream.max_rpm,
                         max_concurrency: upstream.max_concurrency,
                         upstream_cooldown_seconds: upstream.cooldown_seconds,
-                        egress_note: upstream.egress_note.clone(),
+                        egress_note,
                         key_label: mask_key(&record.key),
                         quality_key: key_quality_key(
                             upstream.base_url.trim_end_matches('/'),
@@ -1468,7 +1581,7 @@ fn handle_smart_proxy_client(
     let method = request_parts.next().unwrap_or_default();
     let path = request_parts.next().unwrap_or("/");
     if method == "GET" && path == "/_watchapi/smart/status" {
-        let snapshot = snapshot_from_deployments(&deployments, &upstreams);
+        let snapshot = snapshot_from_deployments(&deployments, &upstreams, clash_verge.as_ref());
         return write_json(stream, 200, &snapshot_to_json(&snapshot).to_string());
     }
     if method != "POST" {
@@ -2295,9 +2408,16 @@ fn clear_upstream_cooldown(
 fn snapshot_from_deployments(
     deployments: &Arc<Mutex<Vec<SmartDeployment>>>,
     upstreams: &Arc<Mutex<HashMap<String, SmartUpstreamRuntime>>>,
+    clash_verge: Option<&Arc<ClashVergeController>>,
 ) -> SmartProxySnapshot {
     let now = Instant::now();
     let upstream_state = upstreams.lock().ok();
+    let recent_clash_node = clash_verge
+        .and_then(|controller| controller.latest_group_node())
+        .unwrap_or_default();
+    let recent_clash_egress_ip = clash_verge
+        .and_then(|controller| controller.latest_group_node_egress_ip(&recent_clash_node))
+        .unwrap_or_default();
     let rows = deployments
         .lock()
         .map(|items| {
@@ -2318,8 +2438,11 @@ fn snapshot_from_deployments(
                         .unwrap_or(0);
                     SmartProxyKeyRow {
                         upstream: item.upstream.clone(),
+                        base_url: item.base_url.clone(),
                         key_label: item.key_label.clone(),
                         egress_note: item.egress_note.clone(),
+                        recent_clash_node: recent_clash_node.clone(),
+                        recent_clash_egress_ip: recent_clash_egress_ip.clone(),
                         score: item.stats.score,
                         total_requests: item.stats.total_requests,
                         success_requests: item.stats.success_requests,
@@ -2342,8 +2465,12 @@ fn snapshot_to_json(snapshot: &SmartProxySnapshot) -> Value {
     json!({
         "keys": snapshot.rows.iter().map(|row| json!({
             "upstream": row.upstream,
+            "base_url": row.base_url,
             "key": row.key_label,
             "egress_note": row.egress_note,
+            "recent_clash_node": row.recent_clash_node,
+            "recent_clash_egress_ip": row.recent_clash_egress_ip,
+            "egress_display": row.egress_display_text(),
             "score": row.score,
             "total_requests": row.total_requests,
             "success_requests": row.success_requests,
@@ -3044,7 +3171,7 @@ mod tests {
             35,
         );
 
-        let snapshot = snapshot_from_deployments(&deployments, &upstreams);
+        let snapshot = snapshot_from_deployments(&deployments, &upstreams, None);
         assert_eq!(snapshot.rows[0].failure_requests, 1);
         assert_eq!(snapshot.rows[0].last_status, "402");
     }
@@ -3124,6 +3251,99 @@ mod tests {
         assert!(yaml.contains("cooldown_time: 35"));
         assert!(yaml.contains("allowed_fails: 0"));
         assert!(yaml.contains("num_retries: 0"));
+    }
+
+    #[test]
+    fn smart_deployments_keep_blank_egress_note_for_url_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let keys = temp.path().join("keys.txt");
+        fs::write(&keys, "sk-first\n").unwrap();
+        let mut proxy = ProxyConfig::blank(1);
+        proxy.upstreams[0].name = "聚合出口A".to_string();
+        proxy.upstreams[0].egress_note = String::new();
+        proxy.upstreams[0].key_batches = vec![KeyBatchConfig {
+            path: keys,
+            format: KeyBatchFormat::Txt,
+            rpm: None,
+            tpm: None,
+        }];
+        proxy.routes[0].upstreams = vec!["聚合出口A".to_string()];
+
+        let deployments = build_smart_deployments(&proxy, temp.path()).unwrap();
+
+        assert_eq!(deployments[0].egress_note, "");
+    }
+
+    #[test]
+    fn smart_proxy_row_egress_display_prefers_clash_then_note_then_base_url() {
+        let row = SmartProxyKeyRow {
+            upstream: "上游A".to_string(),
+            base_url: "https://upstream.example/v1".to_string(),
+            key_label: "sk-1".to_string(),
+            egress_note: "出口备注A".to_string(),
+            recent_clash_node: "香港 01".to_string(),
+            recent_clash_egress_ip: "203.0.113.8".to_string(),
+            score: 100.0,
+            total_requests: 0,
+            success_requests: 0,
+            failure_requests: 0,
+            consecutive_failures: 0,
+            average_latency_ms: None,
+            last_status: String::new(),
+            cooldown_remaining_seconds: 0,
+            in_flight: 0,
+            limit_status: "-".to_string(),
+        };
+
+        assert_eq!(row.egress_display_text(), "香港 01 / 203.0.113.8");
+        assert!(row.egress_hover_text().contains("上游名：上游A"));
+        assert!(row
+            .egress_hover_text()
+            .contains("Base URL：https://upstream.example/v1"));
+        assert!(row.egress_hover_text().contains("最近 Clash 节点：香港 01"));
+        assert!(row
+            .egress_hover_text()
+            .contains("Clash 出口 IP：203.0.113.8"));
+        assert!(row.egress_hover_text().contains("出口备注：出口备注A"));
+
+        let mut without_clash = row.clone();
+        without_clash.recent_clash_node.clear();
+        without_clash.recent_clash_egress_ip.clear();
+        assert_eq!(without_clash.egress_display_text(), "出口备注A");
+
+        without_clash.recent_clash_egress_ip = "203.0.113.9".to_string();
+        assert_eq!(without_clash.egress_display_text(), "203.0.113.9");
+
+        without_clash.recent_clash_egress_ip.clear();
+        without_clash.egress_note.clear();
+        assert_eq!(
+            without_clash.egress_display_text(),
+            "https://upstream.example/v1"
+        );
+    }
+
+    #[test]
+    fn proxy_egress_ip_lookup_uses_configured_clash_proxy() {
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = proxy.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = proxy.accept().unwrap();
+            let raw = read_http_request(&mut socket).unwrap();
+            let request = String::from_utf8_lossy(&raw).to_string();
+            let body = "203.0.113.9";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).unwrap();
+            request
+        });
+
+        let ip = lookup_proxy_egress_ip(&format!("http://127.0.0.1:{port}"));
+
+        let request = handle.join().unwrap();
+        assert_eq!(ip.as_deref(), Some("203.0.113.9"));
+        assert!(request.starts_with("GET http://api.ipify.org/"));
     }
 
     fn smart_test_deployment(upstream: &str, base_url: &str, key: &str) -> SmartDeployment {
@@ -3254,7 +3474,7 @@ mod tests {
             35,
         );
 
-        let snapshot = snapshot_from_deployments(&deployments, &upstreams);
+        let snapshot = snapshot_from_deployments(&deployments, &upstreams, None);
         assert!(snapshot
             .rows
             .iter()
@@ -3967,7 +4187,7 @@ mod tests {
         mark_upstream_request_started(&upstreams, "https://limited.example/v1");
 
         assert!(select_deployment(&deployments, &upstreams, "gpt-5.5").is_none());
-        let snapshot = snapshot_from_deployments(&deployments, &upstreams);
+        let snapshot = snapshot_from_deployments(&deployments, &upstreams, None);
         assert_eq!(snapshot.rows[0].egress_note, "出口A");
         assert!(snapshot.rows[0].limit_status.contains("RPM 1/1"));
     }

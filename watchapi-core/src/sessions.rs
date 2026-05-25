@@ -4,9 +4,12 @@ use crate::tokens::{extract_token_usage, TokenUsage};
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -933,7 +936,7 @@ fn visit_jsonl(path: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn read_session_meta(path: &Path) -> Option<Value> {
-    let file = File::open(path).ok()?;
+    let file = open_session_file_for_read(path)?;
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         let item: Value = serde_json::from_str(&line).ok()?;
         if item.get("type").and_then(Value::as_str) != Some("session_meta") {
@@ -951,6 +954,7 @@ fn read_session_meta(path: &Path) -> Option<Value> {
 #[derive(Debug, Clone)]
 struct RankingContext {
     normalized_workdir: String,
+    workspace_name: String,
     config_name: String,
     agent_name: String,
     workdir_fragments: Vec<String>,
@@ -959,9 +963,16 @@ struct RankingContext {
 impl RankingContext {
     fn new(workdir: &Path, config_name: &str, agent_name: &str) -> Self {
         let normalized_workdir = normalize_workdir(workdir);
+        let workspace_name = workdir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
         Self {
             workdir_fragments: path_fragments(&normalized_workdir),
             normalized_workdir,
+            workspace_name,
             config_name: config_name.to_ascii_lowercase(),
             agent_name: agent_name.to_ascii_lowercase(),
         }
@@ -976,15 +987,15 @@ fn codex_candidate_from_path(
     let meta = read_session_meta(&path)?;
     let session_id = meta.get("id").and_then(Value::as_str)?.to_string();
     let workdir = meta.get("cwd").and_then(Value::as_str).map(PathBuf::from);
-    if !session_workdir_matches_context(workdir.as_deref(), context) {
-        return None;
-    }
     let modified_at = path
         .metadata()
         .and_then(|meta| meta.modified())
         .ok()
         .map(DateTime::<Utc>::from);
     let summary = recent_session_summary(&path);
+    if !session_matches_context(workdir.as_deref(), &summary, context) {
+        return None;
+    }
     let (score, reason) = rank_candidate(
         workdir.as_deref(),
         context,
@@ -1011,15 +1022,15 @@ fn claude_candidate_from_path(
 ) -> Option<SessionCandidate> {
     let session_id = path.file_stem()?.to_string_lossy().to_string();
     let workdir = claude_session_workdir(&path);
-    if !session_workdir_matches_context(workdir.as_deref(), context) {
-        return None;
-    }
     let modified_at = path
         .metadata()
         .and_then(|meta| meta.modified())
         .ok()
         .map(DateTime::<Utc>::from);
     let summary = recent_session_summary(&path);
+    if !session_matches_context(workdir.as_deref(), &summary, context) {
+        return None;
+    }
     let (score, reason) = rank_candidate(
         workdir.as_deref(),
         context,
@@ -1047,6 +1058,18 @@ fn session_workdir_matches_context(
         return false;
     };
     workdir == context.normalized_workdir || path_is_related(&workdir, &context.normalized_workdir)
+}
+
+fn session_matches_context(
+    session_workdir: Option<&Path>,
+    summary: &str,
+    context: &RankingContext,
+) -> bool {
+    if session_workdir_matches_context(session_workdir, context) {
+        return true;
+    }
+    let haystack = summary.to_ascii_lowercase();
+    workspace_name_matches_context(&haystack, context)
 }
 
 fn rank_candidate(
@@ -1093,6 +1116,10 @@ fn rank_candidate(
         }
     }
     let haystack = summary.to_ascii_lowercase();
+    if workspace_name_matches_context(&haystack, context) {
+        score += 1800;
+        reasons.push("命中工作区名");
+    }
     for part in context.workdir_fragments.iter().take(10) {
         if haystack.contains(part) {
             score += 200;
@@ -1122,11 +1149,15 @@ fn rank_candidate(
     (score, reasons.join("、"))
 }
 
+fn workspace_name_matches_context(haystack: &str, context: &RankingContext) -> bool {
+    context.workspace_name.chars().count() >= 3 && haystack.contains(&context.workspace_name)
+}
+
 fn sort_session_candidates(candidates: &mut [SessionCandidate]) {
     candidates.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
-            .then_with(|| b.modified_at.cmp(&a.modified_at))
+        b.modified_at
+            .cmp(&a.modified_at)
+            .then_with(|| b.score.cmp(&a.score))
     });
 }
 
@@ -1159,7 +1190,7 @@ fn shared_path_fragment_count(path: &str, fragments: &[String]) -> usize {
 }
 
 fn claude_session_workdir(path: &Path) -> Option<PathBuf> {
-    let file = File::open(path).ok()?;
+    let file = open_session_file_for_read(path)?;
     for line in BufReader::new(file).lines().map_while(Result::ok).take(80) {
         let Ok(item) = serde_json::from_str::<Value>(&line) else {
             continue;
@@ -1205,6 +1236,62 @@ pub fn recent_session_detail_summary(path: &Path) -> String {
     sections.join("\n\n")
 }
 
+pub fn latest_codex_session_goal(path: &Path) -> Option<String> {
+    latest_codex_session_goal_record(path).map(|record| record.text)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexSessionGoalRecord {
+    pub text: String,
+    pub signature: String,
+}
+
+pub fn latest_codex_session_goal_record(path: &Path) -> Option<CodexSessionGoalRecord> {
+    let file = open_session_file_for_read(path)?;
+    let mut latest = None;
+    for (line_index, line) in BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .enumerate()
+    {
+        let Ok(item) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let goal = codex_thread_goal_event_text(&item)
+            .or_else(|| codex_user_message_text(&item).and_then(|text| goal_from_user_text(&text)));
+        if let Some(goal) = goal {
+            latest = Some(CodexSessionGoalRecord {
+                text: goal,
+                signature: codex_goal_signature(line_index, &line),
+            });
+        }
+    }
+    latest
+}
+
+fn codex_goal_signature(line_index: usize, line: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    line.hash(&mut hasher);
+    format!("line:{}:hash:{:016x}", line_index + 1, hasher.finish())
+}
+
+fn codex_thread_goal_event_text(item: &Value) -> Option<String> {
+    if item.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return None;
+    }
+    let payload = item.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("thread_goal_updated") {
+        return None;
+    }
+    payload
+        .get("goal")
+        .and_then(|goal| goal.get("objective"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
 fn recent_session_summary(path: &Path) -> String {
     let lines = recent_session_jsonl_tail_lines(path, SUMMARY_TAIL_READ_BYTES, 30);
     let mut summary = String::new();
@@ -1231,7 +1318,7 @@ fn recent_session_jsonl_tail_lines(
     max_read_bytes: u64,
     max_lines: usize,
 ) -> Vec<String> {
-    let Ok(mut file) = File::open(path) else {
+    let Some(mut file) = open_session_file_for_read(path) else {
         return Vec::new();
     };
     let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
@@ -1258,6 +1345,24 @@ fn recent_session_jsonl_tail_lines(
         lines.push_back(line.to_string());
     }
     lines.into_iter().collect()
+}
+
+fn open_session_file_for_read(path: &Path) -> Option<File> {
+    #[cfg(windows)]
+    {
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        return fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(path)
+            .ok();
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path).ok()
+    }
 }
 
 fn markdown_escape_heading(text: &str) -> String {
@@ -1306,6 +1411,46 @@ fn compact_whitespace(text: &str) -> String {
         out.push_str(part);
     }
     out
+}
+
+fn codex_user_message_text(item: &Value) -> Option<String> {
+    if item.get("type").and_then(Value::as_str) == Some("response_item") {
+        let payload = item.get("payload")?;
+        if payload.get("type").and_then(Value::as_str) == Some("message")
+            && payload.get("role").and_then(Value::as_str) == Some("user")
+        {
+            return Some(extract_message_text(
+                payload.get("content").unwrap_or(&Value::Null),
+            ));
+        }
+    }
+    if item.get("role").and_then(Value::as_str) == Some("user")
+        || item.get("type").and_then(Value::as_str) == Some("user")
+        || item
+            .get("message")
+            .and_then(|message| message.get("role"))
+            .and_then(Value::as_str)
+            == Some("user")
+    {
+        return Some(extract_any_message_text(item));
+    }
+    None
+}
+
+fn goal_from_user_text(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("/goal") else {
+            continue;
+        };
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+            let goal = rest.trim();
+            if !goal.is_empty() {
+                return Some(goal.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn collect_summary_text(value: &Value, parts: &mut Vec<String>, depth: usize) {
@@ -1752,6 +1897,75 @@ mod tests {
     }
 
     #[test]
+    fn codex_candidates_include_workspace_name_summary_when_cwd_is_unrelated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("ProjectAlpha");
+        let other = tmp.path().join("other");
+        fs::create_dir_all(&workdir).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let candidate_file = tmp.path().join("sessions/2026/05/17/name-hit.jsonl");
+        fs::create_dir_all(candidate_file.parent().unwrap()).unwrap();
+        fs::write(
+            &candidate_file,
+            [
+                json!({"type": "session_meta", "payload": {"id": "name-hit", "cwd": other.to_string_lossy()}}).to_string(),
+                json!({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"text": "继续处理 ProjectAlpha 的绑定会话逻辑"}]}}).to_string(),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let store = SessionStore::new(tmp.path().join("state.json"));
+
+        let candidates = CodexSessionIndex::new(tmp.path().to_path_buf())
+            .ranked_candidates(&workdir, "config", "backend", &store);
+
+        let candidate = candidates
+            .iter()
+            .find(|item| item.session_id == "name-hit")
+            .expect("workspace name summary should keep candidate visible");
+        assert!(candidate.score >= 1800);
+        assert!(candidate.reason.contains("命中工作区名"));
+    }
+
+    #[test]
+    fn workspace_name_summary_match_scores_as_high_relevance() {
+        let context = RankingContext::new(Path::new("D:/work/ProjectAlpha"), "config", "agent");
+
+        let (workspace_score, workspace_reason) = rank_candidate(
+            Some(Path::new("D:/other/unrelated")),
+            &context,
+            None,
+            "继续处理 ProjectAlpha 的绑定会话逻辑",
+            None,
+        );
+        let (child_score, _) = rank_candidate(
+            Some(Path::new("D:/work/ProjectAlpha/feature")),
+            &context,
+            None,
+            "",
+            None,
+        );
+        let (fragment_score, _) = rank_candidate(
+            Some(Path::new("D:/backup/work")),
+            &context,
+            None,
+            "config agent",
+            None,
+        );
+
+        assert!(
+            workspace_score > child_score,
+            "对话内容命中工作区文件夹名应高于父子路径弱相关"
+        );
+        assert!(
+            workspace_score > fragment_score,
+            "对话内容命中工作区文件夹名应明显高于配置/agent/路径片段命中"
+        );
+        assert!(workspace_reason.contains("命中工作区名"));
+    }
+
+    #[test]
     fn claude_candidates_exclude_sessions_from_other_workdirs() {
         let tmp = tempfile::tempdir().unwrap();
         let workdir = tmp.path().join("project");
@@ -1832,6 +2046,38 @@ mod tests {
     }
 
     #[test]
+    fn session_candidates_sort_by_modified_time_before_score() {
+        let now = Utc::now();
+        let mut candidates = vec![
+            SessionCandidate {
+                session_id: "old-high-score".to_string(),
+                path: PathBuf::from("old.jsonl"),
+                workdir: None,
+                modified_at: Some(now - chrono::Duration::hours(4)),
+                score: 10_000,
+                reason: "高相关旧会话".to_string(),
+                summary: String::new(),
+                occupied_by: None,
+            },
+            SessionCandidate {
+                session_id: "recent-low-score".to_string(),
+                path: PathBuf::from("recent.jsonl"),
+                workdir: None,
+                modified_at: Some(now - chrono::Duration::minutes(1)),
+                score: 10,
+                reason: "低相关新会话".to_string(),
+                summary: String::new(),
+                occupied_by: None,
+            },
+        ];
+
+        sort_session_candidates(&mut candidates);
+
+        assert_eq!(candidates[0].session_id, "recent-low-score");
+        assert_eq!(candidates[1].session_id, "old-high-score");
+    }
+
+    #[test]
     fn codex_index_reads_latest_session_id_for_workdir() {
         let tmp = tempfile::tempdir().unwrap();
         let workdir = tmp.path().join("project");
@@ -1866,6 +2112,22 @@ mod tests {
 
         assert_eq!(uncached_sort_count, 0);
         assert!(cached_sort_count >= 4);
+    }
+
+    #[test]
+    fn session_candidate_reads_use_shared_file_open() {
+        let source = include_str!("sessions.rs");
+        let production_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("sessions source should contain production code");
+
+        assert!(production_source.contains("fn open_session_file_for_read"));
+        assert!(
+            production_source.contains("FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE")
+        );
+        assert!(!production_source.contains("let file = File::open(path).ok()?;"));
+        assert!(!production_source.contains("let Ok(mut file) = File::open(path)"));
     }
 
     #[test]
@@ -2030,6 +2292,72 @@ mod tests {
         assert!(block.contains("seek(SeekFrom::Start(start))"));
         assert!(block.contains("read_to_end"));
         assert!(block.contains("if start > 0 && index == 0"));
+    }
+
+    #[test]
+    fn latest_codex_session_goal_uses_last_user_goal_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_file = tmp.path().join("session.jsonl");
+        fs::write(
+            &session_file,
+            [
+                json!({"type": "session_meta", "payload": {"id": "session-1"}}).to_string(),
+                json!({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "/goal 修复终端渲染"}]}}).to_string(),
+                json!({"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "/goal 不应该从助手回复提取"}]}}).to_string(),
+                json!({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "/goal 完成 Goal 绑定回填"}]}}).to_string(),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            latest_codex_session_goal(&session_file),
+            Some("完成 Goal 绑定回填".to_string())
+        );
+        let record = latest_codex_session_goal_record(&session_file).unwrap();
+        assert_eq!(record.text, "完成 Goal 绑定回填");
+        assert!(record.signature.starts_with("line:4:hash:"));
+    }
+
+    #[test]
+    fn latest_codex_session_goal_uses_last_thread_goal_update_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_file = tmp.path().join("session.jsonl");
+        fs::write(
+            &session_file,
+            [
+                json!({"type": "session_meta", "payload": {"id": "session-1"}}).to_string(),
+                json!({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "/goal 旧目标"}]}}).to_string(),
+                json!({"type": "event_msg", "payload": {"type": "thread_goal_updated", "goal": {"objective": "原生 Goal 事件目标", "status": "active"}}}).to_string(),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        let record = latest_codex_session_goal_record(&session_file).unwrap();
+
+        assert_eq!(record.text, "原生 Goal 事件目标");
+        assert!(record.signature.starts_with("line:3:hash:"));
+    }
+
+    #[test]
+    fn latest_codex_session_goal_ignores_goal_mentions_without_user_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_file = tmp.path().join("session.jsonl");
+        fs::write(
+            &session_file,
+            [
+                json!({"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"text": "/goal 助手总结"}]}}).to_string(),
+                json!({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"text": "这里提到了 /goal 但不是指令"}]}}).to_string(),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        assert_eq!(latest_codex_session_goal(&session_file), None);
     }
 
     #[test]

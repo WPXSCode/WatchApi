@@ -28,7 +28,6 @@ use crate::guard_proxy::{
 
 const MIN_KEY_EXPLORATION_REQUESTS: u64 = 2;
 const MIN_FINGERPRINT_EXPLORATION_REQUESTS: u64 = 2;
-const QUALITY_DOMINANCE_MARGIN: f64 = 12.0;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -178,8 +177,11 @@ impl AggregateClashConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AggregateKeyRow {
     pub upstream: String,
+    pub base_url: String,
     pub key_label: String,
     pub egress_note: String,
+    pub recent_clash_node: String,
+    pub recent_clash_egress_ip: String,
     pub score: f64,
     pub total_requests: u64,
     pub success_requests: u64,
@@ -214,6 +216,8 @@ pub struct AggregateEgressRuntime {
     quality_writer: QualityWriteHandle,
     clash: Option<Arc<AggregateClashController>>,
     clash_proxy_url: Option<String>,
+    last_request_egress: Mutex<Option<AggregateRequestEgress>>,
+    request_egress_ip_cache: Mutex<HashMap<String, (String, Instant)>>,
     combos: Arc<Mutex<AggregateComboState>>,
     cooldown_seconds: u32,
     config: AggregateEgressConfig,
@@ -236,6 +240,7 @@ struct AggregateDeploymentRuntime {
     key_label: String,
     quality_key: String,
     stats: AggregateQualityStats,
+    last_request_egress: Option<AggregateRequestEgress>,
 }
 
 #[derive(Debug, Clone)]
@@ -325,6 +330,13 @@ struct AggregateComboState {
     current_index: usize,
     next_index: usize,
     recent: Vec<(AggregateEgressCombo, Instant)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AggregateRequestEgress {
+    node: Option<String>,
+    ip: Option<String>,
+    seen_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -511,10 +523,19 @@ impl AggregateClashController {
         let Some(next) = self.next_group_candidate(&group.name, &candidates) else {
             return;
         };
-        let _ = self.switch_to_node(&group.name, next);
+        let _ = self.switch_to_node_force(&group.name, next);
     }
 
+    #[cfg(test)]
     fn switch_to_node(&self, group_name: &str, node: &str) -> Result<()> {
+        self.switch_to_node_inner(group_name, node, false)
+    }
+
+    fn switch_to_node_force(&self, group_name: &str, node: &str) -> Result<()> {
+        self.switch_to_node_inner(group_name, node, true)
+    }
+
+    fn switch_to_node_inner(&self, group_name: &str, node: &str, force: bool) -> Result<()> {
         if !self.config.enabled {
             return Ok(());
         }
@@ -525,7 +546,7 @@ impl AggregateClashController {
         let Ok(mut last_switch_at) = self.last_switch_at.lock() else {
             return Ok(());
         };
-        if last_switch_at.is_some_and(|last| last.elapsed() < cooldown) {
+        if !force && last_switch_at.is_some_and(|last| last.elapsed() < cooldown) {
             return Ok(());
         }
         let group = url_encode_component(group_name);
@@ -733,6 +754,7 @@ impl AggregateEgressRuntime {
                 key_label: seed.key_label,
                 quality_key: seed.quality_key,
                 stats: AggregateQualityStats::default(),
+                last_request_egress: None,
             })
             .collect::<Vec<_>>();
         KeyQualityStore::load(&quality_path).apply_to_deployments(&mut deployments);
@@ -777,6 +799,8 @@ impl AggregateEgressRuntime {
                 .as_ref()
                 .filter(|item| item.enabled)
                 .and_then(|item| item.effective_proxy_url()),
+            last_request_egress: Mutex::new(None),
+            request_egress_ip_cache: Mutex::new(HashMap::new()),
             combos: Arc::new(Mutex::new(AggregateComboState {
                 combos,
                 current_index: 0,
@@ -820,6 +844,8 @@ impl AggregateEgressRuntime {
         let forwarded_body = request_body.rewrite_model(&deployment.actual_model);
         let headers = forward_headers(raw_request, &deployment.key, forwarded_body.len(), true)?;
         let started_at = Instant::now();
+        self.activate_combo_node(&combo);
+        self.record_request_egress(deployment_index, &combo);
         let request = EmulatedRequest {
             base_url: &deployment.base_url,
             method,
@@ -935,6 +961,8 @@ impl AggregateEgressRuntime {
         let forwarded_body = request_body.rewrite_model(&deployment.actual_model);
         let headers = forward_headers(raw_request, &deployment.key, forwarded_body.len(), true)?;
         let started_at = Instant::now();
+        self.activate_combo_node(&combo);
+        self.record_request_egress(deployment_index, &combo);
         let request = EmulatedRequest {
             base_url: &deployment.base_url,
             method,
@@ -993,10 +1021,23 @@ impl AggregateEgressRuntime {
                             .cooldown_until
                             .map(|until| until.saturating_duration_since(now).as_secs())
                             .unwrap_or(0);
+                        let row_egress = item.last_request_egress.clone().filter(|egress| {
+                            now.duration_since(egress.seen_at) < Duration::from_secs(24 * 60 * 60)
+                        });
+                        let row_clash_node = row_egress
+                            .as_ref()
+                            .and_then(|egress| egress.node.clone())
+                            .unwrap_or_default();
+                        let row_clash_egress_ip = row_egress
+                            .and_then(|egress| egress.ip)
+                            .unwrap_or_default();
                         AggregateKeyRow {
                             upstream: item.upstream.clone(),
+                            base_url: item.base_url.clone(),
                             key_label: item.key_label.clone(),
                             egress_note: item.egress_note.clone(),
+                            recent_clash_node: row_clash_node,
+                            recent_clash_egress_ip: row_clash_egress_ip,
                             score: item.stats.score,
                             total_requests: item.stats.total_requests,
                             success_requests: item.stats.success_requests,
@@ -1013,6 +1054,63 @@ impl AggregateEgressRuntime {
             })
             .unwrap_or_default();
         AggregateEgressSnapshot { rows }
+    }
+
+    fn record_request_egress(&self, deployment_index: usize, combo: &AggregateEgressCombo) {
+        let ip = self
+            .clash_proxy_url
+            .as_deref()
+            .and_then(|proxy_url| self.request_proxy_egress_ip(proxy_url, combo.node.as_deref()));
+        if combo.node.is_none() && ip.is_none() {
+            return;
+        }
+        let egress = AggregateRequestEgress {
+            node: combo.node.clone(),
+            ip,
+            seen_at: Instant::now(),
+        };
+        if let Ok(mut items) = self.deployments.lock() {
+            if let Some(item) = items.get_mut(deployment_index) {
+                item.last_request_egress = Some(egress.clone());
+            }
+        }
+        if let Ok(mut last) = self.last_request_egress.lock() {
+            *last = Some(egress);
+        }
+    }
+
+    fn activate_combo_node(&self, combo: &AggregateEgressCombo) {
+        let (Some(clash), Some(node)) = (&self.clash, combo.node.as_deref()) else {
+            return;
+        };
+        if clash
+            .switch_to_node_force(clash.config.group_name.trim(), node)
+            .is_ok()
+        {
+            self.clear_cached_combo_egress_ip(combo);
+        }
+    }
+
+    fn request_proxy_egress_ip(&self, proxy_url: &str, node: Option<&str>) -> Option<String> {
+        let proxy_url = trimmed(proxy_url)?;
+        let node = node.and_then(trimmed);
+        if node.is_none() {
+            return lookup_proxy_egress_ip(proxy_url);
+        }
+        let cache_key = format!("{}\n{}", proxy_url, node.unwrap_or_default());
+        let ttl = Duration::from_secs(10);
+        let now = Instant::now();
+        if let Ok(mut cache) = self.request_egress_ip_cache.lock() {
+            cache.retain(|_, (_, seen_at)| now.duration_since(*seen_at) < ttl);
+            if let Some((ip, _)) = cache.get(&cache_key) {
+                return Some(ip.clone());
+            }
+        }
+        let ip = lookup_proxy_egress_ip(proxy_url)?;
+        if let Ok(mut cache) = self.request_egress_ip_cache.lock() {
+            cache.insert(cache_key, (ip.clone(), Instant::now()));
+        }
+        Some(ip)
     }
 
     pub fn flush_quality(&self) {
@@ -1057,11 +1155,7 @@ impl AggregateEgressRuntime {
                 .then_with(|| left.stats.total_requests.cmp(&right.stats.total_requests))
                 .then_with(|| left_index.cmp(right_index))
         });
-        let offset = if quality_dominates(&candidates) {
-            0
-        } else {
-            self.next_rotation() % candidates.len()
-        };
+        let offset = self.next_rotation() % candidates.len();
         candidates
             .get(offset)
             .copied()
@@ -1094,11 +1188,7 @@ impl AggregateEgressRuntime {
                 .then_with(|| left.stats.total_requests.cmp(&right.stats.total_requests))
                 .then_with(|| left_index.cmp(right_index))
         });
-        let offset = if quality_dominates(&candidates) {
-            0
-        } else {
-            self.next_rotation() % candidates.len()
-        };
+        let offset = self.next_rotation() % candidates.len();
         candidates
             .get(offset)
             .copied()
@@ -1273,7 +1363,7 @@ impl AggregateEgressRuntime {
         if let Some(clash) = &self.clash {
             if let Some(next_combo) = self.advance_combo_after_failure(combo) {
                 if let Some(node) = next_combo.node.as_deref() {
-                    let _ = clash.switch_to_node(clash.config.group_name.trim(), node);
+                    let _ = clash.switch_to_node_force(clash.config.group_name.trim(), node);
                 }
             } else {
                 clash.rotate_after_failure();
@@ -1323,7 +1413,7 @@ impl AggregateEgressRuntime {
         if let Some(clash) = &self.clash {
             if let Some(next_combo) = self.advance_combo_after_failure(combo) {
                 if let Some(node) = next_combo.node.as_deref() {
-                    let _ = clash.switch_to_node(clash.config.group_name.trim(), node);
+                    let _ = clash.switch_to_node_force(clash.config.group_name.trim(), node);
                 }
             } else {
                 clash.rotate_after_failure();
@@ -1404,21 +1494,67 @@ impl AggregateEgressRuntime {
             .map(|index| index.saturating_add(1))
             .unwrap_or(state.next_index)
             % len;
-        let mut selected_index = start;
-        for step in 0..len {
-            let index = (start + step) % len;
-            let combo = &state.combos[index];
-            if ttl.is_zero()
-                || window == 0
-                || !state.recent.iter().any(|(recent, _)| recent == combo)
-            {
-                selected_index = index;
-                break;
-            }
-        }
+        let failed_ip = self.cached_combo_egress_ip(failed_combo);
+        let selected_index = self
+            .find_combo_candidate_index(&state, start, failed_ip.as_deref(), true)
+            .or_else(|| self.find_combo_candidate_index(&state, start, failed_ip.as_deref(), false))
+            .unwrap_or(start);
         state.current_index = selected_index;
         state.next_index = (selected_index + 1) % len;
         state.combos.get(selected_index).cloned()
+    }
+
+    fn find_combo_candidate_index(
+        &self,
+        state: &AggregateComboState,
+        start: usize,
+        failed_ip: Option<&str>,
+        avoid_recent: bool,
+    ) -> Option<usize> {
+        let len = state.combos.len();
+        if len == 0 {
+            return None;
+        }
+        let mut unknown_ip = None;
+        let mut same_ip = None;
+        for step in 0..len {
+            let index = (start + step) % len;
+            let combo = &state.combos[index];
+            if avoid_recent && state.recent.iter().any(|(recent, _)| recent == combo) {
+                continue;
+            }
+            match (failed_ip, self.cached_combo_egress_ip(combo)) {
+                (Some(failed), Some(candidate)) if candidate != failed => return Some(index),
+                (Some(_), Some(_)) => same_ip.get_or_insert(index),
+                (Some(_), None) => unknown_ip.get_or_insert(index),
+                (None, _) => return Some(index),
+            };
+        }
+        unknown_ip.or(same_ip)
+    }
+
+    fn cached_combo_egress_ip(&self, combo: &AggregateEgressCombo) -> Option<String> {
+        let proxy_url = trimmed(self.clash_proxy_url.as_deref()?)?;
+        let node = trimmed(combo.node.as_deref()?)?;
+        let cache_key = format!("{proxy_url}\n{node}");
+        let ttl = Duration::from_secs(10);
+        let now = Instant::now();
+        let mut cache = self.request_egress_ip_cache.lock().ok()?;
+        cache.retain(|_, (_, seen_at)| now.duration_since(*seen_at) < ttl);
+        cache.get(&cache_key).map(|(ip, _)| ip.clone())
+    }
+
+    fn clear_cached_combo_egress_ip(&self, combo: &AggregateEgressCombo) {
+        let Some(proxy_url) = trimmed(self.clash_proxy_url.as_deref().unwrap_or_default()) else {
+            return;
+        };
+        let Some(node) = trimmed(combo.node.as_deref().unwrap_or_default()) else {
+            return;
+        };
+        let cache_key = format!("{proxy_url}\n{node}");
+        if let Ok(mut cache) = self.request_egress_ip_cache.lock() {
+            cache.remove(&cache_key);
+        }
     }
 
     fn combo_recent_window(&self) -> usize {
@@ -1650,6 +1786,24 @@ fn emulated_client(
     Ok(builder.build()?)
 }
 
+fn lookup_proxy_egress_ip(proxy_url: &str) -> Option<String> {
+    let proxy = reqwest::Proxy::all(proxy_url).ok()?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .proxy(proxy)
+        .build()
+        .ok()?;
+    let text = client
+        .get("http://api.ipify.org")
+        .send()
+        .ok()?
+        .text()
+        .ok()?;
+    let ip = text.trim();
+    ip.parse::<std::net::IpAddr>().ok()?;
+    Some(ip.to_string())
+}
+
 fn upstream_url(upstream: &str, path: &str) -> Result<String> {
     let base_text = upstream.trim_end_matches('/');
     let base = Url::parse(&format!("{base_text}/"))?;
@@ -1765,18 +1919,6 @@ where
     } else {
         candidates
     }
-}
-
-fn quality_dominates<T>(candidates: &[(usize, &T)]) -> bool
-where
-    T: HasQualityStats,
-{
-    if candidates.len() <= 1 {
-        return true;
-    }
-    let first = candidates[0].1.quality_stats().score;
-    let second = candidates[1].1.quality_stats().score;
-    first - second >= QUALITY_DOMINANCE_MARGIN
 }
 
 trait HasQualityStats {
@@ -2249,6 +2391,123 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_selection_rotates_all_keys_and_fingerprints_even_with_score_gap() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = AggregateEgressRuntime::new(
+            AggregateEgressConfig {
+                enabled: true,
+                fingerprints: vec![
+                    AggregateFingerprint::Chrome132,
+                    AggregateFingerprint::Firefox128,
+                ],
+                recent_fingerprint_window: 0,
+                recent_fingerprint_ttl_seconds: 0,
+            },
+            vec![
+                seed("dc", "http://upstream.example/v1", "sk-first"),
+                seed("dc", "http://upstream.example/v1", "sk-second"),
+            ],
+            temp.path().join("quality.json"),
+            None,
+            35,
+        )
+        .unwrap();
+        {
+            let mut deployments = runtime.deployments.lock().unwrap();
+            deployments[0].stats.total_requests = 4;
+            deployments[0].stats.score = 100.0;
+            deployments[1].stats.total_requests = 4;
+            deployments[1].stats.score = 10.0;
+        }
+        {
+            let mut fingerprints = runtime.fingerprints.lock().unwrap();
+            fingerprints[0].stats.total_requests = 4;
+            fingerprints[0].stats.score = 100.0;
+            fingerprints[1].stats.total_requests = 4;
+            fingerprints[1].stats.score = 10.0;
+        }
+
+        let first_key = runtime.select_deployment("gpt-5.5").unwrap().1.key;
+        let second_key = runtime.select_deployment("gpt-5.5").unwrap().1.key;
+        let first_fingerprint = runtime.select_fingerprint().unwrap().1.fingerprint;
+        let second_fingerprint = runtime.select_fingerprint().unwrap().1.fingerprint;
+
+        assert_ne!(first_key, second_key);
+        assert_ne!(first_fingerprint, second_fingerprint);
+    }
+
+    #[test]
+    fn aggregate_failure_prefers_combo_with_different_cached_egress_ip() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = AggregateEgressRuntime::new(
+            AggregateEgressConfig {
+                enabled: true,
+                fingerprints: vec![AggregateFingerprint::Chrome132],
+                recent_fingerprint_window: 3,
+                recent_fingerprint_ttl_seconds: 300,
+            },
+            vec![seed("dc", "http://upstream.example/v1", "sk-first")],
+            temp.path().join("quality.json"),
+            Some(AggregateClashConfig {
+                enabled: true,
+                controller_url: String::new(),
+                proxy_url: "http://127.0.0.1:7897".to_string(),
+                secret: String::new(),
+                group_name: String::new(),
+                ip_switch_cooldown_seconds: 0,
+                recent_node_window: 3,
+                recent_node_ttl_seconds: 300,
+            }),
+            35,
+        )
+        .unwrap();
+        {
+            let mut state = runtime.combos.lock().unwrap();
+            state.combos = vec![
+                AggregateEgressCombo {
+                    node: Some("node-a".to_string()),
+                    fingerprint: AggregateFingerprint::Chrome132,
+                },
+                AggregateEgressCombo {
+                    node: Some("node-b".to_string()),
+                    fingerprint: AggregateFingerprint::Chrome132,
+                },
+                AggregateEgressCombo {
+                    node: Some("node-c".to_string()),
+                    fingerprint: AggregateFingerprint::Chrome132,
+                },
+            ];
+            state.current_index = 0;
+            state.next_index = 0;
+            state.recent.clear();
+        }
+        {
+            let now = Instant::now();
+            let mut cache = runtime.request_egress_ip_cache.lock().unwrap();
+            cache.insert(
+                "http://127.0.0.1:7897\nnode-a".to_string(),
+                ("198.51.100.1".to_string(), now),
+            );
+            cache.insert(
+                "http://127.0.0.1:7897\nnode-b".to_string(),
+                ("198.51.100.1".to_string(), now),
+            );
+            cache.insert(
+                "http://127.0.0.1:7897\nnode-c".to_string(),
+                ("198.51.100.2".to_string(), now),
+            );
+        }
+        let failed = AggregateEgressCombo {
+            node: Some("node-a".to_string()),
+            fingerprint: AggregateFingerprint::Chrome132,
+        };
+
+        let next = runtime.advance_combo_after_failure(&failed).unwrap();
+
+        assert_eq!(next.node.as_deref(), Some("node-c"));
+    }
+
+    #[test]
     fn aggregate_quality_writer_keeps_pending_on_save_failure() {
         let source = include_str!("aggregate_egress.rs");
         let block = source
@@ -2347,6 +2606,387 @@ mod tests {
                 fingerprint: AggregateFingerprint::Chrome132,
             }]
         );
+    }
+
+    #[test]
+    fn aggregate_selected_combo_switches_clash_node_before_request() {
+        let controller_server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = controller_server.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..5 {
+                let (mut socket, _) = controller_server.accept().unwrap();
+                let raw = read_http_request(&mut socket).unwrap();
+                let request = String::from_utf8_lossy(&raw).to_string();
+                let body = if request.starts_with("GET /proxies/%E8%87%AA%E5%8A%A8") {
+                    r#"{"now":"node-a","all":["node-a","node-b"]}"#
+                } else if request.starts_with("GET /proxies/node-a")
+                    || request.starts_with("GET /proxies/node-b")
+                {
+                    r#"{"history":[{"delay":120}]}"#
+                } else {
+                    r#"{"ok":true}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = AggregateEgressRuntime::new(
+            AggregateEgressConfig {
+                enabled: true,
+                fingerprints: vec![AggregateFingerprint::Chrome132],
+                recent_fingerprint_window: 1,
+                recent_fingerprint_ttl_seconds: 300,
+            },
+            vec![seed("dc", "http://upstream.example/v1", "sk-first")],
+            temp.path().join("quality.json"),
+            Some(AggregateClashConfig {
+                enabled: true,
+                controller_url: format!("http://127.0.0.1:{port}"),
+                proxy_url: String::new(),
+                secret: String::new(),
+                group_name: "自动选择".to_string(),
+                ip_switch_cooldown_seconds: 0,
+                recent_node_window: 1,
+                recent_node_ttl_seconds: 300,
+            }),
+            35,
+        )
+        .unwrap();
+
+        let first = runtime.select_combo().unwrap();
+        runtime.activate_combo_node(&first);
+        runtime.remember_combo(&first);
+        let second = runtime.select_combo().unwrap();
+        runtime.activate_combo_node(&second);
+
+        let requests = handle.join().unwrap();
+        assert_eq!(first.node.as_deref(), Some("node-a"));
+        assert_eq!(second.node.as_deref(), Some("node-b"));
+        assert!(requests.iter().any(|request| request
+            .starts_with("PUT /proxies/%E8%87%AA%E5%8A%A8")
+            && request.contains(r#""name":"node-a""#)));
+        assert!(requests.iter().any(|request| request
+            .starts_with("PUT /proxies/%E8%87%AA%E5%8A%A8")
+            && request.contains(r#""name":"node-b""#)));
+    }
+
+    #[test]
+    fn aggregate_force_switch_bypasses_ip_switch_cooldown() {
+        let controller_server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = controller_server.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = controller_server.accept().unwrap();
+                let raw = read_http_request(&mut socket).unwrap();
+                let request = String::from_utf8_lossy(&raw).to_string();
+                let body = r#"{"ok":true}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+        let controller = AggregateClashController::new(AggregateClashConfig {
+            enabled: true,
+            controller_url: format!("http://127.0.0.1:{port}"),
+            proxy_url: String::new(),
+            secret: String::new(),
+            group_name: "自动选择".to_string(),
+            ip_switch_cooldown_seconds: 3600,
+            recent_node_window: 0,
+            recent_node_ttl_seconds: 0,
+        })
+        .unwrap();
+
+        controller
+            .switch_to_node("自动选择", "node-a")
+            .expect("first switch should be sent");
+        controller
+            .switch_to_node_force("自动选择", "node-b")
+            .expect("forced switch should bypass cooldown");
+
+        let requests = handle.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains(r#""name":"node-a""#));
+        assert!(requests[1].contains(r#""name":"node-b""#));
+    }
+
+    #[test]
+    fn aggregate_forced_combo_activation_clears_cached_node_egress_ip() {
+        let controller_server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = controller_server.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..4 {
+                let (mut socket, _) = controller_server.accept().unwrap();
+                let raw = read_http_request(&mut socket).unwrap();
+                let request = String::from_utf8_lossy(&raw).to_string();
+                let body = if request.starts_with("GET /proxies/%E8%87%AA%E5%8A%A8") {
+                    r#"{"now":"node-a","all":["node-a","node-b"]}"#
+                } else if request.starts_with("GET /proxies/node-a")
+                    || request.starts_with("GET /proxies/node-b")
+                {
+                    r#"{"history":[{"delay":120}]}"#
+                } else {
+                    r#"{"ok":true}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let proxy_url = "http://127.0.0.1:7897".to_string();
+        let runtime = AggregateEgressRuntime::new(
+            AggregateEgressConfig {
+                enabled: true,
+                fingerprints: vec![AggregateFingerprint::Chrome132],
+                recent_fingerprint_window: 0,
+                recent_fingerprint_ttl_seconds: 0,
+            },
+            vec![seed("dc", "http://upstream.example/v1", "sk-first")],
+            temp.path().join("quality.json"),
+            Some(AggregateClashConfig {
+                enabled: true,
+                controller_url: format!("http://127.0.0.1:{port}"),
+                proxy_url: proxy_url.clone(),
+                secret: String::new(),
+                group_name: "自动选择".to_string(),
+                ip_switch_cooldown_seconds: 3600,
+                recent_node_window: 0,
+                recent_node_ttl_seconds: 0,
+            }),
+            35,
+        )
+        .unwrap();
+        let combo = AggregateEgressCombo {
+            node: Some("node-b".to_string()),
+            fingerprint: AggregateFingerprint::Chrome132,
+        };
+        let cache_key = format!("{proxy_url}\nnode-b");
+        runtime.request_egress_ip_cache.lock().unwrap().insert(
+            cache_key.clone(),
+            ("198.51.100.9".to_string(), Instant::now()),
+        );
+
+        runtime.activate_combo_node(&combo);
+
+        let requests = handle.join().unwrap();
+        assert!(requests.iter().any(|request| request.contains(r#""name":"node-b""#)));
+        assert!(!runtime
+            .request_egress_ip_cache
+            .lock()
+            .unwrap()
+            .contains_key(&cache_key));
+    }
+
+    #[test]
+    fn aggregate_snapshot_uses_request_time_proxy_egress_without_group() {
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = proxy.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = proxy.accept().unwrap();
+                let raw = read_http_request(&mut socket).unwrap();
+                let request = String::from_utf8_lossy(&raw).to_string();
+                let body = if request.starts_with("GET http://api.ipify.org/") {
+                    "203.0.113.11".to_string()
+                } else {
+                    r#"{"output_text":"ok"}"#.to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = AggregateEgressRuntime::new(
+            AggregateEgressConfig {
+                enabled: true,
+                ..AggregateEgressConfig::default()
+            },
+            vec![seed("dc", "http://upstream.example/v1", "sk-first")],
+            temp.path().join("quality.json"),
+            Some(AggregateClashConfig {
+                enabled: true,
+                controller_url: String::new(),
+                proxy_url: format!("http://127.0.0.1:{port}"),
+                secret: String::new(),
+                group_name: String::new(),
+                ip_switch_cooldown_seconds: 0,
+                recent_node_window: 0,
+                recent_node_ttl_seconds: 0,
+            }),
+            35,
+        )
+        .unwrap();
+        let body = r#"{"model":"gpt-5.5","input":"hello"}"#;
+
+        let response = runtime
+            .forward_once(&raw_request(body), body.as_bytes(), "POST", "/v1/responses")
+            .unwrap();
+        let snapshot = runtime.snapshot();
+
+        let requests = handle.join().unwrap();
+        assert_eq!(response.status, 200);
+        assert!(requests[0].starts_with("GET http://api.ipify.org/"));
+        assert!(requests[1].starts_with("POST http://upstream.example/v1/responses"));
+        assert_eq!(snapshot.rows[0].recent_clash_node, "");
+        assert_eq!(snapshot.rows[0].recent_clash_egress_ip, "203.0.113.11");
+        assert_eq!(snapshot.rows[0].base_url, "http://upstream.example/v1");
+    }
+
+    #[test]
+    fn aggregate_snapshot_keeps_request_egress_per_key_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = AggregateEgressRuntime::new(
+            AggregateEgressConfig {
+                enabled: true,
+                ..AggregateEgressConfig::default()
+            },
+            vec![
+                seed("dc", "http://upstream-a.example/v1", "sk-first"),
+                seed("dc", "http://upstream-b.example/v1", "sk-second"),
+            ],
+            temp.path().join("quality.json"),
+            None,
+            35,
+        )
+        .unwrap();
+        {
+            let mut deployments = runtime.deployments.lock().unwrap();
+            deployments[0].last_request_egress = Some(AggregateRequestEgress {
+                node: Some("node-a".to_string()),
+                ip: Some("203.0.113.21".to_string()),
+                seen_at: Instant::now(),
+            });
+            deployments[1].last_request_egress = Some(AggregateRequestEgress {
+                node: Some("node-b".to_string()),
+                ip: Some("203.0.113.22".to_string()),
+                seen_at: Instant::now(),
+            });
+        }
+
+        let snapshot = runtime.snapshot();
+
+        let first = snapshot
+            .rows
+            .iter()
+            .find(|row| row.base_url == "http://upstream-a.example/v1")
+            .unwrap();
+        let second = snapshot
+            .rows
+            .iter()
+            .find(|row| row.base_url == "http://upstream-b.example/v1")
+            .unwrap();
+        assert_eq!(first.recent_clash_node, "node-a");
+        assert_eq!(first.recent_clash_egress_ip, "203.0.113.21");
+        assert_eq!(second.recent_clash_node, "node-b");
+        assert_eq!(second.recent_clash_egress_ip, "203.0.113.22");
+    }
+
+    #[test]
+    fn aggregate_snapshot_does_not_copy_global_egress_to_unused_key_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = AggregateEgressRuntime::new(
+            AggregateEgressConfig {
+                enabled: true,
+                ..AggregateEgressConfig::default()
+            },
+            vec![
+                seed("dc", "http://upstream-a.example/v1", "sk-first"),
+                seed("dc", "http://upstream-b.example/v1", "sk-second"),
+            ],
+            temp.path().join("quality.json"),
+            None,
+            35,
+        )
+        .unwrap();
+        {
+            let egress = AggregateRequestEgress {
+                node: Some("node-a".to_string()),
+                ip: Some("203.0.113.21".to_string()),
+                seen_at: Instant::now(),
+            };
+            runtime.deployments.lock().unwrap()[0].last_request_egress = Some(egress.clone());
+            *runtime.last_request_egress.lock().unwrap() = Some(egress);
+        }
+
+        let snapshot = runtime.snapshot();
+
+        let unused = snapshot
+            .rows
+            .iter()
+            .find(|row| row.base_url == "http://upstream-b.example/v1")
+            .unwrap();
+        assert_eq!(unused.recent_clash_node, "");
+        assert_eq!(unused.recent_clash_egress_ip, "");
+    }
+
+    #[test]
+    fn aggregate_request_egress_cache_is_scoped_by_clash_node() {
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = proxy.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            for body in ["203.0.113.31", "203.0.113.32"] {
+                let (mut socket, _) = proxy.accept().unwrap();
+                let _ = read_http_request(&mut socket).unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = AggregateEgressRuntime::new(
+            AggregateEgressConfig {
+                enabled: true,
+                ..AggregateEgressConfig::default()
+            },
+            vec![seed("dc", "http://upstream.example/v1", "sk-first")],
+            temp.path().join("quality.json"),
+            Some(AggregateClashConfig {
+                enabled: true,
+                controller_url: String::new(),
+                proxy_url: format!("http://127.0.0.1:{port}"),
+                secret: String::new(),
+                group_name: String::new(),
+                ip_switch_cooldown_seconds: 0,
+                recent_node_window: 0,
+                recent_node_ttl_seconds: 0,
+            }),
+            35,
+        )
+        .unwrap();
+        let proxy_url = format!("http://127.0.0.1:{port}");
+
+        let first = runtime.request_proxy_egress_ip(&proxy_url, Some("node-a"));
+        let second = runtime.request_proxy_egress_ip(&proxy_url, Some("node-b"));
+
+        handle.join().unwrap();
+        assert_eq!(first.as_deref(), Some("203.0.113.31"));
+        assert_eq!(second.as_deref(), Some("203.0.113.32"));
     }
 
     fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>> {

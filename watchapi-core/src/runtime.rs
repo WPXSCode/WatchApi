@@ -1,6 +1,6 @@
 use crate::agent::AgentProcess;
 use crate::atomic_write::write_text_atomic;
-use crate::config::{AgentDriver, AppConfig, ContinuationMode, EndpointConfig};
+use crate::config::{AgentDriver, AppConfig, EndpointConfig};
 use crate::control::{
     enqueue_manual_prompt, pop_manual_prompt, read_control_state, update_control_state,
 };
@@ -130,6 +130,7 @@ pub struct RuntimeCore {
     last_prompt_at: Option<Instant>,
     last_auto_prompt_signature: Option<(String, String)>,
     waiting_for_assistant_progress: bool,
+    goal_turn_active: bool,
     trigger_now_clear_failed: bool,
     force_new_session_once: bool,
     force_current_probe_once: bool,
@@ -198,6 +199,7 @@ impl RuntimeCore {
             last_prompt_at: None,
             last_auto_prompt_signature: None,
             waiting_for_assistant_progress: false,
+            goal_turn_active: false,
             trigger_now_clear_failed: false,
             force_new_session_once: false,
             force_current_probe_once: false,
@@ -457,6 +459,7 @@ impl RuntimeCore {
         self.last_prompt_at = None;
         self.last_auto_prompt_signature = None;
         self.waiting_for_assistant_progress = false;
+        self.goal_turn_active = false;
         self.trigger_now_clear_failed = false;
         self.state = RuntimeState::WaitingAvailable;
         self.probing_endpoint = None;
@@ -487,6 +490,16 @@ impl RuntimeCore {
             .get("auto_paused")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true)
+    }
+
+    fn goal_enabled(&self) -> bool {
+        let Some(path) = self.config.config_path.as_ref() else {
+            return false;
+        };
+        read_control_state(path)
+            .get("goal_enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
     }
     pub fn terminal_output(&self) -> String {
         self.agent
@@ -1224,11 +1237,27 @@ impl RuntimeCore {
     }
 
     fn goal_prompt_for_new_session(&self, resumed: bool) -> Option<String> {
-        if resumed
-            || self.config.agent_driver != AgentDriver::Codex
-            || self.config.continuation_mode != ContinuationMode::Goal
+        if self.config.agent_driver != AgentDriver::Codex
             || !self.config.agent_goal.enabled
+            || !self.goal_enabled()
         {
+            return None;
+        }
+        if resumed {
+            if self.config.agent_goal.sync_on_resume
+                && self.config.agent_goal.source == "session_import"
+                && !self
+                    .config
+                    .agent_goal
+                    .source_goal_signature
+                    .trim()
+                    .is_empty()
+            {
+                return Some("/goal resume".to_string());
+            }
+            return None;
+        }
+        if !self.config.agent_goal.sync_on_new_session {
             return None;
         }
         let text = self.config.agent_goal.text.trim();
@@ -1239,8 +1268,8 @@ impl RuntimeCore {
     }
 
     fn goal_fallback_prompt(&self) -> Option<String> {
-        if self.config.continuation_mode != ContinuationMode::Goal
-            || !self.config.agent_goal.enabled
+        if !self.config.agent_goal.enabled
+            || !self.goal_enabled()
             || !self.config.agent_goal.fallback_enabled
             || self.config.agent_goal.text.trim().is_empty()
         {
@@ -1255,6 +1284,7 @@ impl RuntimeCore {
 
     fn maybe_drive_prompt(&mut self, endpoint: &EndpointConfig) {
         let mut session_assistant_confirmed = false;
+        let mut input_block_reason = None;
         let can_send_prompt = {
             let Some(agent) = self.agent.as_mut() else {
                 return;
@@ -1282,16 +1312,20 @@ impl RuntimeCore {
             if agent.auto_wait_safely_released() {
                 self.waiting_for_assistant_progress = false;
             }
-            agent.can_send_prompt()
+            let can_send = agent.can_send_prompt();
+            if !can_send {
+                input_block_reason = agent.auto_input_block_reason();
+            }
+            can_send
         };
         if session_assistant_confirmed {
             self.clear_endpoint_request_failures(&endpoint.name);
             self.endpoint_auto_prompt_blocked_until
                 .remove(&endpoint.name);
-        }
-        if !can_send_prompt {
-            self.publish_snapshot_event();
-            return;
+            if self.goal_turn_active {
+                self.goal_turn_active = false;
+                self.disable_goal_mode_after_completed_turn();
+            }
         }
         let control_state = self
             .config
@@ -1311,7 +1345,11 @@ impl RuntimeCore {
             .get("auto_paused")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
-        if self.pending_goal_prompt.is_none() {
+        let goal_enabled = control_state
+            .get("goal_enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if goal_enabled && self.pending_goal_prompt.is_none() {
             self.pending_goal_prompt = control_state_goal_prompt(&control_state);
             if self.pending_goal_prompt.is_some() {
                 if let Some(config_path) = &self.config.config_path {
@@ -1331,10 +1369,21 @@ impl RuntimeCore {
             at.elapsed() >= Duration::from_secs_f64(self.config.min_prompt_interval_seconds)
         });
         let automatic_requested = trigger_now_requested
-            || (!auto_paused
-                && (self.pending_goal_prompt.is_some()
-                    || self.pending_initial_prompt.is_some()
-                    || can_send_by_interval));
+            || (goal_enabled && self.pending_goal_prompt.is_some())
+            || (!auto_paused && (self.pending_initial_prompt.is_some() || can_send_by_interval));
+        if !can_send_prompt {
+            if let Some(prompt) = manual_prompt.as_ref() {
+                if let Some(config_path) = &self.config.config_path {
+                    let _ = enqueue_manual_prompt(config_path, prompt);
+                }
+            }
+            if automatic_requested || manual_prompt.is_some() {
+                let reason = input_block_reason.unwrap_or("终端未就绪");
+                self.state = RuntimeState::Error(format!("等待可输入：{reason}"));
+            }
+            self.publish_snapshot_event();
+            return;
+        }
         if manual_prompt.is_none()
             && automatic_requested
             && self.auto_prompt_blocked_by_endpoint_cooldown(&endpoint.name)
@@ -1385,6 +1434,9 @@ impl RuntimeCore {
             self.last_prompt_at = Some(Instant::now());
             if !is_goal_command {
                 self.last_auto_prompt_signature = Some((endpoint.name.clone(), prompt));
+            }
+            if is_goal_command {
+                self.goal_turn_active = true;
             }
             self.waiting_for_assistant_progress = !is_manual;
             let mut cleanup_error = None;
@@ -1459,6 +1511,28 @@ impl RuntimeCore {
         if self.save_usage_state() {
             self.publish_snapshot_event();
         }
+    }
+
+    fn disable_goal_mode_after_completed_turn(&mut self) {
+        let Some(config_path) = &self.config.config_path else {
+            return;
+        };
+        let _ = update_control_state(
+            config_path,
+            &[
+                ("goal_enabled", serde_json::json!(false)),
+                ("goal_completed", serde_json::json!(true)),
+                (
+                    "goal_completed_revision",
+                    serde_json::json!(self.config.agent_goal.revision),
+                ),
+                (
+                    "goal_completed_source_goal_signature",
+                    serde_json::json!(self.config.agent_goal.source_goal_signature),
+                ),
+                ("goal_request", serde_json::Value::Null),
+            ],
+        );
     }
 
     fn save_usage_state(&mut self) -> bool {
@@ -2080,9 +2154,17 @@ fn usage_key(endpoint: &EndpointConfig) -> String {
 }
 
 fn control_state_goal_prompt(state: &Value) -> Option<String> {
-    let goal = state
-        .get("goal_request")
-        .and_then(|request| request.get("text"))
+    let request = state.get("goal_request")?;
+    let action = request
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("set")
+        .trim();
+    if action == "resume" {
+        return Some("/goal resume".to_string());
+    }
+    let goal = request
+        .get("text")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|text| !text.is_empty())?;
@@ -3195,9 +3277,83 @@ mod tests {
     }
 
     #[test]
+    fn resumed_imported_goal_uses_goal_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.json");
+        crate::control::update_control_state(&config_path, &[("goal_enabled", json!(true))])
+            .unwrap();
+        let mut cfg = config();
+        cfg.config_path = Some(config_path);
+        cfg.continuation_mode = crate::config::ContinuationMode::Goal;
+        cfg.agent_goal.enabled = true;
+        cfg.agent_goal.text = "历史目标".to_string();
+        cfg.agent_goal.source = "session_import".to_string();
+        cfg.agent_goal.source_goal_signature = "line:4:hash:abc".to_string();
+        cfg.agent_goal.sync_on_resume = true;
+        let runtime = RuntimeCore::new(cfg);
+
+        assert_eq!(
+            runtime.goal_prompt_for_new_session(true),
+            Some("/goal resume".to_string())
+        );
+    }
+
+    #[test]
+    fn user_edited_goal_does_not_resume_imported_goal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.json");
+        crate::control::update_control_state(&config_path, &[("goal_enabled", json!(true))])
+            .unwrap();
+        let mut cfg = config();
+        cfg.config_path = Some(config_path);
+        cfg.continuation_mode = crate::config::ContinuationMode::Goal;
+        cfg.agent_goal.enabled = true;
+        cfg.agent_goal.text = "用户新目标".to_string();
+        cfg.agent_goal.source = "user_edit".to_string();
+        cfg.agent_goal.source_goal_signature = String::new();
+        cfg.agent_goal.sync_on_resume = true;
+        let runtime = RuntimeCore::new(cfg);
+
+        assert_eq!(runtime.goal_prompt_for_new_session(true), None);
+    }
+
+    #[test]
+    fn completed_goal_turn_disables_goal_switch_for_next_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.json");
+        crate::control::update_control_state(
+            &config_path,
+            &[
+                ("goal_enabled", json!(true)),
+                ("goal_request", json!({"action": "resume"})),
+            ],
+        )
+        .unwrap();
+        let mut cfg = config();
+        cfg.config_path = Some(config_path.clone());
+        cfg.agent_goal.revision = 7;
+        cfg.agent_goal.source_goal_signature = "line:4:hash:abc".to_string();
+        let mut runtime = RuntimeCore::new(cfg);
+        runtime.goal_turn_active = true;
+
+        runtime.disable_goal_mode_after_completed_turn();
+
+        let state = crate::control::read_control_state(&config_path);
+        assert_eq!(state["goal_enabled"], json!(false));
+        assert_eq!(state["goal_completed"], json!(true));
+        assert_eq!(state["goal_completed_revision"], json!(7));
+        assert_eq!(
+            state["goal_completed_source_goal_signature"],
+            json!("line:4:hash:abc")
+        );
+        assert!(state.get("goal_request").is_none_or(Value::is_null));
+    }
+
+    #[test]
     fn control_state_goal_request_builds_codex_goal_command() {
         let state = json!({
             "goal_request": {
+                "action": "set",
                 "text": "  修复终端渲染  "
             }
         });
@@ -3210,11 +3366,20 @@ mod tests {
             control_state_goal_prompt(&json!({"goal_request": {"text": ""}})),
             None
         );
+        assert_eq!(
+            control_state_goal_prompt(&json!({"goal_request": {"action": "resume"}})),
+            Some("/goal resume".to_string())
+        );
     }
 
     #[test]
     fn goal_mode_uses_fallback_prompt_instead_of_auto_prompt_when_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.json");
+        crate::control::update_control_state(&config_path, &[("goal_enabled", json!(true))])
+            .unwrap();
         let mut cfg = config();
+        cfg.config_path = Some(config_path);
         cfg.continuation_mode = crate::config::ContinuationMode::Goal;
         cfg.agent_goal.enabled = true;
         cfg.agent_goal.text = "修复终端渲染".to_string();
@@ -3296,6 +3461,26 @@ mod tests {
             prompt_block.contains("清理立即续航标记失败"),
             "清理失败要进入可见状态，便于定位文件权限或状态文件异常"
         );
+    }
+
+    #[test]
+    fn blocked_auto_prompt_reports_waiting_for_input_instead_of_idle() {
+        let source = include_str!("runtime.rs");
+        let prompt_block = source
+            .split("fn maybe_drive_prompt")
+            .nth(1)
+            .and_then(|tail| tail.split("fn record_agent_usage").next())
+            .expect("prompt driver should be discoverable");
+        let blocked_block = prompt_block
+            .split("if !can_send_prompt {")
+            .nth(1)
+            .and_then(|tail| tail.split("if manual_prompt.is_none()").next())
+            .expect("blocked can_send_prompt block should be discoverable");
+
+        assert!(blocked_block.contains("enqueue_manual_prompt"));
+        assert!(blocked_block.contains("automatic_requested || manual_prompt.is_some()"));
+        assert!(prompt_block.contains("agent.auto_input_block_reason()"));
+        assert!(blocked_block.contains("format!(\"等待可输入：{reason}\")"));
     }
 
     #[test]
