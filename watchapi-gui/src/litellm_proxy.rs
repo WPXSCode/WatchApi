@@ -1220,10 +1220,7 @@ impl SmartProxyServer {
         } else {
             None
         };
-        let http_client = Client::builder()
-            .connect_timeout(SMART_PROXY_UPSTREAM_CONNECT_TIMEOUT)
-            .timeout(smart_proxy_upstream_timeout())
-            .build()?;
+        let http_client = smart_proxy_http_client(proxy)?;
         Ok(Self {
             listen_host: proxy.host.trim().to_string(),
             listen_port: proxy.port,
@@ -1390,6 +1387,20 @@ impl SmartProxyServer {
             self.bound_port.unwrap_or(self.listen_port)
         )
     }
+}
+
+fn smart_proxy_http_client(proxy: &ProxyConfig) -> Result<Client> {
+    let mut builder = Client::builder()
+        .connect_timeout(SMART_PROXY_UPSTREAM_CONNECT_TIMEOUT)
+        .timeout(smart_proxy_upstream_timeout())
+        .pool_max_idle_per_host(0);
+    if proxy.clash_verge.is_effective() {
+        let proxy_url = non_empty_trimmed(&proxy.clash_verge.proxy_url)
+            .map(str::to_string)
+            .unwrap_or_else(default_clash_verge_proxy_url);
+        builder = builder.proxy(reqwest::Proxy::all(&proxy_url)?);
+    }
+    Ok(builder.build()?)
 }
 
 impl Drop for SmartProxyServer {
@@ -2989,12 +3000,25 @@ mod tests {
             .expect("smart proxy stream forward block should be discoverable");
 
         assert!(server_struct.contains("http_client: Client"));
-        assert!(constructor_block.contains("let http_client = Client::builder()"));
+        assert!(constructor_block.contains("let http_client = smart_proxy_http_client(proxy)?"));
         assert!(constructor_block.contains("http_client,"));
         assert!(!forward_block.contains("Client::builder()"));
         assert!(!stream_block.contains("Client::builder()"));
         assert!(forward_block.contains("client: &Client"));
         assert!(stream_block.contains("client: &Client"));
+    }
+
+    #[test]
+    fn smart_proxy_upstream_client_uses_clash_proxy_without_idle_reuse() {
+        let source = include_str!("litellm_proxy.rs");
+        let block = source
+            .split("fn smart_proxy_http_client")
+            .nth(1)
+            .and_then(|tail| tail.split("impl Drop for SmartProxyServer").next())
+            .expect("smart proxy http client helper should be discoverable");
+
+        assert!(block.contains(".proxy(reqwest::Proxy::all(&proxy_url)?);"));
+        assert!(block.contains(".pool_max_idle_per_host(0)"));
     }
 
     #[test]
