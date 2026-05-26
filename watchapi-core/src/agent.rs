@@ -392,6 +392,13 @@ impl AgentProcess {
             .unwrap_or_default()
     }
 
+    pub fn terminal_output_delta_from(&self, start: usize) -> (String, usize) {
+        self.terminal
+            .as_ref()
+            .map(|terminal| terminal.output_delta_from(start))
+            .unwrap_or_default()
+    }
+
     pub fn terminal_output_revision(&self) -> u64 {
         self.terminal
             .as_ref()

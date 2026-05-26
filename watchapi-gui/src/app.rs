@@ -7238,9 +7238,21 @@ impl WatchApiApp {
                     let output_revision = guard.terminal_output_revision();
                     if output_revision != self.terminal_output_revision {
                         self.terminal_output_revision = output_revision;
-                        let output = guard.terminal_output();
-                        if !output.is_empty() {
-                            next_output = Some(output);
+                        let full_output_needed = self.terminal_control.is_none()
+                            || self.terminal_view.is_none()
+                            || self.terminal_output.is_empty();
+                        if full_output_needed {
+                            let output = guard.terminal_output();
+                            if !output.is_empty() {
+                                next_output = Some(output);
+                            }
+                        } else {
+                            let (delta, next_len) =
+                                guard.terminal_output_delta_from(self.logged_output_len);
+                            if !delta.is_empty() {
+                                self.pending_log_text.push_str(&delta);
+                            }
+                            self.logged_output_len = next_len;
                         }
                     }
                     let view_revision = guard.terminal_view_revision();
@@ -7327,18 +7339,23 @@ impl WatchApiApp {
         next_output: &mut Option<String>,
         next_view: &mut Option<TerminalView>,
     ) {
-        let Some(terminal_control) = &self.terminal_control else {
+        let Some(terminal_control) = self.terminal_control.clone() else {
             return;
         };
         self.terminal_running = terminal_control.process_id().is_some();
+        let full_output_needed = self.terminal_view.is_none() || self.terminal_output.is_empty();
         refresh_terminal_cache_from_control(
-            terminal_control,
+            &terminal_control,
             &mut self.terminal_output_revision,
             &mut self.terminal_view_revision,
+            &mut self.logged_output_len,
+            &mut self.pending_log_text,
             self.terminal_view.is_none(),
+            full_output_needed,
             next_output,
             next_view,
         );
+        self.flush_terminal_log_buffer_if_due();
     }
 
     fn refresh_background_runtime_snapshots(&mut self) {
@@ -9978,16 +9995,27 @@ fn refresh_terminal_cache_from_control(
     terminal_control: &TerminalControl,
     output_revision: &mut u64,
     view_revision: &mut u64,
+    logged_output_len: &mut usize,
+    pending_log_text: &mut String,
     view_missing: bool,
+    full_output_needed: bool,
     next_output: &mut Option<String>,
     next_view: &mut Option<TerminalView>,
 ) {
     let control_output_revision = terminal_control.output_revision();
     if control_output_revision != *output_revision {
         *output_revision = control_output_revision;
-        let output = terminal_control.output_text();
-        if !output.is_empty() {
-            *next_output = Some(output);
+        if full_output_needed {
+            let output = terminal_control.output_text();
+            if !output.is_empty() {
+                *next_output = Some(output);
+            }
+        } else {
+            let (delta, next_len) = terminal_control.output_delta_from(*logged_output_len);
+            if !delta.is_empty() {
+                pending_log_text.push_str(&delta);
+            }
+            *logged_output_len = next_len;
         }
     }
     let control_view_revision = terminal_control.view_revision();
@@ -10045,7 +10073,10 @@ fn refresh_stashed_terminal_cache_from_control(session: &mut GuiRuntimeSession, 
         terminal_control,
         &mut session.terminal_output_revision,
         &mut session.terminal_view_revision,
+        &mut session.logged_output_len,
+        &mut session.pending_log_text,
         session.terminal_view.is_none(),
+        session.terminal_view.is_none() || session.terminal_output.is_empty(),
         &mut next_output,
         &mut next_view,
     );
@@ -20518,6 +20549,29 @@ mod tests {
             block.find("terminal_output_revision()") < block.find("terminal_output()"),
             "terminal_output should only be read after the revision check"
         );
+    }
+
+    #[test]
+    fn terminal_control_refresh_uses_output_delta_for_logs() {
+        let source = include_str!("app.rs");
+        let helper_block = source
+            .split("fn refresh_terminal_cache_from_control")
+            .nth(1)
+            .and_then(|tail| tail.split("fn should_apply_terminal_view_update").next())
+            .expect("terminal control refresh helper should be discoverable");
+        let refresh_block = source
+            .split("fn refresh_runtime_snapshot")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("fn refresh_active_terminal_cache_from_control")
+                    .next()
+            })
+            .expect("runtime refresh block should be discoverable");
+
+        assert!(helper_block.contains("output_delta_from(*logged_output_len)"));
+        assert!(helper_block.contains("pending_log_text.push_str(&delta)"));
+        assert!(helper_block.contains("if full_output_needed"));
+        assert!(refresh_block.contains("guard.terminal_output_delta_from(self.logged_output_len)"));
     }
 
     #[test]

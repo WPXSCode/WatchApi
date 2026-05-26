@@ -174,6 +174,10 @@ impl TerminalControl {
         self.output.lock().text()
     }
 
+    pub fn output_delta_from(&self, start: usize) -> (String, usize) {
+        self.output.lock().text_delta_from(start)
+    }
+
     pub fn output_revision(&self) -> u64 {
         self.output.lock().revision()
     }
@@ -446,6 +450,10 @@ impl TerminalSession {
 
     pub fn output_text(&self) -> String {
         self.output.lock().text()
+    }
+
+    pub fn output_delta_from(&self, start: usize) -> (String, usize) {
+        self.output.lock().text_delta_from(start)
     }
 
     pub fn output_revision(&self) -> u64 {
@@ -809,6 +817,45 @@ impl RingTextBuffer {
         out
     }
 
+    fn text_delta_from(&self, start: usize) -> (String, usize) {
+        if start == self.bytes {
+            return (String::new(), self.bytes);
+        }
+        if start > self.bytes || !self.is_char_boundary(start) {
+            return (self.text(), self.bytes);
+        }
+        let mut remaining = start;
+        let delta_len = self.bytes - start;
+        let mut out = String::with_capacity(delta_len);
+        for chunk in &self.chunks {
+            if remaining >= chunk.len() {
+                remaining -= chunk.len();
+                continue;
+            }
+            out.push_str(&chunk[remaining..]);
+            remaining = 0;
+        }
+        (out, self.bytes)
+    }
+
+    fn is_char_boundary(&self, index: usize) -> bool {
+        if index == 0 || index == self.bytes {
+            return true;
+        }
+        let mut offset = 0;
+        for chunk in &self.chunks {
+            let next = offset + chunk.len();
+            if index < next {
+                return chunk.is_char_boundary(index - offset);
+            }
+            if index == next {
+                return true;
+            }
+            offset = next;
+        }
+        false
+    }
+
     fn revision(&self) -> u64 {
         self.revision
     }
@@ -916,6 +963,35 @@ mod tests {
         buffer.push("def");
 
         assert_eq!(buffer.text(), "bcdef");
+    }
+
+    #[test]
+    fn ring_buffer_reads_delta_without_joining_full_output() {
+        let mut buffer = RingTextBuffer::new(16);
+        buffer.push("abc");
+        let start = buffer.text().len();
+        buffer.push("甲乙");
+
+        let (delta, next_len) = buffer.text_delta_from(start);
+
+        assert_eq!(delta, "甲乙");
+        assert_eq!(next_len, buffer.text().len());
+        assert_eq!(buffer.text_delta_from(next_len), (String::new(), next_len));
+    }
+
+    #[test]
+    fn ring_buffer_delta_falls_back_after_truncation_or_split_utf8() {
+        let mut buffer = RingTextBuffer::new(8);
+        buffer.push("abc");
+        let old_start = buffer.text().len();
+        buffer.push("甲乙丙丁");
+
+        let current = buffer.text();
+        assert_eq!(
+            buffer.text_delta_from(old_start),
+            (current.clone(), current.len())
+        );
+        assert_eq!(buffer.text_delta_from(3), (current.clone(), current.len()));
     }
 
     #[test]

@@ -512,6 +512,13 @@ impl RuntimeCore {
             .unwrap_or_default()
     }
 
+    pub fn terminal_output_delta_from(&self, start: usize) -> (String, usize) {
+        self.agent
+            .as_ref()
+            .map(|agent| agent.terminal_output_delta_from(start))
+            .unwrap_or_default()
+    }
+
     pub fn terminal_output_revision(&self) -> u64 {
         self.agent
             .as_ref()
