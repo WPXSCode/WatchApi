@@ -11421,6 +11421,7 @@ fn terminal_keyboard_actions_for_events(
     ime_preediting: &mut bool,
 ) -> Vec<TerminalInputAction> {
     let mut actions = Vec::new();
+    let mut last_ime_commit_text: Option<&str> = None;
     for event in events {
         match event {
             egui::Event::Ime(egui::ImeEvent::Preedit(text)) => {
@@ -11432,11 +11433,13 @@ fn terminal_keyboard_actions_for_events(
                 *ime_preediting = false;
                 if !text.is_empty() && text != "\n" && text != "\r" {
                     actions.push(TerminalInputAction::Write(text.clone()));
+                    last_ime_commit_text = Some(text.as_str());
                 }
             }
             egui::Event::Ime(egui::ImeEvent::Disabled) => {
                 *ime_preediting = false;
             }
+            egui::Event::Text(text) if Some(text.as_str()) == last_ime_commit_text => {}
             egui::Event::Key {
                 key: Key::Enter,
                 pressed: true,
@@ -18648,6 +18651,23 @@ mod tests {
         );
 
         assert_eq!(actions, vec![TerminalInputAction::Write("中".to_string())]);
+        assert!(!preediting);
+    }
+
+    #[test]
+    fn terminal_keyboard_ime_commit_deduplicates_following_text_event() {
+        let mut preediting = true;
+        let events = vec![
+            egui::Event::Ime(egui::ImeEvent::Commit("一一aw我".to_string())),
+            egui::Event::Text("一一aw我".to_string()),
+        ];
+
+        let actions = terminal_keyboard_actions_for_events(&events, 24, None, &mut preediting);
+
+        assert_eq!(
+            actions,
+            vec![TerminalInputAction::Write("一一aw我".to_string())]
+        );
         assert!(!preediting);
     }
 
