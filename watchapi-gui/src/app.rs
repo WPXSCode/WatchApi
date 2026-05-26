@@ -29,7 +29,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -134,6 +134,13 @@ pub struct WatchApiApp {
     config_sidebar_width: f32,
     runtime_started_at: Option<Instant>,
     last_background_terminal_refresh_at: Instant,
+    control_state_cache: Mutex<HashMap<String, CachedControlState>>,
+    control_state_cache_enabled: AtomicBool,
+}
+
+#[derive(Debug, Clone)]
+struct CachedControlState {
+    value: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -1031,6 +1038,8 @@ impl WatchApiApp {
             config_sidebar_width: CONFIG_SIDEBAR_DEFAULT_WIDTH,
             runtime_started_at: None,
             last_background_terminal_refresh_at: Instant::now(),
+            control_state_cache: Mutex::new(HashMap::new()),
+            control_state_cache_enabled: AtomicBool::new(false),
         };
         if !app.config_path.is_empty() {
             app.load_config();
@@ -1049,6 +1058,7 @@ impl Default for WatchApiApp {
 impl eframe::App for WatchApiApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let _ = frame;
+        self.begin_control_state_frame_cache();
         self.handle_window_lifecycle(ctx);
         self.poll_session_candidate_result();
         self.flush_terminal_log_buffer_if_due();
@@ -1149,6 +1159,7 @@ impl eframe::App for WatchApiApp {
         self.render_close_dialog(ctx);
         let repaint_interval_ms = self.repaint_interval_ms();
         ctx.request_repaint_after(Duration::from_millis(repaint_interval_ms));
+        self.end_control_state_frame_cache();
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -6873,7 +6884,7 @@ impl WatchApiApp {
         if let Some(path) = self.config_path_path() {
             let auto_paused = startup_auto_paused(&path, reset_restart_attempts, &self.registry);
             if let Err(err) =
-                update_control_state(&path, &startup_control_state_updates(auto_paused))
+                self.update_control_state_cached(&path, &startup_control_state_updates(auto_paused))
             {
                 self.runtime = None;
                 self.runtime_event_rx = None;
@@ -7291,13 +7302,17 @@ impl WatchApiApp {
     }
 
     fn repaint_interval_ms(&self) -> u64 {
+        let recent_terminal_activity = self
+            .terminal_cache_changed_at
+            .is_some_and(|at| at.elapsed() <= RECENT_TERMINAL_ACTIVITY_WINDOW);
         if self.terminal_focused {
-            return ACTIVE_TERMINAL_REPAINT_INTERVAL_MS;
+            return if recent_terminal_activity {
+                ACTIVE_TERMINAL_REPAINT_INTERVAL_MS
+            } else {
+                QUIET_RUNNING_REPAINT_INTERVAL_MS
+            };
         }
         if self.running {
-            let recent_terminal_activity = self
-                .terminal_cache_changed_at
-                .is_some_and(|at| at.elapsed() <= RECENT_TERMINAL_ACTIVITY_WINDOW);
             return if self.terminal_running && recent_terminal_activity {
                 ACTIVE_TERMINAL_REPAINT_INTERVAL_MS
             } else {
@@ -8661,7 +8676,9 @@ impl WatchApiApp {
         let last_rows = fresh_runtime.rows();
         let runtime = Arc::new(Mutex::new(fresh_runtime));
         let auto_paused = startup_auto_paused(path, reset_restart_attempts, &self.registry);
-        if let Err(err) = update_control_state(path, &startup_control_state_updates(auto_paused)) {
+        if let Err(err) =
+            self.update_control_state_cached(path, &startup_control_state_updates(auto_paused))
+        {
             if let Some(session) = self.sessions.get_mut(key) {
                 session.status = format!("启动前更新控制状态失败：{err}");
                 session.last_start_error = Some(session.status.clone());
@@ -8906,7 +8923,7 @@ impl WatchApiApp {
             == Some(key.as_str())
         {
             return if self.terminal_running {
-                running_session_status_label(path, &self.status)
+                self.running_session_status_label(path, &self.status)
             } else if self.running {
                 "启动中".to_string()
             } else if self.status.contains("异常") || self.status.contains("失败") {
@@ -8919,7 +8936,10 @@ impl WatchApiApp {
             .get(&key)
             .map(|session| {
                 if session.terminal_running {
-                    return running_session_status_label(Path::new(&session.config_path), &session.status);
+                    return self.running_session_status_label(
+                        Path::new(&session.config_path),
+                        &session.status,
+                    );
                 } else if session.running {
                     "启动中"
                 } else if session.status.contains("异常") || session.status.contains("失败") {
@@ -8930,6 +8950,25 @@ impl WatchApiApp {
                 .to_string()
             })
             .unwrap_or_else(|| "已停止".to_string())
+    }
+
+    fn running_session_status_label(&self, path: &Path, status: &str) -> String {
+        if status.contains("异常") || status.contains("失败") {
+            return "异常".to_string();
+        }
+        let state = self.cached_control_state(path);
+        let auto_paused = auto_paused_from_control_state(Some(&state)).unwrap_or(false);
+        let completion_pause_detected = completion_pause_detected_from_control_state(Some(&state));
+        let goal_enabled = goal_enabled_from_control_state(Some(&state)).unwrap_or(false);
+        if auto_paused && completion_pause_detected {
+            "完成暂停".to_string()
+        } else if auto_paused {
+            "暂停中".to_string()
+        } else if goal_enabled {
+            "Goal中".to_string()
+        } else {
+            "运行中".to_string()
+        }
     }
 
     fn running_session_count(&self) -> usize {
@@ -9154,7 +9193,53 @@ impl WatchApiApp {
 
     fn current_control_state(&self) -> Option<Value> {
         self.config_path_path()
-            .map(|path| read_control_state(&path))
+            .map(|path| self.cached_control_state(&path))
+    }
+
+    fn begin_control_state_frame_cache(&self) {
+        self.control_state_cache.lock().clear();
+        self.control_state_cache_enabled
+            .store(true, Ordering::Relaxed);
+    }
+
+    fn end_control_state_frame_cache(&self) {
+        self.control_state_cache_enabled
+            .store(false, Ordering::Relaxed);
+        self.control_state_cache.lock().clear();
+    }
+
+    fn cached_control_state(&self, path: &Path) -> Value {
+        if !self.control_state_cache_enabled.load(Ordering::Relaxed) {
+            return read_control_state(path);
+        }
+        let key = session_key_for_path(path);
+        if let Some(cached) = self.control_state_cache.lock().get(&key).cloned() {
+            return cached.value;
+        }
+        let value = read_control_state(path);
+        self.control_state_cache.lock().insert(
+            key,
+            CachedControlState {
+                value: value.clone(),
+            },
+        );
+        value
+    }
+
+    fn invalidate_control_state_cache(&self, path: &Path) {
+        self.control_state_cache
+            .lock()
+            .remove(&session_key_for_path(path));
+    }
+
+    fn update_control_state_cached(
+        &self,
+        path: &Path,
+        updates: &[(&str, Value)],
+    ) -> Result<Value, anyhow::Error> {
+        let updated = update_control_state(path, updates)?;
+        self.invalidate_control_state_cache(path);
+        Ok(updated)
     }
 
     fn pause_state_label(&self) -> String {
@@ -9350,7 +9435,9 @@ impl WatchApiApp {
         self.status = match (registry_save_error, session_binding_clear_result) {
             (Some(err), _) => format!("配置已移除，但保存配置列表失败：{err}"),
             (None, Err(err)) => format!("配置已移除，但清除绑定失败：{err}"),
-            (None, Ok(cleared)) if cleared > 0 => format!("配置已移除，并清除 {cleared} 个会话绑定"),
+            (None, Ok(cleared)) if cleared > 0 => {
+                format!("配置已移除，并清除 {cleared} 个会话绑定")
+            }
             (None, Ok(_)) => "配置已移除".to_string(),
         };
     }
@@ -9401,7 +9488,7 @@ impl WatchApiApp {
             self.status = "请先选择配置".to_string();
             return;
         };
-        match update_control_state(
+        match self.update_control_state_cached(
             &path,
             &[
                 ("auto_paused", json!(paused)),
@@ -9438,7 +9525,7 @@ impl WatchApiApp {
             ("goal_request", Value::Null),
             ("goal_completed", json!(false)),
         ];
-        match update_control_state(&path, &updates) {
+        match self.update_control_state_cached(&path, &updates) {
             Ok(_) => {
                 self.status = if enabled {
                     "Goal 模式已开启"
@@ -9456,7 +9543,9 @@ impl WatchApiApp {
             return;
         };
         let paused = !self.registry.is_autostart(path.clone());
-        if let Err(err) = update_control_state(&path, &startup_control_state_updates(paused)) {
+        if let Err(err) =
+            self.update_control_state_cached(&path, &startup_control_state_updates(paused))
+        {
             self.status = format!("更新启动暂停状态失败：{err}");
         }
     }
@@ -9504,12 +9593,8 @@ impl WatchApiApp {
         }
         let control_state = read_control_state(&path);
         let resume_goal = should_resume_goal(config, Some(&control_state));
-        let action = if resume_goal {
-            "resume"
-        } else {
-            "set"
-        };
-        match update_control_state(
+        let action = if resume_goal { "resume" } else { "set" };
+        match self.update_control_state_cached(
             &path,
             &[
                 (
@@ -9609,7 +9694,7 @@ impl WatchApiApp {
     }
 
     fn resume_auto_continuation_for_config(&mut self, path: &Path) -> bool {
-        match update_control_state(
+        match self.update_control_state_cached(
             path,
             &[
                 ("trigger_now", json!(true)),
@@ -10044,25 +10129,6 @@ fn auto_paused_from_control_state(state: Option<&Value>) -> Option<bool> {
 
 fn goal_enabled_from_control_state(state: Option<&Value>) -> Option<bool> {
     state.and_then(|state| state.get("goal_enabled").and_then(Value::as_bool))
-}
-
-fn running_session_status_label(path: &Path, status: &str) -> String {
-    if status.contains("异常") || status.contains("失败") {
-        return "异常".to_string();
-    }
-    let state = read_control_state(path);
-    let auto_paused = auto_paused_from_control_state(Some(&state)).unwrap_or(false);
-    let completion_pause_detected = completion_pause_detected_from_control_state(Some(&state));
-    let goal_enabled = goal_enabled_from_control_state(Some(&state)).unwrap_or(false);
-    if auto_paused && completion_pause_detected {
-        "完成暂停".to_string()
-    } else if auto_paused {
-        "暂停中".to_string()
-    } else if goal_enabled {
-        "Goal中".to_string()
-    } else {
-        "运行中".to_string()
-    }
 }
 
 fn should_resume_goal(config: &AppConfig, state: Option<&Value>) -> bool {
@@ -19302,6 +19368,24 @@ mod tests {
     }
 
     #[test]
+    fn focused_terminal_repaint_is_quiet_when_output_is_idle() {
+        let mut app = WatchApiApp::default();
+        app.terminal_focused = true;
+        app.running = true;
+        app.terminal_running = true;
+        app.terminal_cache_changed_at = None;
+
+        assert_eq!(app.repaint_interval_ms(), QUIET_RUNNING_REPAINT_INTERVAL_MS);
+
+        app.terminal_cache_changed_at = Some(Instant::now());
+
+        assert_eq!(
+            app.repaint_interval_ms(),
+            ACTIVE_TERMINAL_REPAINT_INTERVAL_MS
+        );
+    }
+
+    #[test]
     fn worker_reuses_tokio_runtime_between_probe_ticks() {
         let source = include_str!("app.rs");
         let worker_block = source
@@ -22691,6 +22775,7 @@ mod tests {
         app.config_path = path.to_string_lossy().into_owned();
         app.running = true;
         app.terminal_running = false;
+        app.status = "运行中".to_string();
 
         assert_eq!(app.session_status_for_path(&path), "启动中");
         assert!(!app.session_terminal_running(&path));
@@ -22725,6 +22810,7 @@ mod tests {
         app.config_path = path.to_string_lossy().into_owned();
         app.running = true;
         app.terminal_running = true;
+        app.status = "运行中".to_string();
 
         update_control_state(
             &path,
@@ -22758,6 +22844,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(app.session_status_for_path(&path), "Goal中");
+    }
+
+    #[test]
+    fn control_state_cache_is_frame_scoped_and_invalidated_on_write() {
+        let app = WatchApiApp::default();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        update_control_state(&path, &[("auto_paused", json!(true))]).unwrap();
+
+        app.begin_control_state_frame_cache();
+        assert_eq!(app.cached_control_state(&path)["auto_paused"], json!(true));
+        update_control_state(&path, &[("auto_paused", json!(false))]).unwrap();
+        assert_eq!(
+            app.cached_control_state(&path)["auto_paused"],
+            json!(true),
+            "同一帧内应复用缓存，避免配置树每行反复读控制文件"
+        );
+        app.end_control_state_frame_cache();
+        assert_eq!(
+            app.cached_control_state(&path)["auto_paused"],
+            json!(false),
+            "帧外读取不能复用旧缓存，避免运行时写入后 UI 长时间滞后"
+        );
+
+        app.begin_control_state_frame_cache();
+        let _ = app.cached_control_state(&path);
+        app.update_control_state_cached(&path, &[("auto_paused", json!(true))])
+            .unwrap();
+        assert_eq!(
+            app.cached_control_state(&path)["auto_paused"],
+            json!(true),
+            "本进程写控制状态后应立即清理帧缓存"
+        );
+        app.end_control_state_frame_cache();
     }
 
     #[test]
