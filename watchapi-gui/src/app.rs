@@ -11439,6 +11439,7 @@ fn terminal_keyboard_actions_for_events(
             egui::Event::Ime(egui::ImeEvent::Disabled) => {
                 *ime_preediting = false;
             }
+            egui::Event::Text(_) if *ime_preediting => {}
             egui::Event::Text(text) if Some(text.as_str()) == last_ime_commit_text => {}
             egui::Event::Key {
                 key: Key::Enter,
@@ -18667,6 +18668,24 @@ mod tests {
         assert_eq!(
             actions,
             vec![TerminalInputAction::Write("一一aw我".to_string())]
+        );
+        assert!(!preediting);
+    }
+
+    #[test]
+    fn terminal_keyboard_ime_preedit_suppresses_text_until_commit() {
+        let mut preediting = false;
+        let events = vec![
+            egui::Event::Ime(egui::ImeEvent::Preedit("ni".to_string())),
+            egui::Event::Text("，".to_string()),
+            egui::Event::Ime(egui::ImeEvent::Commit("，你".to_string())),
+        ];
+
+        let actions = terminal_keyboard_actions_for_events(&events, 24, None, &mut preediting);
+
+        assert_eq!(
+            actions,
+            vec![TerminalInputAction::Write("，你".to_string())]
         );
         assert!(!preediting);
     }
