@@ -643,6 +643,11 @@ impl AgentProcess {
                 return Some("已有排队消息");
             }
             if codex_working_prompt_visible(&self.observed_terminal_view_text) {
+                if self.config.agent_driver == AgentDriverKind::Codex
+                    && self.last_prompt_sent_at.is_none()
+                {
+                    return Some("等待 Codex 就绪");
+                }
                 return Some("检测到 Working");
             }
             return Some("终端忙碌");
@@ -2967,6 +2972,32 @@ mod tests {
         assert!(!agent.can_send_prompt());
     }
 
+    #[test]
+    fn pre_prompt_restore_working_reports_waiting_ready_not_working_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let mut agent = AgentProcess::new(
+            config(
+                workdir.clone(),
+                AgentDriver::Codex,
+                AgentCommand::Args(vec!["codex".to_string()]),
+                tmp.path().join("state.json"),
+                tmp.path().join(".codex"),
+            ),
+            endpoint(workdir),
+            false,
+        );
+        agent.awaiting_turn_completion = false;
+        agent.saw_ready_banner = true;
+        agent.last_prompt_sent_at = None;
+        agent.observed_terminal_view_text = "• Working (12s • esc to interrupt)\n\
+             ›"
+            .to_string();
+
+        assert!(!agent.can_send_prompt());
+        assert_eq!(agent.auto_input_block_reason(), Some("等待 Codex 就绪"));
+    }
     #[test]
     fn can_send_prompt_rejects_visible_working_without_completion_evidence() {
         let tmp = tempfile::tempdir().unwrap();

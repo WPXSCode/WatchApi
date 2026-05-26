@@ -256,6 +256,14 @@ struct SmartDeployment {
     key_label: String,
     quality_key: String,
     stats: SmartKeyStats,
+    last_request_egress: Option<SmartRequestEgress>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SmartRequestEgress {
+    node: Option<String>,
+    ip: Option<String>,
+    seen_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -523,6 +531,23 @@ impl ClashVergeController {
         }
     }
 
+    fn rotate_before_request(&self) {
+        if !self.config.enabled {
+            return;
+        }
+        let Some(group_name) = non_empty_trimmed(&self.config.group_name) else {
+            return;
+        };
+        let Some(controller_url) = non_empty_trimmed(&self.config.controller_url) else {
+            return;
+        };
+        if self.switch_group(group_name, controller_url).is_ok() {
+            if let Ok(mut last_switch_at) = self.last_switch_at.lock() {
+                *last_switch_at = Some(Instant::now());
+            }
+        }
+    }
+
     fn switch_group(&self, group_name: &str, controller_url: &str) -> Result<()> {
         let group = url_encode_component(group_name);
         let url = format!("{}/proxies/{}", controller_url.trim_end_matches('/'), group);
@@ -553,6 +578,7 @@ impl ClashVergeController {
             return Err(anyhow!("clash switch failed: {}", response.status()));
         }
         self.remember_group_node(group_name, next);
+        self.clear_node_egress_cache(next);
         Ok(())
     }
 
@@ -692,6 +718,36 @@ impl ClashVergeController {
             cache.insert(cache_key, (ip.clone(), Instant::now()));
         }
         Some(ip)
+    }
+
+    fn clear_node_egress_cache(&self, node: &str) {
+        let Some(node) = non_empty_trimmed(node) else {
+            return;
+        };
+        let Some(proxy_url) = non_empty_trimmed(&self.config.proxy_url) else {
+            return;
+        };
+        let cache_key = format!("{proxy_url}\n{node}");
+        if let Ok(mut cache) = self.egress_ip_cache.lock() {
+            cache.remove(&cache_key);
+        }
+    }
+
+    fn current_request_egress(&self) -> Option<SmartRequestEgress> {
+        let node = self.latest_group_node();
+        let ip = if let Some(node) = node.as_deref() {
+            self.latest_group_node_egress_ip(node)
+        } else {
+            non_empty_trimmed(&self.config.proxy_url).and_then(lookup_proxy_egress_ip)
+        };
+        if node.is_none() && ip.is_none() {
+            return None;
+        }
+        Some(SmartRequestEgress {
+            node,
+            ip,
+            seen_at: Instant::now(),
+        })
     }
 }
 
@@ -1551,6 +1607,7 @@ fn build_smart_deployments(proxy: &ProxyConfig, base_dir: &Path) -> Result<Vec<S
                         ),
                         key: record.key,
                         stats: SmartKeyStats::default(),
+                        last_request_egress: None,
                     });
                 }
             }
@@ -1637,6 +1694,7 @@ fn handle_smart_proxy_client(
                 return write_sse_error_event(stream, &detail);
             };
             mark_upstream_request_started(&upstreams, &deployment.base_url);
+            record_deployment_request_egress(&deployments, clash_verge.as_deref(), index);
             let forwarded_body = request_body.rewrite_model(&deployment.actual_model);
             let started_at = Instant::now();
             let result = forward_smart_stream_request(
@@ -1732,6 +1790,7 @@ fn handle_smart_proxy_client(
             );
         };
         mark_upstream_request_started(&upstreams, &deployment.base_url);
+        record_deployment_request_egress(&deployments, clash_verge.as_deref(), index);
         let forwarded_body = request_body.rewrite_model(&deployment.actual_model);
         let started_at = Instant::now();
         let response = forward_smart_request(
@@ -2119,6 +2178,25 @@ fn mark_upstream_request_finished(
     }
 }
 
+fn record_deployment_request_egress(
+    deployments: &Arc<Mutex<Vec<SmartDeployment>>>,
+    clash_verge: Option<&ClashVergeController>,
+    index: usize,
+) {
+    let Some(controller) = clash_verge else {
+        return;
+    };
+    controller.rotate_before_request();
+    let Some(egress) = controller.current_request_egress() else {
+        return;
+    };
+    if let Ok(mut items) = deployments.lock() {
+        if let Some(item) = items.get_mut(index) {
+            item.last_request_egress = Some(egress);
+        }
+    }
+}
+
 fn forward_smart_request(
     client: &Client,
     raw_request: &[u8],
@@ -2408,16 +2486,10 @@ fn clear_upstream_cooldown(
 fn snapshot_from_deployments(
     deployments: &Arc<Mutex<Vec<SmartDeployment>>>,
     upstreams: &Arc<Mutex<HashMap<String, SmartUpstreamRuntime>>>,
-    clash_verge: Option<&Arc<ClashVergeController>>,
+    _clash_verge: Option<&Arc<ClashVergeController>>,
 ) -> SmartProxySnapshot {
     let now = Instant::now();
     let upstream_state = upstreams.lock().ok();
-    let recent_clash_node = clash_verge
-        .and_then(|controller| controller.latest_group_node())
-        .unwrap_or_default();
-    let recent_clash_egress_ip = clash_verge
-        .and_then(|controller| controller.latest_group_node_egress_ip(&recent_clash_node))
-        .unwrap_or_default();
     let rows = deployments
         .lock()
         .map(|items| {
@@ -2436,13 +2508,23 @@ fn snapshot_from_deployments(
                         .cooldown_until
                         .map(|until| until.saturating_duration_since(now).as_secs())
                         .unwrap_or(0);
+                    let row_egress = item.last_request_egress.clone().filter(|egress| {
+                        now.duration_since(egress.seen_at) < Duration::from_secs(24 * 60 * 60)
+                    });
+                    let row_clash_node = row_egress
+                        .as_ref()
+                        .and_then(|egress| egress.node.clone())
+                        .unwrap_or_default();
+                    let row_clash_egress_ip = row_egress
+                        .and_then(|egress| egress.ip)
+                        .unwrap_or_default();
                     SmartProxyKeyRow {
                         upstream: item.upstream.clone(),
                         base_url: item.base_url.clone(),
                         key_label: item.key_label.clone(),
                         egress_note: item.egress_note.clone(),
-                        recent_clash_node: recent_clash_node.clone(),
-                        recent_clash_egress_ip: recent_clash_egress_ip.clone(),
+                        recent_clash_node: row_clash_node,
+                        recent_clash_egress_ip: row_clash_egress_ip,
                         score: item.stats.score,
                         total_requests: item.stats.total_requests,
                         success_requests: item.stats.success_requests,
@@ -3323,6 +3405,51 @@ mod tests {
     }
 
     #[test]
+    fn smart_proxy_snapshot_uses_per_key_request_egress() {
+        let deployments = Arc::new(Mutex::new(vec![
+            smart_test_deployment("dc", "https://same.example/v1", "sk-first"),
+            smart_test_deployment("dc", "https://same.example/v1", "sk-second"),
+        ]));
+        let upstreams = smart_test_upstreams(&deployments);
+        {
+            let mut items = deployments.lock().unwrap();
+            items[0].last_request_egress = Some(SmartRequestEgress {
+                node: Some("node-a".to_string()),
+                ip: Some("203.0.113.21".to_string()),
+                seen_at: Instant::now(),
+            });
+            items[1].last_request_egress = Some(SmartRequestEgress {
+                node: Some("node-b".to_string()),
+                ip: Some("203.0.113.22".to_string()),
+                seen_at: Instant::now(),
+            });
+        }
+
+        let snapshot = snapshot_from_deployments(&deployments, &upstreams, None);
+
+        assert_eq!(snapshot.rows[0].recent_clash_node, "node-a");
+        assert_eq!(snapshot.rows[0].recent_clash_egress_ip, "203.0.113.21");
+        assert_eq!(snapshot.rows[1].recent_clash_node, "node-b");
+        assert_eq!(snapshot.rows[1].recent_clash_egress_ip, "203.0.113.22");
+    }
+
+    #[test]
+    fn smart_proxy_records_egress_after_rotating_clash_node() {
+        let source = include_str!("litellm_proxy.rs");
+        let record_block = source
+            .split("fn record_deployment_request_egress")
+            .nth(1)
+            .and_then(|tail| tail.split("fn forward_smart_request").next())
+            .expect("request egress recorder should be discoverable");
+
+        assert!(record_block.contains("controller.rotate_before_request();"));
+        assert!(
+            record_block.find("controller.rotate_before_request();")
+                < record_block.find("controller.current_request_egress()")
+        );
+    }
+
+    #[test]
     fn proxy_egress_ip_lookup_uses_configured_clash_proxy() {
         let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = proxy.local_addr().unwrap().port();
@@ -3361,6 +3488,7 @@ mod tests {
             key_label: mask_key(key),
             quality_key: key_quality_key(base_url, key, "gpt-5.5"),
             stats: SmartKeyStats::default(),
+            last_request_egress: None,
         }
     }
 

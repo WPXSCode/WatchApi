@@ -128,6 +128,7 @@ pub struct WatchApiApp {
     terminal_render_cache: TerminalRenderCache,
     terminal_fallback_cache: TerminalFallbackCache,
     terminal_focused: bool,
+    terminal_ime_preediting: bool,
     terminal_manual_input_capture: TerminalManualInputCapture,
     exit_cleanup_rx: Option<Receiver<()>>,
     config_sidebar_width: f32,
@@ -1024,6 +1025,7 @@ impl WatchApiApp {
             terminal_render_cache: TerminalRenderCache::default(),
             terminal_fallback_cache: TerminalFallbackCache::default(),
             terminal_focused: false,
+            terminal_ime_preediting: false,
             terminal_manual_input_capture: TerminalManualInputCapture::default(),
             exit_cleanup_rx: None,
             config_sidebar_width: CONFIG_SIDEBAR_DEFAULT_WIDTH,
@@ -2736,6 +2738,9 @@ impl WatchApiApp {
             if !self.running && auto_running {
                 self.start_runtime();
                 if self.running {
+                    if goal_enabled_from_control_state(control_state).unwrap_or(false) {
+                        self.request_current_goal();
+                    }
                     self.trigger_auto_prompt_now();
                     let _ = self.send_runtime_command(
                         RuntimeCommand::ConfirmCurrentProbe,
@@ -2743,6 +2748,9 @@ impl WatchApiApp {
                     );
                 }
             } else if auto_running {
+                if goal_enabled_from_control_state(control_state).unwrap_or(false) {
+                    self.request_current_goal();
+                }
                 self.trigger_auto_prompt_now();
                 let _ = self.send_runtime_command(
                     RuntimeCommand::ConfirmCurrentProbe,
@@ -6296,6 +6304,7 @@ impl WatchApiApp {
         if !focused {
             self.terminal_pending_size_cells = None;
             self.terminal_pending_size_since = None;
+            self.terminal_ime_preediting = false;
         }
         if let Some(sequence) = self
             .terminal_view
@@ -6363,11 +6372,12 @@ impl WatchApiApp {
             .map_or(10, |view| view.rows.saturating_sub(1).max(1) as i32);
         let modes = self.terminal_view.as_ref().map(|view| view.modes);
         let actions = ctx.input(|input| {
-            input
-                .events
-                .iter()
-                .filter_map(|event| terminal_keyboard_action_for_event(event, page_lines, modes))
-                .collect::<Vec<_>>()
+            terminal_keyboard_actions_for_events(
+                &input.events,
+                page_lines,
+                modes,
+                &mut self.terminal_ime_preediting,
+            )
         });
         self.apply_terminal_input_actions(ctx, actions);
     }
@@ -7173,6 +7183,7 @@ impl WatchApiApp {
         self.terminal_render_cache = TerminalRenderCache::default();
         self.terminal_fallback_cache = TerminalFallbackCache::default();
         self.terminal_focused = false;
+        self.terminal_ime_preediting = false;
         self.terminal_manual_input_capture = TerminalManualInputCapture::default();
         self.logged_output_len = 0;
         self.pending_log_text.clear();
@@ -8824,6 +8835,7 @@ impl WatchApiApp {
         self.terminal_render_cache = TerminalRenderCache::default();
         self.terminal_fallback_cache = TerminalFallbackCache::default();
         self.terminal_focused = false;
+        self.terminal_ime_preediting = false;
         self.terminal_manual_input_capture = TerminalManualInputCapture::default();
         self.logged_output_len = 0;
         self.pending_log_text.clear();
@@ -9491,8 +9503,8 @@ impl WatchApiApp {
             return;
         }
         let control_state = read_control_state(&path);
-        let resume_imported_goal = should_resume_imported_goal(config, Some(&control_state));
-        let action = if resume_imported_goal {
+        let resume_goal = should_resume_goal(config, Some(&control_state));
+        let action = if resume_goal {
             "resume"
         } else {
             "set"
@@ -9516,7 +9528,7 @@ impl WatchApiApp {
             ],
         ) {
             Ok(_) => {
-                self.status = if resume_imported_goal {
+                self.status = if resume_goal {
                     "Goal 恢复已排队，等待 Agent 空闲后执行 /goal resume".to_string()
                 } else {
                     "Goal 已排队，等待 Agent 空闲后设置".to_string()
@@ -10053,11 +10065,16 @@ fn running_session_status_label(path: &Path, status: &str) -> String {
     }
 }
 
-fn should_resume_imported_goal(config: &AppConfig, state: Option<&Value>) -> bool {
+fn should_resume_goal(config: &AppConfig, state: Option<&Value>) -> bool {
+    if completed_imported_goal_matches(config, state) {
+        return false;
+    }
+    if synced_goal_matches_current(config, state) {
+        return true;
+    }
     config.agent_goal.source == "session_import"
         && !config.agent_goal.source_goal_signature.trim().is_empty()
         && config.agent_goal.last_user_edit_revision < config.agent_goal.revision
-        && !completed_imported_goal_matches(config, state)
 }
 
 fn completed_imported_goal_matches(config: &AppConfig, state: Option<&Value>) -> bool {
@@ -10085,6 +10102,35 @@ fn completed_imported_goal_matches(config: &AppConfig, state: Option<&Value>) ->
         .trim();
     !completed_signature.is_empty()
         && completed_signature == config.agent_goal.source_goal_signature.trim()
+}
+
+fn synced_goal_matches_current(config: &AppConfig, state: Option<&Value>) -> bool {
+    let Some(state) = state else {
+        return false;
+    };
+    let synced_revision = state
+        .get("goal_synced_revision")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if config.agent_goal.revision != 0 && synced_revision == config.agent_goal.revision {
+        return true;
+    }
+    let synced_signature = state
+        .get("goal_synced_source_goal_signature")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if !synced_signature.is_empty()
+        && synced_signature == config.agent_goal.source_goal_signature.trim()
+    {
+        return true;
+    }
+    let synced_text = state
+        .get("goal_synced_text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    !synced_text.is_empty() && synced_text == config.agent_goal.text.trim()
 }
 
 fn completion_pause_detected_from_control_state(state: Option<&Value>) -> bool {
@@ -11247,6 +11293,45 @@ fn terminal_clipboard_action(event: &egui::Event) -> Option<TerminalClipboardAct
         } => Some(TerminalClipboardAction::RequestPaste),
         _ => None,
     }
+}
+
+fn terminal_keyboard_actions_for_events(
+    events: &[egui::Event],
+    page_lines: i32,
+    modes: Option<TerminalModeView>,
+    ime_preediting: &mut bool,
+) -> Vec<TerminalInputAction> {
+    let mut actions = Vec::new();
+    for event in events {
+        match event {
+            egui::Event::Ime(egui::ImeEvent::Preedit(text)) => {
+                if text != "\n" && text != "\r" {
+                    *ime_preediting = !text.is_empty();
+                }
+            }
+            egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
+                *ime_preediting = false;
+                if !text.is_empty() && text != "\n" && text != "\r" {
+                    actions.push(TerminalInputAction::Write(text.clone()));
+                }
+            }
+            egui::Event::Ime(egui::ImeEvent::Disabled) => {
+                *ime_preediting = false;
+            }
+            egui::Event::Key {
+                key: Key::Enter,
+                pressed: true,
+                modifiers,
+                ..
+            } if *ime_preediting && terminal_normalized_modifiers(*modifiers).is_none() => {}
+            _ => {
+                if let Some(action) = terminal_keyboard_action_for_event(event, page_lines, modes) {
+                    actions.push(action);
+                }
+            }
+        }
+    }
+    actions
 }
 
 fn terminal_keyboard_action_for_event(
@@ -18418,6 +18503,56 @@ mod tests {
     }
 
     #[test]
+    fn terminal_keyboard_ime_preedit_suppresses_plain_enter_until_commit() {
+        let mut preediting = false;
+        let events = vec![
+            egui::Event::Ime(egui::ImeEvent::Preedit("zhong".to_string())),
+            egui::Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            },
+        ];
+
+        let actions = terminal_keyboard_actions_for_events(&events, 24, None, &mut preediting);
+
+        assert!(actions.is_empty());
+        assert!(preediting);
+
+        let actions = terminal_keyboard_actions_for_events(
+            &[egui::Event::Ime(egui::ImeEvent::Commit("中".to_string()))],
+            24,
+            None,
+            &mut preediting,
+        );
+
+        assert_eq!(actions, vec![TerminalInputAction::Write("中".to_string())]);
+        assert!(!preediting);
+    }
+
+    #[test]
+    fn terminal_keyboard_ime_preedit_does_not_block_modified_enter() {
+        let mut preediting = true;
+        let events = vec![egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        }];
+
+        let actions = terminal_keyboard_actions_for_events(&events, 24, None, &mut preediting);
+
+        assert_eq!(actions, vec![TerminalInputAction::WriteStatic("\n")]);
+        assert!(preediting);
+    }
+
+    #[test]
     fn terminal_manual_input_capture_submits_entered_text_to_history() {
         let mut capture = TerminalManualInputCapture::default();
 
@@ -19204,8 +19339,8 @@ mod tests {
         assert!(action_block.contains("self.set_goal_mode_enabled(goal_enabled);"));
         assert!(action_block.contains("RuntimeCommand::ConfirmCurrentProbe"));
         assert!(action_block.contains("self.start_runtime();"));
-        assert!(action_block
-            .contains("if self.running {\n                    self.trigger_auto_prompt_now();"));
+        assert!(action_block.contains("if self.running"));
+        assert!(action_block.contains("self.request_current_goal();"));
         assert!(
             action_block.find("self.trigger_auto_prompt_now();")
                 < action_block.find("RuntimeCommand::ConfirmCurrentProbe"),
@@ -20758,13 +20893,69 @@ mod tests {
         .unwrap();
         let config = AppConfig::load(&config_path).unwrap();
 
-        assert!(should_resume_imported_goal(&config, None));
-        assert!(!should_resume_imported_goal(
+        assert!(should_resume_goal(&config, None));
+        assert!(!should_resume_goal(
             &config,
             Some(&json!({
                 "goal_completed": true,
                 "goal_completed_revision": 4,
                 "goal_completed_source_goal_signature": "line:7:hash:abc"
+            }))
+        ));
+    }
+
+    #[test]
+    fn unfinished_synced_goal_uses_resume_even_after_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "workdir": "D:/Works/SelfWorks/WatchApi",
+                "initial_prompt": "init",
+                "auto_prompt": "auto",
+                "agent_command": ["codex", "--no-alt-screen"],
+                "endpoint_refs": [{ "provider": "high" }],
+                "providers": [{
+                    "name": "high",
+                    "base_url": "http://127.0.0.1:8787/v1",
+                    "api_key": "key",
+                    "model": "gpt-5.4",
+                    "reasoning_effort": "high",
+                    "weight": 100
+                }],
+                "continuation_mode": "goal",
+                "agent_goal": {
+                    "enabled": true,
+                    "text": "用户目标",
+                    "revision": 9,
+                    "last_user_edit_revision": 9,
+                    "source": "user_edit",
+                    "sync_on_resume": true
+                }
+            }"#,
+        )
+        .unwrap();
+        let config = AppConfig::load(&config_path).unwrap();
+
+        assert!(should_resume_goal(
+            &config,
+            Some(&json!({
+                "goal_enabled": true,
+                "auto_paused": false,
+                "goal_synced_revision": 9,
+                "goal_synced_text": "用户目标",
+                "goal_completed": false
+            }))
+        ));
+        assert!(!should_resume_goal(
+            &config,
+            Some(&json!({
+                "goal_enabled": true,
+                "auto_paused": false,
+                "goal_synced_revision": 8,
+                "goal_synced_text": "旧目标",
+                "goal_completed": false
             }))
         ));
     }
@@ -22512,6 +22703,19 @@ mod tests {
         assert_eq!(app.running_session_count(), 1);
     }
 
+    #[test]
+    fn config_list_running_waiting_input_status_is_not_error() {
+        let mut app = WatchApiApp::default();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        app.config_path = path.to_string_lossy().into_owned();
+        app.running = true;
+        app.terminal_running = true;
+        app.status = "等待可输入：检测到 Working".to_string();
+
+        assert_eq!(app.session_status_for_path(&path), "运行中");
+    }
     #[test]
     fn config_list_status_shows_paused_and_goal_running_modes() {
         let mut app = WatchApiApp::default();

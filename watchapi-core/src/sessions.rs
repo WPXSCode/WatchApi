@@ -996,13 +996,22 @@ fn codex_candidate_from_path(
     if !session_matches_context(workdir.as_deref(), &summary, context) {
         return None;
     }
-    let (score, reason) = rank_candidate(
+    let (mut score, mut reason) = rank_candidate(
         workdir.as_deref(),
         context,
         modified_at,
         &summary,
         owners.get(&session_id),
     );
+    if latest_codex_session_goal_record(&path).is_some() {
+        score += 900;
+        if reason.trim().is_empty() {
+            reason = "含历史 Goal".to_string();
+        } else if !reason.contains("含历史 Goal") {
+            reason.push('、');
+            reason.push_str("含历史 Goal");
+        }
+    }
     Some(SessionCandidate {
         session_id: session_id.clone(),
         path,
