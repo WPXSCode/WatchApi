@@ -6470,6 +6470,7 @@ impl WatchApiApp {
         };
         for prompt in prompts {
             self.save_terminal_manual_prompt_history(&prompt);
+            self.mark_terminal_manual_prompt_submitted();
         }
     }
 
@@ -6477,6 +6478,16 @@ impl WatchApiApp {
         self.registry.add_manual_prompt_history(prompt);
         if let Err(err) = self.registry.save() {
             self.status = format!("终端输入已发送，但保存历史失败：{err}");
+        }
+    }
+
+    fn mark_terminal_manual_prompt_submitted(&mut self) {
+        if self.terminal_running {
+            self.status = "运行中".to_string();
+        }
+        if let Some(path) = self.config_path_path() {
+            let _ = self
+                .update_control_state_cached(&path, &[("completion_pause_detected", json!(false))]);
         }
     }
 
@@ -8977,7 +8988,13 @@ impl WatchApiApp {
         let auto_paused = auto_paused_from_control_state(Some(&state)).unwrap_or(false);
         let completion_pause_detected = completion_pause_detected_from_control_state(Some(&state));
         let goal_enabled = goal_enabled_from_control_state(Some(&state)).unwrap_or(false);
-        if auto_paused && completion_pause_detected {
+        if running_status_label_is_active(status) {
+            if goal_enabled {
+                "Goal中".to_string()
+            } else {
+                "运行中".to_string()
+            }
+        } else if auto_paused && completion_pause_detected {
             "完成暂停".to_string()
         } else if auto_paused {
             "暂停中".to_string()
@@ -10152,6 +10169,11 @@ fn runtime_primary_icon(running: bool, auto_paused: bool) -> ToolButtonIcon {
     } else {
         ToolButtonIcon::Pause
     }
+}
+
+fn running_status_label_is_active(status: &str) -> bool {
+    let status = status.trim();
+    status == "运行中" || status.starts_with("正在")
 }
 
 fn auto_paused_from_control_state(state: Option<&Value>) -> Option<bool> {
@@ -18666,6 +18688,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut app = WatchApiApp::new(None);
         app.registry = GuiConfigRegistry::new(temp.path().join(".watchapi-gui.json"));
+        let config_path = temp.path().join("config.json");
+        std::fs::write(&config_path, "{}").unwrap();
+        update_control_state(&config_path, &[("completion_pause_detected", json!(true))]).unwrap();
+        app.config_path = config_path.to_string_lossy().into_owned();
+        app.terminal_running = true;
+        app.status = "暂停中".to_string();
 
         app.capture_terminal_manual_input_action(&TerminalInputAction::Write(
             "终端里手动输入".to_string(),
@@ -18678,6 +18706,10 @@ mod tests {
         );
         let saved = std::fs::read_to_string(&app.registry.state_path).unwrap();
         assert!(saved.contains("终端里手动输入"));
+        assert_eq!(app.status, "运行中");
+        assert!(!completion_pause_detected_from_control_state(Some(
+            &read_control_state(&config_path)
+        )));
     }
 
     #[test]
@@ -22864,7 +22896,7 @@ mod tests {
         app.config_path = path.to_string_lossy().into_owned();
         app.running = true;
         app.terminal_running = true;
-        app.status = "运行中".to_string();
+        app.status = "空闲".to_string();
 
         update_control_state(
             &path,
@@ -22897,6 +22929,33 @@ mod tests {
             ],
         )
         .unwrap();
+        app.status = "运行中".to_string();
+        assert_eq!(app.session_status_for_path(&path), "Goal中");
+    }
+
+    #[test]
+    fn config_list_status_prefers_manual_terminal_activity_over_paused_mode() {
+        let mut app = WatchApiApp::default();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        app.config_path = path.to_string_lossy().into_owned();
+        app.running = true;
+        app.terminal_running = true;
+        app.status = "运行中".to_string();
+
+        update_control_state(
+            &path,
+            &[
+                ("auto_paused", json!(true)),
+                ("completion_pause_detected", json!(false)),
+                ("goal_enabled", json!(false)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(app.session_status_for_path(&path), "运行中");
+
+        update_control_state(&path, &[("goal_enabled", json!(true))]).unwrap();
         assert_eq!(app.session_status_for_path(&path), "Goal中");
     }
 
