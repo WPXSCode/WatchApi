@@ -7794,6 +7794,7 @@ impl WatchApiApp {
         self.terminal_render_cache = TerminalRenderCache::default();
         self.terminal_fallback_cache = TerminalFallbackCache::default();
         self.terminal_focused = false;
+        self.terminal_cache_changed_at = None;
         self.logged_output_len = 0;
         self.pending_log_text.clear();
         self.last_log_flush_at = Instant::now();
@@ -9837,6 +9838,7 @@ impl WatchApiApp {
         self.terminal_render_cache = TerminalRenderCache::default();
         self.terminal_fallback_cache = TerminalFallbackCache::default();
         self.terminal_focused = false;
+        self.terminal_cache_changed_at = None;
         self.logged_output_len = 0;
         self.pending_log_text.clear();
         self.last_log_flush_at = Instant::now();
@@ -16937,6 +16939,7 @@ fn default_guard_proxy_json() -> Value {
         "redact_email": false,
         "redact_url": false,
         "redact_group_number": false,
+        "request_rewrite_enabled": true,
         "response_rewrite_enabled": true,
         "invalid_encrypted_content_retry_enabled": true,
         "pollution_threshold": 0.35,
@@ -17633,6 +17636,7 @@ fn render_guard_proxy_fields(
         for (key, label) in [
             ("enabled", enabled_label),
             ("audit_enabled", "响应审计"),
+            ("request_rewrite_enabled", "改写请求"),
             ("response_rewrite_enabled", "改写成功响应"),
             ("invalid_encrypted_content_retry_enabled", "修复加密内容"),
             ("replace_direct_pollution_detection", "替代直接污染判断"),
@@ -17899,11 +17903,14 @@ fn guard_field_hint(key: &str) -> &'static str {
         "replace_direct_pollution_detection" => {
             "开启表示保护层替代全局直接污染判断，避免同一响应被二次判断；关闭后全局污染词判断继续作为兜底。"
         }
+        "request_rewrite_enabled" => {
+            "请求改写总开关。开启时才会按下面的 temperature、max_tokens、降级模型、防注入前缀和系统提示词追加改写上游请求；关闭后这些字段不生效，invalid_encrypted_content 修复仍由单独开关控制。"
+        }
         "response_rewrite_enabled" => {
             "成功响应改写开关。开启才允许删除过滤关键词、执行脱敏、把高风险响应替换成本地提示；关闭后成功响应原样透传。"
         }
         "invalid_encrypted_content_retry_enabled" => {
-            "请求修复开关。开启且上游明确返回 invalid_encrypted_content 时，才会删除请求里的 encrypted_content 后重试一次；关闭后不改请求。"
+            "请求修复开关。开启且上游明确返回 invalid_encrypted_content 时，才会删除请求里的 encrypted_content 后重试一次；关闭后不会为了该错误删除 encrypted_content，其他请求改写仍由“改写请求”控制。"
         }
         "log_filtered_response" => {
             "审计预览开关。开启后仅在响应确实被删除关键词、脱敏或本地替换时记录处理后文本预览，最多 300 字；默认关闭，不保存原始污染内容。"
@@ -17933,7 +17940,7 @@ fn guard_combo_option_hint(key: &str, value: &str) -> &'static str {
         ("mode", "filter_and_fail") => "当前模式 filter_and_fail：失败关键词命中立即记录污染失败；高风险连续到阈值也记录污染失败，并按改写开关决定替换响应或返回本地错误。",
         ("mode", "observe_then_fail") => "当前模式 observe_then_fail：前 N-1 次风险命中原样透传只计数；第 N 次返回本地错误/SSE error 并记录一次污染失败，N 是连续高危次数。",
         ("mode", "filter_only") => "当前模式 filter_only：只对成功响应做删除、脱敏或替换，不因为污染命中把接口判失败；关闭成功响应改写后基本只剩审计。",
-        ("mode", "observe") => "当前模式 observe：响应侧只记录审计，不过滤、不替换、不拦截；temperature、max_tokens、提示词等请求改写字段仍按配置生效。",
+        ("mode", "observe") => "当前模式 observe：响应侧只记录审计，不过滤、不替换、不拦截；请求改写总开关开启时，temperature、max_tokens、提示词等请求改写字段仍按配置生效。",
         _ => "",
     }
 }
@@ -23787,6 +23794,37 @@ mod tests {
     }
 
     #[test]
+    fn clearing_runtime_terminal_state_drops_recent_activity_repaint() {
+        let mut app = WatchApiApp::default();
+        app.main_page = MainPage::Watch;
+        app.running = false;
+        app.terminal_running = true;
+        app.terminal_surface_painted_this_frame = true;
+        app.terminal_cache_changed_at = Some(Instant::now());
+        app.terminal_view = Some(TerminalView {
+            revision: 1,
+            rows: 1,
+            cols: 2,
+            scrollback_lines: 0,
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_shape: TerminalCursorShape::Block,
+            display_offset: 0,
+            modes: Default::default(),
+            cells: vec![test_terminal_cell(' '), test_terminal_cell(' ')],
+        });
+
+        assert!(app.terminal_live_repaint_needed());
+
+        app.clear_runtime_terminal_state();
+
+        assert!(app.terminal_cache_changed_at.is_none());
+        assert!(!app.terminal_live_repaint_needed());
+        assert!(!app.terminal_repaint_ticker_active());
+        assert_eq!(app.repaint_interval_ms(), IDLE_REPAINT_INTERVAL_MS);
+    }
+
+    #[test]
     fn painted_terminal_surface_keeps_active_repaint_during_recent_terminal_activity() {
         let mut app = WatchApiApp::default();
         app.main_page = MainPage::Provider;
@@ -26503,6 +26541,7 @@ mod tests {
             "check_max_chars",
             "high_risk_failure_threshold",
             "replace_direct_pollution_detection",
+            "request_rewrite_enabled",
             "response_rewrite_enabled",
             "invalid_encrypted_content_retry_enabled",
             "audit_enabled",
@@ -27140,6 +27179,10 @@ mod tests {
             json!(true)
         );
         assert_eq!(
+            default_guard_proxy_json()["request_rewrite_enabled"],
+            json!(true)
+        );
+        assert_eq!(
             default_guard_proxy_json()["response_rewrite_enabled"],
             json!(true)
         );
@@ -27169,15 +27212,18 @@ mod tests {
         assert!(editor.contains("\"detection_mode\""));
         assert!(editor.contains("\"keywords_only\""));
         assert!(editor.contains("\"observe_then_fail\""));
+        assert!(editor.contains("\"request_rewrite_enabled\""));
         assert!(editor.contains("\"response_rewrite_enabled\""));
         assert!(editor.contains("\"invalid_encrypted_content_retry_enabled\""));
         assert!(source.contains("\"detection_mode\": \"hybrid\""));
         assert!(source.contains("只按配置的过滤关键词和失败关键词判断"));
         assert!(source.contains("前 N-1 次风险命中原样透传只计数"));
         assert!(source.contains("删除请求里的 encrypted_content 后重试一次"));
+        assert!(source.contains("其他请求改写仍由“改写请求”控制"));
         assert!(source.contains("只保存处理后响应的 300 字以内审计预览"));
         assert!(source.contains("污染失败、连续高危、高危替换仍保留为切换/冷却控制信号"));
-        assert!(source.contains("请求改写字段仍按配置生效"));
+        assert!(source.contains("请求改写总开关开启时"));
+        assert!(source.contains("关闭后这些字段不生效"));
         assert!(source.contains("总尝试约为 1 + 此值"));
         assert!(source.contains("最多 6 次总尝试"));
     }
@@ -29192,11 +29238,16 @@ mod tests {
         app.config_path = running_path.to_string_lossy().into_owned();
         app.status = "running".to_string();
         app.running = true;
+        app.terminal_running = true;
+        app.terminal_surface_painted_this_frame = true;
+        app.terminal_cache_changed_at = Some(Instant::now());
 
         app.clear_active_runtime_state_for_config_switch();
         app.config_path = other_path.to_string_lossy().into_owned();
 
         assert!(!app.session_running(&other_path));
+        assert!(app.terminal_cache_changed_at.is_none());
+        assert_eq!(app.repaint_interval_ms(), IDLE_REPAINT_INTERVAL_MS);
     }
 
     #[test]

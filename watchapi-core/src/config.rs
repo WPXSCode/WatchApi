@@ -167,6 +167,7 @@ pub struct GuardProxyConfig {
     pub redact_email: bool,
     pub redact_url: bool,
     pub redact_group_number: bool,
+    pub request_rewrite_enabled: bool,
     pub response_rewrite_enabled: bool,
     pub invalid_encrypted_content_retry_enabled: bool,
     pub pollution_threshold: f64,
@@ -308,6 +309,7 @@ struct RawGuardProxy {
     redact_email: Option<bool>,
     redact_url: Option<bool>,
     redact_group_number: Option<bool>,
+    request_rewrite_enabled: Option<bool>,
     response_rewrite_enabled: Option<bool>,
     invalid_encrypted_content_retry_enabled: Option<bool>,
     pollution_threshold: Option<f64>,
@@ -692,6 +694,7 @@ fn empty_raw_guard_proxy() -> RawGuardProxy {
         redact_email: None,
         redact_url: None,
         redact_group_number: None,
+        request_rewrite_enabled: None,
         response_rewrite_enabled: None,
         invalid_encrypted_content_retry_enabled: None,
         pollution_threshold: None,
@@ -749,6 +752,9 @@ fn apply_guard_proxy_override(
     config.redact_group_number = raw
         .redact_group_number
         .unwrap_or(config.redact_group_number);
+    config.request_rewrite_enabled = raw
+        .request_rewrite_enabled
+        .unwrap_or(config.request_rewrite_enabled);
     config.response_rewrite_enabled = raw
         .response_rewrite_enabled
         .unwrap_or(config.response_rewrite_enabled);
@@ -809,6 +815,7 @@ fn guard_rule_group_defaults(rule_group: GuardRuleGroup) -> GuardProxyConfig {
         redact_email: false,
         redact_url: false,
         redact_group_number: false,
+        request_rewrite_enabled: true,
         response_rewrite_enabled: true,
         invalid_encrypted_content_retry_enabled: true,
         pollution_threshold: 0.35,
@@ -1603,6 +1610,7 @@ mod tests {
                 "guard_proxy": {
                     "enabled": true,
                     "mode": "observe_then_fail",
+                    "request_rewrite_enabled": false,
                     "response_rewrite_enabled": false,
                     "invalid_encrypted_content_retry_enabled": false
                 }"#,
@@ -1612,6 +1620,7 @@ mod tests {
         let guard = &config.endpoints[0].guard_proxy;
 
         assert_eq!(guard.mode, GuardProxyMode::ObserveThenFail);
+        assert!(!guard.request_rewrite_enabled);
         assert!(!guard.response_rewrite_enabled);
         assert!(!guard.invalid_encrypted_content_retry_enabled);
     }

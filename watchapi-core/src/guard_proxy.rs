@@ -805,6 +805,13 @@ fn rewrite_request_value_with_options(
     fallback_model: Option<&str>,
     strip_encrypted_content: bool,
 ) -> Vec<u8> {
+    if !config.request_rewrite_enabled {
+        if strip_encrypted_content {
+            strip_encrypted_content_fields(value);
+            return serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec());
+        }
+        return body.to_vec();
+    }
     let is_responses_request = value.get("input").is_some() && value.get("messages").is_none();
     if !is_responses_request {
         if let Some(temperature) = config.temperature {
@@ -2537,6 +2544,7 @@ mod tests {
             redact_email: true,
             redact_url: true,
             redact_group_number: true,
+            request_rewrite_enabled: true,
             response_rewrite_enabled: true,
             invalid_encrypted_content_retry_enabled: true,
             pollution_threshold: 0.35,
@@ -2820,6 +2828,36 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("prefix"));
+    }
+
+    #[test]
+    fn disabled_request_rewrite_preserves_request_params_and_prompt() {
+        let body =
+            br#"{"model":"gpt-test","messages":[{"role":"user","content":"hi"}],"max_tokens":128}"#;
+        let mut config = config();
+        config.request_rewrite_enabled = false;
+
+        let out = rewrite_request_body(body, &config, Some("fallback-model"));
+
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn disabled_request_rewrite_still_allows_encrypted_content_retry_strip() {
+        let body = br#"{"model":"gpt-test","input":[{"type":"reasoning","encrypted_content":"bad-token"},{"role":"user","content":[{"type":"input_text","text":"hello"}]}],"max_output_tokens":128,"stream":true}"#;
+        let request_body = GuardRequestBody::parse(body);
+        let mut config = config();
+        config.request_rewrite_enabled = false;
+
+        let out = request_body.rewrite_with_options(&config, Some("fallback-model"), true);
+        let value: Value = serde_json::from_slice(&out).unwrap();
+
+        assert!(!String::from_utf8(out)
+            .unwrap()
+            .contains("encrypted_content"));
+        assert_eq!(value["model"], json!("gpt-test"));
+        assert_eq!(value["max_output_tokens"], json!(128));
+        assert_eq!(value["input"][1]["content"][0]["text"], json!("hello"));
     }
 
     #[test]
