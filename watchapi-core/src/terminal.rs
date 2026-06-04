@@ -1,4 +1,4 @@
-use crate::config::AgentCommand;
+use crate::config::{split_shell_like_command, AgentCommand};
 use crate::terminal_emulator::{TerminalEmulator, TerminalView};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use parking_lot::Mutex;
@@ -40,6 +40,8 @@ pub enum TerminalEvent {
     Exit(Option<String>),
 }
 
+pub type TerminalActivityWakeup = Arc<dyn Fn() + Send + Sync + 'static>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalSnapshot {
     pub output: String,
@@ -55,6 +57,7 @@ pub struct TerminalSession {
     user_input_active: Arc<Mutex<bool>>,
     last_activity_at: Arc<Mutex<Instant>>,
     last_output_at: Arc<Mutex<Instant>>,
+    activity_wakeup: Arc<Mutex<Option<TerminalActivityWakeup>>>,
     events: Receiver<TerminalEvent>,
     _event_tx: Sender<TerminalEvent>,
 }
@@ -68,6 +71,7 @@ pub struct TerminalControl {
     emulator: Arc<Mutex<TerminalEmulator>>,
     user_input_active: Arc<Mutex<bool>>,
     last_activity_at: Arc<Mutex<Instant>>,
+    activity_wakeup: Arc<Mutex<Option<TerminalActivityWakeup>>>,
 }
 
 impl std::fmt::Debug for TerminalControl {
@@ -95,6 +99,16 @@ enum TerminalBackend {
 }
 
 impl TerminalControl {
+    pub fn clear_local_view(&self) {
+        self.output.lock().clear();
+        self.emulator.lock().clear_screen_and_scrollback();
+        wake_terminal_activity(&self.activity_wakeup);
+    }
+
+    pub fn set_activity_wakeup(&self, wakeup: Option<TerminalActivityWakeup>) {
+        *self.activity_wakeup.lock() = wakeup;
+    }
+
     pub fn mark_user_input_active(&self, active: bool) {
         *self.user_input_active.lock() = active;
     }
@@ -113,6 +127,7 @@ impl TerminalControl {
                 .map_err(|err| TerminalError::Pty(err.to_string()))?;
         }
         *self.last_activity_at.lock() = Instant::now();
+        wake_terminal_activity(&self.activity_wakeup);
         Ok(())
     }
 
@@ -121,7 +136,6 @@ impl TerminalControl {
     }
 
     pub fn resize(&self, rows: u16, cols: u16) -> Result<(), TerminalError> {
-        self.emulator.lock().resize(rows as usize, cols as usize);
         self.master
             .lock()
             .resize(PtySize {
@@ -130,19 +144,34 @@ impl TerminalControl {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|err| TerminalError::Pty(err.to_string()))
+            .map_err(|err| TerminalError::Pty(err.to_string()))?;
+        self.emulator.lock().resize(rows as usize, cols as usize);
+        wake_terminal_activity(&self.activity_wakeup);
+        Ok(())
     }
 
     pub fn scroll_display(&self, delta: i32) {
         self.emulator.lock().scroll_display(delta);
+        wake_terminal_activity(&self.activity_wakeup);
     }
 
     pub fn scroll_bottom(&self) {
         self.emulator.lock().scroll_bottom();
+        wake_terminal_activity(&self.activity_wakeup);
     }
 
     pub fn scroll_to_offset(&self, offset: usize) {
         self.emulator.lock().scroll_to_offset(offset);
+        wake_terminal_activity(&self.activity_wakeup);
+    }
+
+    pub fn stop_process(&self) {
+        let mut guard = self.child.lock();
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        wake_terminal_activity(&self.activity_wakeup);
     }
 
     pub fn is_running(&self) -> bool {
@@ -261,6 +290,8 @@ impl TerminalSession {
         let last_activity_for_thread = Arc::clone(&last_activity_at);
         let last_output_at = Arc::new(Mutex::new(Instant::now()));
         let last_output_for_thread = Arc::clone(&last_output_at);
+        let activity_wakeup = Arc::new(Mutex::new(None));
+        let activity_wakeup_for_thread = Arc::clone(&activity_wakeup);
         let child = Arc::new(Mutex::new(Some(child)));
         let child_for_thread = Arc::clone(&child);
         let (event_tx, events) = unbounded();
@@ -273,6 +304,7 @@ impl TerminalSession {
                     Ok(0) => {
                         let status = child_exit_status_text(&child_for_thread);
                         let _ = event_tx_for_thread.send(TerminalEvent::Exit(status));
+                        wake_terminal_activity(&activity_wakeup_for_thread);
                         break;
                     }
                     Ok(count) => {
@@ -289,10 +321,12 @@ impl TerminalSession {
                             let _ = writer.flush();
                         }
                         let _ = event_tx_for_thread.send(TerminalEvent::Output(text));
+                        wake_terminal_activity(&activity_wakeup_for_thread);
                     }
                     Err(_) => {
                         let status = child_exit_status_text(&child_for_thread);
                         let _ = event_tx_for_thread.send(TerminalEvent::Exit(status));
+                        wake_terminal_activity(&activity_wakeup_for_thread);
                         break;
                     }
                 }
@@ -310,6 +344,7 @@ impl TerminalSession {
             user_input_active: Arc::new(Mutex::new(false)),
             last_activity_at,
             last_output_at,
+            activity_wakeup,
             events,
             _event_tx: event_tx,
         })
@@ -323,10 +358,21 @@ impl TerminalSession {
         *self.last_activity_at.lock() = Instant::now();
         *self.last_output_at.lock() = Instant::now();
         let _ = self._event_tx.send(TerminalEvent::Output(text.to_string()));
+        wake_terminal_activity(&self.activity_wakeup);
+    }
+
+    pub fn clear_local_view(&self) {
+        self.output.lock().clear();
+        self.emulator.lock().clear_screen_and_scrollback();
+        wake_terminal_activity(&self.activity_wakeup);
     }
 
     pub fn events(&self) -> Receiver<TerminalEvent> {
         self.events.clone()
+    }
+
+    pub fn set_activity_wakeup(&self, wakeup: Option<TerminalActivityWakeup>) {
+        *self.activity_wakeup.lock() = wakeup;
     }
 
     pub fn mark_user_input_active(&self, active: bool) {
@@ -349,11 +395,11 @@ impl TerminalSession {
             }
         }
         *self.last_activity_at.lock() = Instant::now();
+        wake_terminal_activity(&self.activity_wakeup);
         Ok(())
     }
 
     pub fn resize(&self, rows: u16, cols: u16) -> Result<(), TerminalError> {
-        self.emulator.lock().resize(rows as usize, cols as usize);
         match &self.backend {
             TerminalBackend::Pty { master, .. } => master
                 .lock()
@@ -363,20 +409,26 @@ impl TerminalSession {
                     pixel_width: 0,
                     pixel_height: 0,
                 })
-                .map_err(|err| TerminalError::Pty(err.to_string())),
-        }
+                .map_err(|err| TerminalError::Pty(err.to_string()))?,
+        };
+        self.emulator.lock().resize(rows as usize, cols as usize);
+        wake_terminal_activity(&self.activity_wakeup);
+        Ok(())
     }
 
     pub fn scroll_display(&self, delta: i32) {
         self.emulator.lock().scroll_display(delta);
+        wake_terminal_activity(&self.activity_wakeup);
     }
 
     pub fn scroll_bottom(&self) {
         self.emulator.lock().scroll_bottom();
+        wake_terminal_activity(&self.activity_wakeup);
     }
 
     pub fn scroll_to_offset(&self, offset: usize) {
         self.emulator.lock().scroll_to_offset(offset);
+        wake_terminal_activity(&self.activity_wakeup);
     }
 
     pub fn send_prompt(
@@ -419,6 +471,7 @@ impl TerminalSession {
                 }
             }
         }
+        wake_terminal_activity(&self.activity_wakeup);
     }
 
     pub fn process_id(&self) -> Option<u32> {
@@ -482,8 +535,16 @@ impl TerminalSession {
                 emulator: Arc::clone(&self.emulator),
                 user_input_active: Arc::clone(&self.user_input_active),
                 last_activity_at: Arc::clone(&self.last_activity_at),
+                activity_wakeup: Arc::clone(&self.activity_wakeup),
             },
         }
+    }
+}
+
+fn wake_terminal_activity(activity_wakeup: &Arc<Mutex<Option<TerminalActivityWakeup>>>) {
+    let wakeup = activity_wakeup.lock().clone();
+    if let Some(wakeup) = wakeup {
+        wakeup();
     }
 }
 
@@ -526,7 +587,7 @@ fn resolve_command(command: &AgentCommand) -> Result<ResolvedCommand, TerminalEr
             Ok(adapt_windows_wrapper_command(resolved, items[1..].to_vec()))
         }
         AgentCommand::Shell(text) => {
-            let parts = split_shell_like(text);
+            let parts = split_shell_like_command(text);
             let program = parts.first().cloned().ok_or(TerminalError::EmptyCommand)?;
             let resolved = resolve_program(program)?;
             Ok(adapt_windows_wrapper_command(resolved, parts[1..].to_vec()))
@@ -741,27 +802,6 @@ fn find_in_path(program: &str) -> Option<String> {
     None
 }
 
-fn split_shell_like(text: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut in_quote = false;
-    for ch in text.chars() {
-        match ch {
-            '"' => in_quote = !in_quote,
-            ' ' | '\t' if !in_quote => {
-                if !current.is_empty() {
-                    parts.push(std::mem::take(&mut current));
-                }
-            }
-            _ => current.push(ch),
-        }
-    }
-    if !current.is_empty() {
-        parts.push(current);
-    }
-    parts
-}
-
 #[derive(Debug)]
 struct RingTextBuffer {
     chunks: VecDeque<String>,
@@ -859,6 +899,15 @@ impl RingTextBuffer {
     fn revision(&self) -> u64 {
         self.revision
     }
+
+    fn clear(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
+        self.chunks.clear();
+        self.bytes = 0;
+        self.revision = self.revision.wrapping_add(1).max(1);
+    }
 }
 
 fn utf8_tail(text: &str, max_bytes: usize) -> String {
@@ -904,6 +953,32 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct FailingResizeMasterPty;
+
+    impl MasterPty for FailingResizeMasterPty {
+        fn resize(&self, _size: PtySize) -> Result<(), Error> {
+            Err(Error::msg("resize failed"))
+        }
+
+        fn get_size(&self) -> Result<PtySize, Error> {
+            Ok(PtySize {
+                rows: 30,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+        }
+
+        fn try_clone_reader(&self) -> Result<Box<dyn io::Read + Send>, Error> {
+            Ok(Box::new(io::empty()))
+        }
+
+        fn take_writer(&self) -> Result<Box<dyn io::Write + Send>, Error> {
+            Ok(Box::new(Vec::<u8>::new()))
+        }
+    }
+
     fn test_terminal_session() -> TerminalSession {
         let (_tx, rx) = unbounded();
         TerminalSession {
@@ -917,6 +992,26 @@ mod tests {
             user_input_active: Arc::new(Mutex::new(false)),
             last_activity_at: Arc::new(Mutex::new(Instant::now())),
             last_output_at: Arc::new(Mutex::new(Instant::now())),
+            activity_wakeup: Arc::new(Mutex::new(None)),
+            events: rx,
+            _event_tx: _tx,
+        }
+    }
+
+    fn terminal_session_with_master(master: Box<dyn MasterPty + Send>) -> TerminalSession {
+        let (_tx, rx) = unbounded();
+        TerminalSession {
+            backend: TerminalBackend::Pty {
+                master: Arc::new(Mutex::new(master)),
+                writer: Arc::new(Mutex::new(Box::new(Vec::<u8>::new()))),
+                child: Arc::new(Mutex::new(None)),
+            },
+            output: Arc::new(Mutex::new(RingTextBuffer::new(1024))),
+            emulator: Arc::new(Mutex::new(TerminalEmulator::new(30, 120))),
+            user_input_active: Arc::new(Mutex::new(false)),
+            last_activity_at: Arc::new(Mutex::new(Instant::now())),
+            last_output_at: Arc::new(Mutex::new(Instant::now())),
+            activity_wakeup: Arc::new(Mutex::new(None)),
             events: rx,
             _event_tx: _tx,
         }
@@ -1017,10 +1112,144 @@ mod tests {
     }
 
     #[test]
+    fn ring_buffer_clear_removes_text_and_bumps_revision_once() {
+        let mut buffer = RingTextBuffer::new(8);
+        buffer.push("abc");
+        let revision = buffer.revision();
+
+        buffer.clear();
+
+        assert_eq!(buffer.text(), "");
+        assert!(buffer.revision() > revision);
+        let clear_revision = buffer.revision();
+        buffer.clear();
+        assert_eq!(buffer.revision(), clear_revision);
+    }
+
+    #[test]
+    fn terminal_control_clear_local_view_clears_output_and_screen() {
+        let session = test_terminal_session();
+        session.push_local_output("old log");
+        session.emulator.lock().advance(b"old");
+        let output_revision = session.output_revision();
+        let view_revision = session.view_revision();
+
+        session.control().clear_local_view();
+
+        assert_eq!(session.output_text(), "");
+        assert!(session.output_revision() > output_revision);
+        assert!(session.view_revision() > view_revision);
+        let view_text = session
+            .view()
+            .cells
+            .iter()
+            .map(|cell| cell.c)
+            .collect::<String>();
+        assert!(view_text.trim().is_empty());
+    }
+
+    #[test]
+    fn terminal_activity_wakeup_runs_on_local_output_and_control_mutations() {
+        let session = test_terminal_session();
+        let wakeups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wakeups_for_callback = Arc::clone(&wakeups);
+        session.set_activity_wakeup(Some(Arc::new(move || {
+            wakeups_for_callback.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })));
+
+        session.push_local_output("new output");
+        session.control().clear_local_view();
+
+        assert_eq!(wakeups.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        session.set_activity_wakeup(None);
+        session.push_local_output("after disabled");
+
+        assert_eq!(wakeups.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn terminal_resize_failure_does_not_mutate_local_emulator_view() {
+        let session = terminal_session_with_master(Box::new(FailingResizeMasterPty));
+        let initial_view = session.view();
+        let initial_revision = session.view_revision();
+
+        assert!(matches!(
+            session.resize(20, 80),
+            Err(TerminalError::Pty(message)) if message.contains("resize failed")
+        ));
+
+        let after_session_resize = session.view();
+        assert_eq!(after_session_resize.rows, initial_view.rows);
+        assert_eq!(after_session_resize.cols, initial_view.cols);
+        assert_eq!(session.view_revision(), initial_revision);
+
+        let control = session.control();
+        assert!(matches!(
+            control.resize(20, 80),
+            Err(TerminalError::Pty(message)) if message.contains("resize failed")
+        ));
+
+        let after_control_resize = session.view();
+        assert_eq!(after_control_resize.rows, initial_view.rows);
+        assert_eq!(after_control_resize.cols, initial_view.cols);
+        assert_eq!(session.view_revision(), initial_revision);
+    }
+
+    #[test]
+    fn terminal_control_stop_process_kills_child_without_runtime_lock() {
+        let command = if cfg!(windows) {
+            AgentCommand::Args(vec![
+                "cmd.exe".to_string(),
+                "/d".to_string(),
+                "/c".to_string(),
+                "ping -n 30 127.0.0.1 >nul".to_string(),
+            ])
+        } else {
+            AgentCommand::Args(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "sleep 30".to_string(),
+            ])
+        };
+        let session =
+            TerminalSession::start(&command, std::env::temp_dir(), 8, 80, 16_384).unwrap();
+        let control = session.control();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && control.process_id().is_none() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(control.process_id().is_some());
+        control.stop_process();
+
+        assert_eq!(control.process_id(), None);
+        assert!(!session.is_running());
+    }
+
+    #[test]
     fn split_shell_command_handles_quotes() {
-        let parts = split_shell_like(r#"codex "--no-alt-screen" test"#);
+        let parts = split_shell_like_command(r#"codex "--no-alt-screen" test"#);
 
         assert_eq!(parts, vec!["codex", "--no-alt-screen", "test"]);
+    }
+
+    #[test]
+    fn split_shell_command_handles_single_quotes_empty_args_and_escaped_spaces() {
+        let parts = split_shell_like_command(
+            r#"codex 'resume session' "" escaped\ space "C:\Users\WPX\Codex""#,
+        );
+
+        assert_eq!(
+            parts,
+            vec![
+                "codex",
+                "resume session",
+                "",
+                "escaped space",
+                r"C:\Users\WPX\Codex"
+            ]
+        );
     }
 
     #[test]

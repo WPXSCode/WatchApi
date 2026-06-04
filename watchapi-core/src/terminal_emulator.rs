@@ -137,17 +137,33 @@ impl TerminalEmulator {
         self.drain_pty_writes()
     }
 
+    pub fn clear_screen_and_scrollback(&mut self) {
+        self.term.scroll_display(Scroll::Bottom);
+        self.processor
+            .advance(&mut self.term, b"\x1b[2J\x1b[3J\x1b[H");
+        self.bump_revision();
+        let _ = self.drain_pty_writes();
+    }
+
     pub fn scroll_display(&mut self, delta: i32) {
         if delta == 0 {
             return;
         }
-        self.term.scroll_display(Scroll::Delta(delta));
-        self.bump_revision();
+        let before = self.term.grid().display_offset();
+        let max_offset = self.max_display_offset();
+        let target = (before as i64 + delta as i64).clamp(0, max_offset as i64) as usize;
+        if target == before {
+            return;
+        }
+        let safe_delta = target as i32 - before as i32;
+        self.term.scroll_display(Scroll::Delta(safe_delta));
+        self.bump_revision_if_display_offset_changed(before);
     }
 
     pub fn scroll_bottom(&mut self) {
+        let before = self.term.grid().display_offset();
         self.term.scroll_display(Scroll::Bottom);
-        self.bump_revision();
+        self.bump_revision_if_display_offset_changed(before);
     }
 
     pub fn scroll_to_offset(&mut self, offset: usize) {
@@ -196,6 +212,19 @@ impl TerminalEmulator {
             display_offset,
             modes: mode_view(*self.term.mode()),
             cells,
+        }
+    }
+
+    fn max_display_offset(&self) -> usize {
+        self.term
+            .grid()
+            .total_lines()
+            .saturating_sub(self.term.screen_lines())
+    }
+
+    fn bump_revision_if_display_offset_changed(&mut self, before: usize) {
+        if self.term.grid().display_offset() != before {
+            self.bump_revision();
         }
     }
 
@@ -491,6 +520,39 @@ mod tests {
         assert_eq!(line_text(&emulator.view(), 0), "new     ");
         assert_eq!(line_text(&emulator.view(), 1), "        ");
     }
+    #[test]
+    fn terminal_emulator_updates_carriage_return_progress_in_place() {
+        let mut emulator = TerminalEmulator::new(2, 20);
+        let initial_revision = emulator.revision();
+
+        emulator.advance(b"working 9s");
+        let first_revision = emulator.revision();
+        emulator.advance(b"\rworking 10s");
+        let second_revision = emulator.revision();
+        let line = line_text(&emulator.view(), 0);
+
+        assert!(first_revision > initial_revision);
+        assert!(second_revision > first_revision);
+        assert!(line.starts_with("working 10s"));
+        assert!(!line.starts_with("working 9s"));
+    }
+
+    #[test]
+    fn terminal_emulator_local_clear_removes_screen_and_scrollback() {
+        let mut emulator = TerminalEmulator::new(2, 8);
+
+        emulator.advance(b"one\r\ntwo\r\nthree");
+        emulator.scroll_display(1);
+        assert!(emulator.view().scrollback_lines > 0);
+
+        emulator.clear_screen_and_scrollback();
+        let view = emulator.view();
+
+        assert_eq!(view.scrollback_lines, 0);
+        assert_eq!(view.display_offset, 0);
+        assert_eq!(line_text(&view, 0), "        ");
+        assert_eq!(line_text(&view, 1), "        ");
+    }
 
     #[test]
     fn terminal_emulator_preserves_basic_ansi_color() {
@@ -551,6 +613,57 @@ mod tests {
         assert!(!emulator.view().modes.focus_in_out);
     }
 
+    #[test]
+    fn terminal_emulator_scroll_noops_do_not_bump_revision() {
+        let mut emulator = TerminalEmulator::new(2, 8);
+        let initial_revision = emulator.revision();
+
+        emulator.scroll_display(1);
+        emulator.scroll_bottom();
+
+        assert_eq!(emulator.revision(), initial_revision);
+
+        emulator.advance(b"one\r\ntwo\r\nthree");
+        let output_revision = emulator.revision();
+        assert_eq!(emulator.view().display_offset, 0);
+
+        emulator.scroll_bottom();
+        emulator.scroll_to_offset(0);
+
+        assert_eq!(emulator.revision(), output_revision);
+
+        emulator.scroll_display(1);
+        let scrolled_revision = emulator.revision();
+        let scrolled_offset = emulator.view().display_offset;
+        assert!(scrolled_revision > output_revision);
+        assert!(scrolled_offset > 0);
+
+        emulator.scroll_display(i32::MAX);
+
+        assert_eq!(emulator.view().display_offset, scrolled_offset);
+        assert_eq!(emulator.revision(), scrolled_revision);
+
+        emulator.scroll_display(i32::MIN);
+        let bottom_revision = emulator.revision();
+        assert_eq!(emulator.view().display_offset, 0);
+        assert!(bottom_revision > scrolled_revision);
+
+        emulator.scroll_display(i32::MIN);
+        assert_eq!(emulator.revision(), bottom_revision);
+
+        emulator.scroll_display(1);
+        let scrolled_again_revision = emulator.revision();
+        assert!(scrolled_again_revision > bottom_revision);
+
+        emulator.scroll_bottom();
+        let final_bottom_revision = emulator.revision();
+        assert_eq!(emulator.view().display_offset, 0);
+        assert!(final_bottom_revision > scrolled_again_revision);
+
+        emulator.scroll_bottom();
+
+        assert_eq!(emulator.revision(), final_bottom_revision);
+    }
     #[test]
     fn terminal_emulator_scrolls_display_history() {
         let mut emulator = TerminalEmulator::new(2, 8);

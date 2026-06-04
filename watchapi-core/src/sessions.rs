@@ -1,5 +1,5 @@
 use crate::atomic_write::write_text_atomic;
-use crate::pollution::{is_polluted_text, pollution_detection_configured};
+use crate::pollution::{is_keyword_polluted_text, pollution_detection_configured};
 use crate::tokens::{extract_token_usage, TokenUsage};
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
@@ -79,6 +79,43 @@ impl SessionStore {
             .map(str::to_string)
     }
 
+    pub fn get_bound_session_path(&self, key: &SessionBindingKey) -> Option<PathBuf> {
+        self.data
+            .get("agents")
+            .and_then(Value::as_object)
+            .and_then(|map| map.get(&binding_key_text(key)))
+            .and_then(Value::as_object)
+            .and_then(|item| item.get("session_path"))
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(PathBuf::from)
+    }
+
+    pub fn bound_session_paths_for_config_path(
+        &mut self,
+        config_path: &Path,
+    ) -> Result<Vec<PathBuf>> {
+        let _guard = session_store_lock()
+            .lock()
+            .map_err(|_| anyhow!("session store lock poisoned"))?;
+        self.reload_latest();
+        let target = normalize_workdir(config_path);
+        let Some(map) = self.data.get("agents").and_then(Value::as_object) else {
+            return Ok(Vec::new());
+        };
+        Ok(map
+            .iter()
+            .filter(|(key, value)| bound_session_matches_config_path(key, value, &target))
+            .filter_map(|(_, value)| {
+                value
+                    .get("session_path")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                    .map(PathBuf::from)
+            })
+            .collect())
+    }
+
     pub fn session_id_bound_to_other(&self, key: &SessionBindingKey, session_id: &str) -> bool {
         let current_key = binding_key_text(key);
         let Some(map) = self.data.get("agents").and_then(Value::as_object) else {
@@ -120,6 +157,42 @@ impl SessionStore {
         }
         self.data["agents"][binding_key_text(key)] = value;
         self.save_unlocked()
+    }
+
+    pub fn delete_bound_sessions_for_config_path(&mut self, config_path: &Path) -> Result<usize> {
+        let _guard = session_store_lock()
+            .lock()
+            .map_err(|_| anyhow!("session store lock poisoned"))?;
+        self.reload_latest();
+        let target = normalize_workdir(config_path);
+        let mut keys = Vec::new();
+        let mut workdirs = Vec::new();
+        if let Some(map) = self.data.get("agents").and_then(Value::as_object) {
+            for (key, value) in map {
+                if bound_session_matches_config_path(key, value, &target) {
+                    keys.push(key.clone());
+                    if let Some(workdir) = value.get("workdir").and_then(Value::as_str) {
+                        workdirs.push(workdir.to_string());
+                    }
+                }
+            }
+        }
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let removed = keys.len();
+        if let Some(map) = self.data.get_mut("agents").and_then(Value::as_object_mut) {
+            for key in keys {
+                map.remove(&key);
+            }
+        }
+        if let Some(map) = self.data.get_mut("workdirs").and_then(Value::as_object_mut) {
+            for workdir in workdirs {
+                map.remove(&workdir);
+            }
+        }
+        self.save_unlocked()?;
+        Ok(removed)
     }
 
     pub fn delete_bound_session_id(&mut self, key: &SessionBindingKey) -> Result<()> {
@@ -218,14 +291,38 @@ pub fn binding_key_text(key: &SessionBindingKey) -> String {
     )
 }
 
+fn bound_session_matches_config_path(
+    key: &str,
+    value: &Value,
+    normalized_config_path: &str,
+) -> bool {
+    value
+        .get("config_path")
+        .and_then(Value::as_str)
+        .is_some_and(|path| normalize_workdir(Path::new(path)) == normalized_config_path)
+        || key
+            .split('|')
+            .next()
+            .is_some_and(|prefix| prefix == normalized_config_path)
+}
+
 #[derive(Debug, Clone)]
 pub struct CodexSessionIndex {
     codex_home: PathBuf,
+    additional_homes: Vec<PathBuf>,
 }
 
 impl CodexSessionIndex {
     pub fn new(codex_home: PathBuf) -> Self {
-        Self { codex_home }
+        Self {
+            codex_home,
+            additional_homes: Vec::new(),
+        }
+    }
+
+    pub fn with_additional_homes(mut self, homes: Vec<PathBuf>) -> Self {
+        self.additional_homes = homes;
+        self
     }
 
     pub fn ranked_candidates(
@@ -237,18 +334,30 @@ impl CodexSessionIndex {
     ) -> Vec<SessionCandidate> {
         let owners = store.bound_session_owners();
         let context = RankingContext::new(workdir, config_name, agent_name);
-        let mut candidates = jsonl_files(&self.codex_home.join("sessions"))
+        let mut candidates = self
+            .session_files()
             .into_iter()
             .filter_map(|path| codex_candidate_from_path(path, &context, &owners))
             .collect::<Vec<_>>();
         sort_session_candidates(&mut candidates);
+        dedupe_session_candidates(&mut candidates);
         candidates
     }
 
     pub fn find_latest_session_id_for_workdir(&self, workdir: &Path) -> Option<String> {
-        let file = self.find_latest_session_file_for_workdir(workdir, None)?;
+        self.find_latest_session_for_workdir(workdir, None)
+            .map(|(session_id, _)| session_id)
+    }
+
+    pub fn find_latest_session_for_workdir(
+        &self,
+        workdir: &Path,
+        session_id: Option<&str>,
+    ) -> Option<(String, PathBuf)> {
+        let file = self.find_latest_session_file_for_workdir(workdir, session_id)?;
         let meta = read_session_meta(&file)?;
-        meta.get("id").and_then(Value::as_str).map(str::to_string)
+        let id = meta.get("id").and_then(Value::as_str)?.to_string();
+        Some((id, file))
     }
 
     pub fn find_latest_session_file_for_workdir(
@@ -256,9 +365,8 @@ impl CodexSessionIndex {
         workdir: &Path,
         session_id: Option<&str>,
     ) -> Option<PathBuf> {
-        let sessions_root = self.codex_home.join("sessions");
         let target = normalize_workdir(workdir);
-        let mut candidates = jsonl_files(&sessions_root);
+        let mut candidates = self.session_files();
         candidates.sort_by_cached_key(|path| {
             std::cmp::Reverse(path.metadata().and_then(|meta| meta.modified()).ok())
         });
@@ -283,6 +391,26 @@ impl CodexSessionIndex {
             return Some(candidate);
         }
         None
+    }
+
+    fn session_homes(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for home in std::iter::once(&self.codex_home).chain(self.additional_homes.iter()) {
+            let key = normalize_workdir(home);
+            if seen.insert(key) {
+                out.push(home.clone());
+            }
+        }
+        out
+    }
+
+    fn session_files(&self) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        for home in self.session_homes() {
+            files.extend(jsonl_files(&home.join("sessions")));
+        }
+        files
     }
 
     pub fn find_new_session_file_for_workdir(
@@ -507,16 +635,28 @@ impl ClaudeSessionMonitor {
         if reader.seek(SeekFrom::Start(self.position)).is_err() {
             return;
         }
+        let mut last_good_position = self.position;
+        let mut next_position = self.position;
         let mut line = String::new();
-        while reader.read_line(&mut line).unwrap_or(0) > 0 {
+        loop {
+            line.clear();
+            let Ok(bytes) = reader.read_line(&mut line) else {
+                break;
+            };
+            if bytes == 0 {
+                break;
+            }
+            next_position = next_position.saturating_add(bytes as u64);
             if let Ok(item) = serde_json::from_str::<Value>(&line) {
                 self.observe_item(&item);
+                last_good_position = next_position;
+            } else if line.ends_with('\n') || line.ends_with('\r') {
+                last_good_position = next_position;
+            } else {
+                break;
             }
-            line.clear();
         }
-        if let Ok(position) = reader.stream_position() {
-            self.position = position;
-        }
+        self.position = last_good_position;
     }
 
     fn observe_item(&mut self, item: &Value) {
@@ -530,7 +670,7 @@ impl ClaudeSessionMonitor {
         }
         let text = extract_claude_message_text(item);
         let polluted = pollution_detection_configured(&self.polluted_response_keywords)
-            && is_polluted_text(
+            && is_keyword_polluted_text(
                 &text,
                 &self.polluted_response_keywords,
                 self.polluted_response_threshold,
@@ -630,7 +770,7 @@ impl OpenCodeSessionMonitor {
         }
         let text = extract_any_message_text(item);
         let polluted = pollution_detection_configured(&self.polluted_response_keywords)
-            && is_polluted_text(
+            && is_keyword_polluted_text(
                 &text,
                 &self.polluted_response_keywords,
                 self.polluted_response_threshold,
@@ -852,7 +992,7 @@ impl CodexSessionMonitor {
                 self.assistant_message_count += 1;
                 let text = extract_message_text(payload.get("content").unwrap_or(&Value::Null));
                 let polluted = pollution_detection_configured(&self.polluted_response_keywords)
-                    && is_polluted_text(
+                    && is_keyword_polluted_text(
                         &text,
                         &self.polluted_response_keywords,
                         self.polluted_response_threshold,
@@ -889,10 +1029,6 @@ impl CodexSessionMonitor {
         }
         if self.waiting_for_turn_after.is_some() && self.last_task_started_at.is_none() {
             return;
-        }
-        if event_type == "turn_aborted" {
-            self.endpoint_failure_detected = true;
-            self.assistant_message_count_at_wait_start = None;
         }
         if turn_id == "__unknown__" {
             self.active_turn_ids.clear();
@@ -935,6 +1071,36 @@ fn visit_jsonl(path: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+pub fn discover_codex_session_homes(root: &Path) -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    let mut queue = VecDeque::new();
+    let mut seen = HashSet::new();
+    if root.is_dir() {
+        queue.push_back(root.to_path_buf());
+    }
+    while let Some(path) = queue.pop_front() {
+        let key = normalize_workdir(&path);
+        if !seen.insert(key) {
+            continue;
+        }
+        if path.join("sessions").is_dir() {
+            homes.push(path);
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if child.is_dir() {
+                queue.push_back(child);
+            }
+        }
+    }
+    homes.sort();
+    homes
+}
+
 fn read_session_meta(path: &Path) -> Option<Value> {
     let file = open_session_file_for_read(path)?;
     for line in BufReader::new(file).lines().map_while(Result::ok) {
@@ -949,6 +1115,20 @@ fn read_session_meta(path: &Path) -> Option<Value> {
         return Some(meta);
     }
     None
+}
+
+pub fn codex_session_file_matches(path: &Path, workdir: &Path, session_id: &str) -> bool {
+    let Some(meta) = read_session_meta(path) else {
+        return false;
+    };
+    if meta.get("id").and_then(Value::as_str) != Some(session_id) {
+        return false;
+    }
+    meta.get("cwd")
+        .and_then(Value::as_str)
+        .map(|cwd| normalize_workdir(Path::new(cwd)))
+        .as_deref()
+        == Some(normalize_workdir(workdir).as_str())
 }
 
 #[derive(Debug, Clone)]
@@ -1170,6 +1350,11 @@ fn sort_session_candidates(candidates: &mut [SessionCandidate]) {
     });
 }
 
+fn dedupe_session_candidates(candidates: &mut Vec<SessionCandidate>) {
+    let mut seen = HashSet::new();
+    candidates.retain(|candidate| seen.insert(candidate.session_id.clone()));
+}
+
 fn path_is_related(a: &str, b: &str) -> bool {
     let a = a.replace('\\', "/");
     let b = b.replace('\\', "/");
@@ -1362,11 +1547,11 @@ fn open_session_file_for_read(path: &Path) -> Option<File> {
         const FILE_SHARE_READ: u32 = 0x0000_0001;
         const FILE_SHARE_WRITE: u32 = 0x0000_0002;
         const FILE_SHARE_DELETE: u32 = 0x0000_0004;
-        return fs::OpenOptions::new()
+        fs::OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .open(path)
-            .ok();
+            .ok()
     }
     #[cfg(not(windows))]
     {
@@ -1789,6 +1974,93 @@ mod tests {
     }
 
     #[test]
+    fn session_store_persists_bound_session_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.json");
+        let workdir = tmp.path().join("project");
+        let session_path = tmp
+            .path()
+            .join("old-home/sessions/2026/05/29/session.jsonl");
+        fs::create_dir_all(&workdir).unwrap();
+        let mut store = SessionStore::new(path.clone());
+        let key = SessionBindingKey {
+            config_path: Some(tmp.path().join("config.json")),
+            agent_id: "backend".to_string(),
+            driver: "codex".to_string(),
+            workdir,
+        };
+
+        store
+            .set_bound_session_id(&key, "session-1", Some(&session_path))
+            .unwrap();
+
+        let reloaded = SessionStore::new(path);
+        assert_eq!(reloaded.get_bound_session_path(&key), Some(session_path));
+    }
+
+    #[test]
+    fn session_store_deletes_all_bindings_for_config_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.json");
+        let workdir = tmp.path().join("project");
+        let other_workdir = tmp.path().join("other-project");
+        fs::create_dir_all(&workdir).unwrap();
+        fs::create_dir_all(&other_workdir).unwrap();
+        let config_path = tmp.path().join("config.json");
+        let other_config_path = tmp.path().join("other.json");
+        let session_a = tmp.path().join("sessions/a.jsonl");
+        let session_b = tmp.path().join("sessions/b.jsonl");
+        let session_other = tmp.path().join("sessions/other.jsonl");
+        let key_a = SessionBindingKey {
+            config_path: Some(config_path.clone()),
+            agent_id: "a".to_string(),
+            driver: "codex".to_string(),
+            workdir: workdir.clone(),
+        };
+        let key_b = SessionBindingKey {
+            agent_id: "b".to_string(),
+            ..key_a.clone()
+        };
+        let other_key = SessionBindingKey {
+            config_path: Some(other_config_path),
+            agent_id: "other".to_string(),
+            driver: "codex".to_string(),
+            workdir: other_workdir,
+        };
+        let mut store = SessionStore::new(path.clone());
+        store
+            .set_bound_session_id(&key_a, "session-a", Some(&session_a))
+            .unwrap();
+        store
+            .set_bound_session_id(&key_b, "session-b", Some(&session_b))
+            .unwrap();
+        store
+            .set_bound_session_id(&other_key, "session-other", Some(&session_other))
+            .unwrap();
+
+        let mut reloaded = SessionStore::new(path.clone());
+        let mut paths = reloaded
+            .bound_session_paths_for_config_path(&config_path)
+            .unwrap();
+        paths.sort();
+        assert_eq!(paths, vec![session_a, session_b]);
+        assert_eq!(
+            reloaded
+                .delete_bound_sessions_for_config_path(&config_path)
+                .unwrap(),
+            2
+        );
+
+        let reloaded = SessionStore::new(path);
+        assert_eq!(reloaded.get_bound_session_id(&key_a), None);
+        assert_eq!(reloaded.get_bound_session_id(&key_b), None);
+        assert_eq!(
+            reloaded.get_bound_session_id(&other_key),
+            Some("session-other".to_string())
+        );
+    }
+
+    #[test]
     fn concurrent_session_store_writes_preserve_all_bindings() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("state.json");
@@ -1866,16 +2138,6 @@ mod tests {
         let other_file = tmp.path().join("sessions/2026/05/17/other.jsonl");
         fs::create_dir_all(exact_file.parent().unwrap()).unwrap();
         fs::write(
-            &exact_file,
-            [
-                json!({"type": "session_meta", "payload": {"id": "exact", "cwd": workdir.to_string_lossy()}}).to_string(),
-                json!({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"text": "project backend"}]}}).to_string(),
-            ]
-            .join("\n")
-                + "\n",
-        )
-        .unwrap();
-        fs::write(
             &child_file,
             json!({"type": "session_meta", "payload": {"id": "child", "cwd": child.to_string_lossy()}})
                 .to_string()
@@ -1885,6 +2147,16 @@ mod tests {
         fs::write(
             &other_file,
             json!({"type": "session_meta", "payload": {"id": "other", "cwd": other.to_string_lossy()}}).to_string() + "\n",
+        )
+        .unwrap();
+        fs::write(
+            &exact_file,
+            [
+                json!({"type": "session_meta", "payload": {"id": "exact", "cwd": workdir.to_string_lossy()}}).to_string(),
+                json!({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"text": "project backend"}]}}).to_string(),
+            ]
+            .join("\n")
+                + "\n",
         )
         .unwrap();
         let store = SessionStore::new(tmp.path().join("state.json"));
@@ -1903,6 +2175,49 @@ mod tests {
             .unwrap()
             .reason
             .contains("工作目录完全一致"));
+    }
+
+    #[test]
+    fn codex_candidates_include_additional_historical_homes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        let primary_home = tmp.path().join(".codex");
+        let historical_home = tmp.path().join("Runtime/codex-homes/old-config/codex-main");
+        let historical_file = historical_home.join("sessions/2026/05/29/historical.jsonl");
+        fs::create_dir_all(&workdir).unwrap();
+        fs::create_dir_all(historical_file.parent().unwrap()).unwrap();
+        fs::write(
+            &historical_file,
+            [
+                json!({"type": "session_meta", "payload": {"id": "historical-session", "cwd": workdir.to_string_lossy()}}).to_string(),
+                json!({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"text": "continue project backend"}]}}).to_string(),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let store = SessionStore::new(tmp.path().join("state.json"));
+
+        let candidates = CodexSessionIndex::new(primary_home)
+            .with_additional_homes(vec![historical_home])
+            .ranked_candidates(&workdir, "config", "backend", &store);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].session_id, "historical-session");
+        assert_eq!(candidates[0].path, historical_file);
+    }
+
+    #[test]
+    fn discover_codex_session_homes_finds_nested_homes_with_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Runtime/codex-homes");
+        let codex_home = root.join("old-config/codex-main");
+        fs::create_dir_all(codex_home.join("sessions/2026/05/29")).unwrap();
+        fs::create_dir_all(root.join("empty-config/codex-main")).unwrap();
+
+        let homes = discover_codex_session_homes(&root);
+
+        assert_eq!(homes, vec![codex_home]);
     }
 
     #[test]
@@ -1988,16 +2303,6 @@ mod tests {
         let other_file = tmp.path().join("projects/current/other.jsonl");
         fs::create_dir_all(exact_file.parent().unwrap()).unwrap();
         fs::write(
-            &exact_file,
-            [
-                json!({"cwd": workdir.to_string_lossy(), "type": "summary", "summary": "project context"}).to_string(),
-                json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "exact session"}]}}).to_string(),
-            ]
-            .join("\n")
-                + "\n",
-        )
-        .unwrap();
-        fs::write(
             &child_file,
             json!({"cwd": child.to_string_lossy(), "type": "summary", "summary": "child context"})
                 .to_string()
@@ -2008,6 +2313,16 @@ mod tests {
             &other_file,
             json!({"cwd": other.to_string_lossy(), "type": "summary", "summary": "other context"})
                 .to_string()
+                + "\n",
+        )
+        .unwrap();
+        fs::write(
+            &exact_file,
+            [
+                json!({"cwd": workdir.to_string_lossy(), "type": "summary", "summary": "project context"}).to_string(),
+                json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "exact session"}]}}).to_string(),
+            ]
+            .join("\n")
                 + "\n",
         )
         .unwrap();
@@ -2464,7 +2779,43 @@ mod tests {
     }
 
     #[test]
-    fn codex_turn_aborted_releases_assistant_wait_gate() {
+    fn monitor_pollution_detection_uses_configured_keywords_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let session_file = tmp.path().join("sessions/2026/05/17/rollout.jsonl");
+        fs::create_dir_all(session_file.parent().unwrap()).unwrap();
+        fs::write(
+            &session_file,
+            [
+                json!({"type": "session_meta", "timestamp": "2026-05-17T16:29:00.000Z", "payload": {"id": "session-1", "cwd": workdir.to_string_lossy()}}).to_string(),
+                json!({"timestamp": "2026-05-17T16:29:06.000Z", "type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"text": "Join our channel 175877552 for free API token, stop for 10 minutes"}]}}).to_string(),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let mut monitor = CodexSessionMonitor::new(
+            tmp.path().to_path_buf(),
+            workdir,
+            DateTime::parse_from_rfc3339("2026-05-17T16:29:00.000Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            Some("session-1".to_string()),
+            vec!["余额不足".to_string()],
+            vec![],
+            0.35,
+            12,
+            300,
+        );
+
+        monitor.poll();
+
+        assert!(!monitor.pollution_detected);
+    }
+
+    #[test]
+    fn codex_turn_aborted_does_not_mark_endpoint_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let workdir = tmp.path().join("project");
         fs::create_dir_all(&workdir).unwrap();
@@ -2498,10 +2849,10 @@ mod tests {
         monitor.begin_waiting_for_new_turn();
         monitor.poll();
 
-        assert!(monitor.endpoint_failure_detected);
+        assert!(!monitor.endpoint_failure_detected);
         assert!(!monitor.has_inflight_turn());
         assert!(monitor.last_task_finished_at.is_some());
-        assert!(monitor.has_assistant_message_since_wait_start());
+        assert!(!monitor.has_assistant_message_since_wait_start());
     }
 
     #[test]
@@ -2546,6 +2897,50 @@ mod tests {
 
         assert!(monitor.has_inflight_turn());
         assert!(monitor.last_task_started_at.is_some());
+    }
+
+    #[test]
+    fn claude_monitor_retries_partial_jsonl_line_without_skipping_pollution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let session_file = tmp
+            .path()
+            .join("projects/-tmp-project/claude-session-1.jsonl");
+        fs::create_dir_all(session_file.parent().unwrap()).unwrap();
+        fs::write(
+            &session_file,
+            json!({"cwd": workdir.to_string_lossy(), "type": "summary", "summary": "context"}).to_string()
+                + "\n"
+                + "{\"timestamp\":\"2026-05-17T16:29:02.000Z\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"",
+        )
+        .unwrap();
+        let mut monitor = ClaudeSessionMonitor::new(
+            tmp.path().to_path_buf(),
+            workdir,
+            DateTime::parse_from_rfc3339("2026-05-17T16:29:00.000Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            None,
+            vec!["公益".to_string(), "通知群".to_string()],
+            vec![],
+            0.35,
+            12,
+            300,
+        );
+
+        monitor.poll();
+        assert!(!monitor.pollution_detected);
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&session_file)
+            .unwrap()
+            .write_all("公益 通知群\"}]}}\n".as_bytes())
+            .unwrap();
+        monitor.poll();
+
+        assert!(monitor.pollution_detected);
     }
 
     #[test]

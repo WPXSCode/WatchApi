@@ -8,7 +8,6 @@ use crate::guard_proxy::{GuardAuditSnapshot, GuardProxyServer};
 use crate::health::EndpointHealthTracker;
 use crate::http_probe::HttpProbe;
 use crate::probe::ProbeResult;
-use crate::selector::choose_best_endpoint;
 use crate::terminal::TerminalControl;
 use crate::terminal_emulator::TerminalView;
 use crate::tokens::{format_token_cost, TokenUsage};
@@ -19,7 +18,7 @@ use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const GUARD_PROXY_PORT_MIN: u16 = 45000;
@@ -54,6 +53,8 @@ pub enum RuntimeEvent {
     Snapshot(RuntimeSnapshot),
 }
 
+pub type RuntimeEventWakeup = Arc<dyn Fn() + Send + Sync + 'static>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeEventSignature {
     state_label: String,
@@ -67,6 +68,12 @@ struct RuntimeEventSignature {
     last_status_codes: Vec<(String, Option<u16>)>,
     probe_keys: Vec<(String, bool, bool, bool, Option<u16>)>,
     runtime_tick: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct GuardPollutionSignal {
+    pollution_failures: u64,
+    high_risk_replacements: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,12 +106,15 @@ pub struct RuntimeCore {
     agent: Option<AgentProcess>,
     guard_proxy: Option<GuardProxyServer>,
     guard_audit_by_endpoint: HashMap<String, GuardAuditSnapshot>,
+    guard_pollution_signal_by_endpoint: HashMap<String, GuardPollutionSignal>,
     fixed_endpoint: Option<String>,
     force_probe_endpoint: Option<String>,
     token_usage_by_endpoint: HashMap<String, TokenUsage>,
     historical_usage_by_key: HashMap<String, TokenUsage>,
     usage_state_path: Option<PathBuf>,
     usage_save_error: Option<String>,
+    control_save_error: Option<String>,
+    manual_prompt_requeue_error: Option<String>,
     request_count_by_endpoint: HashMap<String, u64>,
     last_request_at_by_endpoint: HashMap<String, String>,
     last_status_code_by_endpoint: HashMap<String, Option<u16>>,
@@ -119,11 +129,14 @@ pub struct RuntimeCore {
     endpoint_auto_prompt_blocked_until: HashMap<String, Instant>,
     next_probe_at: HashMap<String, Instant>,
     polluted_until: HashMap<String, Instant>,
+    guard_polluted_until: HashMap<String, Instant>,
+    pollution_recovery_successes_by_endpoint: HashMap<String, u32>,
     startup_failed_until: HashMap<String, Instant>,
     startup_failure_error: HashMap<String, String>,
     probing_endpoint: Option<String>,
     counted_probe_inflight: HashSet<String>,
     event_tx: Option<Sender<RuntimeEvent>>,
+    event_wakeup: Option<RuntimeEventWakeup>,
     last_event_snapshot: Mutex<Option<RuntimeSnapshot>>,
     last_event_signature: Mutex<Option<RuntimeEventSignature>>,
     pending_initial_prompt: Option<String>,
@@ -133,6 +146,7 @@ pub struct RuntimeCore {
     waiting_for_assistant_progress: bool,
     goal_synced_this_run: bool,
     goal_turn_active: bool,
+    goal_request_clear_failed_signature: Option<String>,
     trigger_now_clear_failed: bool,
     force_new_session_once: bool,
     force_current_probe_once: bool,
@@ -169,12 +183,15 @@ impl RuntimeCore {
             agent: None,
             guard_proxy: None,
             guard_audit_by_endpoint: HashMap::new(),
+            guard_pollution_signal_by_endpoint: HashMap::new(),
             fixed_endpoint: None,
             force_probe_endpoint: None,
             token_usage_by_endpoint: HashMap::new(),
             historical_usage_by_key,
             usage_state_path,
             usage_save_error: None,
+            control_save_error: None,
+            manual_prompt_requeue_error: None,
             request_count_by_endpoint: HashMap::new(),
             last_request_at_by_endpoint: HashMap::new(),
             last_status_code_by_endpoint: HashMap::new(),
@@ -189,11 +206,14 @@ impl RuntimeCore {
             endpoint_auto_prompt_blocked_until: HashMap::new(),
             next_probe_at: HashMap::new(),
             polluted_until: HashMap::new(),
+            guard_polluted_until: HashMap::new(),
+            pollution_recovery_successes_by_endpoint: HashMap::new(),
             startup_failed_until: HashMap::new(),
             startup_failure_error: HashMap::new(),
             probing_endpoint: None,
             counted_probe_inflight: HashSet::new(),
             event_tx: None,
+            event_wakeup: None,
             last_event_snapshot: Mutex::new(None),
             last_event_signature: Mutex::new(None),
             pending_initial_prompt: None,
@@ -203,6 +223,7 @@ impl RuntimeCore {
             waiting_for_assistant_progress: false,
             goal_synced_this_run: false,
             goal_turn_active: false,
+            goal_request_clear_failed_signature: None,
             trigger_now_clear_failed: false,
             force_new_session_once: false,
             force_current_probe_once: false,
@@ -216,35 +237,101 @@ impl RuntimeCore {
         let auto_paused = self.auto_paused();
         let mut current_failed = false;
         let mut skip_current = false;
+        let mut hold_current_on_no_alternative = false;
         let force_probe_current = self.force_current_probe_once;
         let confirm_probe_current = self.confirm_current_probe_once;
         let force_full_probe = self.force_full_probe_once;
         self.force_current_probe_once = false;
         self.confirm_current_probe_once = false;
         let mut overrides = HashMap::new();
-        if auto_paused && self.current_endpoint.is_some() && !force_full_probe {
+
+        if auto_paused && self.current_endpoint.is_some() && !force_full_probe && !current_failed {
             if let Some(current) = self.current_endpoint.clone() {
                 if let Some(endpoint) = self.endpoint_by_name(&current).cloned() {
                     self.maybe_drive_prompt(&endpoint);
                     self.record_agent_usage(&endpoint);
-                    self.health.update(&self.config.endpoints, &overrides);
+                    let direct_pollution_replaced =
+                        guard_replaces_direct_pollution_detection(&endpoint);
+                    let current_polluted = if let Some(agent) = self.agent.as_mut() {
+                        let polluted = agent.pollution_detected;
+                        if polluted {
+                            agent.pollution_detected = false;
+                        } else if agent.completion_pause_detected {
+                            agent.clear_completion_pause_detected();
+                        }
+                        polluted && !direct_pollution_replaced
+                    } else {
+                        false
+                    };
+                    let mut recovery = HashMap::new();
+                    if current_polluted {
+                        let result = ProbeResult::synthetic_polluted();
+                        self.remember_single_probe_result(&endpoint, &result, Instant::now());
+                        self.mark_endpoint_polluted(&current);
+                        recovery.insert(current.clone(), result);
+                    }
+                    if self.record_current_guard_pollution_signal(&current, &mut recovery) {
+                        if let Some(result) = recovery.get(&current).cloned() {
+                            self.remember_single_probe_result(&endpoint, &result, Instant::now());
+                        }
+                    }
+                    recovery.extend(
+                        self.probe_due_unhealthy_endpoints(
+                            probe,
+                            vec![endpoint.clone()],
+                            ProbeMode::Full,
+                        )
+                        .await,
+                    );
+                    recovery.extend(
+                        self.probe_due_background_recovery(probe, &current, ProbeMode::Full)
+                            .await,
+                    );
+                    self.health.update(&self.config.endpoints, &recovery);
                     return Some(endpoint);
                 }
             }
         }
+
+        if let Some(current) = self.current_endpoint.clone() {
+            if self.endpoint_request_failure_threshold_reached(&current)
+                && !self.clear_endpoint_request_failures_on_session_success(&current)
+            {
+                current_failed = true;
+                skip_current = true;
+                hold_current_on_no_alternative = true;
+                self.state =
+                    RuntimeState::Error(self.endpoint_request_failure_state_text(&current));
+            }
+        }
+
+        if let Some(current) = self.current_endpoint.clone() {
+            if self.record_current_guard_pollution_signal(&current, &mut overrides) {
+                current_failed = true;
+                skip_current = true;
+                self.state = RuntimeState::Error("保护层污染".to_string());
+            }
+        }
+
         if let Some(current) = self.current_endpoint.clone() {
             let mut mark_polluted = false;
+            let direct_pollution_replaced = self
+                .endpoint_by_name(&current)
+                .is_some_and(guard_replaces_direct_pollution_detection);
             if self.current_guard_proxy_unreachable() {
                 current_failed = true;
                 self.state = RuntimeState::Error("保护层端口失效".to_string());
             }
             if let Some(agent) = self.agent.as_mut() {
                 agent.poll_monitor();
+                let direct_polluted = agent.pollution_detected;
+                if direct_polluted {
+                    agent.pollution_detected = false;
+                }
                 if !agent.is_running() {
                     current_failed = true;
-                } else if agent.pollution_detected {
+                } else if direct_polluted && !direct_pollution_replaced {
                     overrides.insert(current.clone(), ProbeResult::synthetic_polluted());
-                    agent.pollution_detected = false;
                     current_failed = true;
                     skip_current = true;
                     mark_polluted = true;
@@ -262,6 +349,7 @@ impl RuntimeCore {
                     if self.record_endpoint_request_failure_reached_threshold(&current) {
                         current_failed = true;
                         skip_current = true;
+                        hold_current_on_no_alternative = true;
                     }
                 } else if agent.transient_endpoint_failure_detected {
                     overrides.insert(current.clone(), ProbeResult::synthetic_unavailable());
@@ -274,6 +362,7 @@ impl RuntimeCore {
                     {
                         current_failed = true;
                         skip_current = true;
+                        hold_current_on_no_alternative = true;
                     }
                 } else if !auto_paused && agent.is_turn_stalled(self.config.turn_stall_seconds) {
                     overrides.insert(current.clone(), ProbeResult::synthetic_unavailable());
@@ -283,6 +372,7 @@ impl RuntimeCore {
                     {
                         current_failed = true;
                         skip_current = true;
+                        hold_current_on_no_alternative = true;
                     }
                 } else {
                     self.transient_failures_by_endpoint.remove(&current);
@@ -322,6 +412,7 @@ impl RuntimeCore {
                             current_failed = !result.available;
                             if current_failed {
                                 skip_current = true;
+                                hold_current_on_no_alternative = !result.polluted;
                             }
                             overrides.insert(endpoint.name.clone(), result);
                         } else {
@@ -330,6 +421,7 @@ impl RuntimeCore {
                             current_failed = !result.available;
                             if current_failed {
                                 skip_current = true;
+                                hold_current_on_no_alternative = !result.polluted;
                             }
                             self.remember_single_probe_result(&endpoint, &result, now);
                             self.counted_probe_inflight.remove(&endpoint.name);
@@ -340,17 +432,6 @@ impl RuntimeCore {
                             self.publish_snapshot_event();
                         }
                     }
-                }
-            }
-        }
-
-        if auto_paused && self.current_endpoint.is_some() && !current_failed && !force_full_probe {
-            if let Some(current) = self.current_endpoint.clone() {
-                if let Some(endpoint) = self.endpoint_by_name(&current).cloned() {
-                    self.maybe_drive_prompt(&endpoint);
-                    self.record_agent_usage(&endpoint);
-                    self.health.update(&self.config.endpoints, &overrides);
-                    return Some(endpoint);
                 }
             }
         }
@@ -366,6 +447,24 @@ impl RuntimeCore {
         self.health.update(&self.config.endpoints, &availability);
 
         let Some(selected) = selected else {
+            if hold_current_on_no_alternative || (force_full_probe && !current_failed) {
+                if let Some(endpoint) =
+                    self.running_single_current_endpoint_without_cooldown(&availability)
+                {
+                    self.probing_endpoint = None;
+                    self.counted_probe_inflight.clear();
+                    let previous_state = self.state.clone();
+                    self.maybe_drive_prompt(&endpoint);
+                    if self.endpoint_request_failure_threshold_reached(&endpoint.name)
+                        && matches!(previous_state, RuntimeState::Error(_))
+                    {
+                        self.state = previous_state;
+                    }
+                    self.record_agent_usage(&endpoint);
+                    self.publish_snapshot_event();
+                    return Some(endpoint);
+                }
+            }
             self.stop_agent();
             self.current_endpoint = None;
             self.probing_endpoint = None;
@@ -464,7 +563,9 @@ impl RuntimeCore {
         self.waiting_for_assistant_progress = false;
         self.goal_synced_this_run = false;
         self.goal_turn_active = false;
+        self.goal_request_clear_failed_signature = None;
         self.trigger_now_clear_failed = false;
+        self.manual_prompt_requeue_error = None;
         self.state = RuntimeState::WaitingAvailable;
         self.probing_endpoint = None;
         self.counted_probe_inflight.clear();
@@ -500,10 +601,8 @@ impl RuntimeCore {
         let Some(path) = self.config.config_path.as_ref() else {
             return false;
         };
-        read_control_state(path)
-            .get("goal_enabled")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
+        let state = read_control_state(path);
+        goal_mode_enabled_runtime(&self.config, &state)
     }
     pub fn terminal_output(&self) -> String {
         self.agent
@@ -548,12 +647,12 @@ impl RuntimeCore {
     }
 
     pub fn write_user_input(&mut self, text: &str) -> Result<(), String> {
-        if let Some(agent) = &self.agent {
-            agent
-                .write_user_input(text)
-                .map_err(|err| format!("终端输入失败：{err}"))?;
-        }
-        Ok(())
+        let Some(agent) = &self.agent else {
+            return Err("终端输入失败：终端未启动".to_string());
+        };
+        agent
+            .write_user_input(text)
+            .map_err(|err| format!("终端输入失败：{err}"))
     }
 
     pub fn resize_terminal(&mut self, rows: u16, cols: u16) -> Result<(), String> {
@@ -592,7 +691,21 @@ impl RuntimeCore {
         Ok(())
     }
 
+    pub fn clear_terminal_local_view(&mut self) -> Result<(), String> {
+        if let Some(agent) = &self.agent {
+            agent
+                .clear_terminal_local_view()
+                .map_err(|err| format!("终端清屏失败：{err}"))?;
+        }
+        Ok(())
+    }
+
     pub fn mark_terminal_command_failed(&mut self, error: String) {
+        self.state = RuntimeState::Error(error);
+        self.publish_snapshot_event();
+    }
+
+    pub fn mark_control_command_failed(&mut self, error: String) {
         self.state = RuntimeState::Error(error);
         self.publish_snapshot_event();
     }
@@ -613,7 +726,9 @@ impl RuntimeCore {
         self.last_auto_prompt_signature = None;
         self.waiting_for_assistant_progress = false;
         self.goal_synced_this_run = false;
+        self.goal_request_clear_failed_signature = None;
         self.trigger_now_clear_failed = false;
+        self.manual_prompt_requeue_error = None;
         self.state = RuntimeState::Stopped;
         self.probing_endpoint = None;
         self.counted_probe_inflight.clear();
@@ -637,6 +752,13 @@ impl RuntimeCore {
             *last = None;
         }
         self.publish_snapshot_event();
+    }
+
+    pub fn set_event_wakeup(&mut self, event_wakeup: Option<RuntimeEventWakeup>) {
+        self.event_wakeup = event_wakeup;
+        if let Some(agent) = self.agent.as_ref() {
+            agent.set_terminal_activity_wakeup(self.event_wakeup.clone());
+        }
     }
 
     pub fn snapshot(&self) -> RuntimeSnapshot {
@@ -743,27 +865,12 @@ impl RuntimeCore {
         &mut self,
         results: HashMap<String, ProbeResult>,
     ) -> Option<EndpointConfig> {
+        let now = Instant::now();
         for (name, result) in &results {
-            self.last_availability.insert(name.clone(), result.clone());
-            if result.request_made {
-                *self
-                    .request_count_by_endpoint
-                    .entry(name.clone())
-                    .or_default() += 1;
-                self.last_request_at_by_endpoint
-                    .insert(name.clone(), now_text());
-                self.last_status_code_by_endpoint
-                    .insert(name.clone(), result.status_code);
-            }
-            if !result.usage.is_empty() {
-                let entry = self
-                    .token_usage_by_endpoint
-                    .entry(name.clone())
-                    .or_default();
-                entry.input_tokens += result.usage.input_tokens;
-                entry.cached_input_tokens += result.usage.cached_input_tokens;
-                entry.output_tokens += result.usage.output_tokens;
-                entry.total_tokens += result.usage.total_tokens;
+            if let Some(endpoint) = self.endpoint_by_name(name).cloned() {
+                self.remember_single_probe_result(&endpoint, result, now);
+            } else {
+                self.last_availability.insert(name.clone(), result.clone());
             }
         }
 
@@ -788,28 +895,37 @@ impl RuntimeCore {
     pub fn set_fixed_endpoint(&mut self, name: Option<String>) {
         self.fixed_endpoint = name.filter(|value| !value.trim().is_empty());
         if let Some(config_path) = &self.config.config_path {
-            let _ = update_control_state(
+            match update_control_state(
                 config_path,
                 &[(
                     "fixed_endpoint",
                     serde_json::json!(self.fixed_endpoint.clone().unwrap_or_default()),
                 )],
-            );
+            ) {
+                Ok(_) => self.clear_control_save_error(),
+                Err(err) => self.set_control_save_error(format!("保存固定接口失败：{err}")),
+            }
+        } else {
+            self.clear_control_save_error();
         }
+        self.publish_snapshot_event();
     }
 
     pub fn set_force_probe_endpoint(&mut self, name: Option<String>) {
         self.force_probe_endpoint = name.filter(|value| !value.trim().is_empty());
         if let Some(config_path) = &self.config.config_path {
-            if let Err(err) = update_control_state(
+            match update_control_state(
                 config_path,
                 &[(
                     "force_probe_endpoint",
                     serde_json::json!(self.force_probe_endpoint.clone().unwrap_or_default()),
                 )],
             ) {
-                self.state = RuntimeState::Error(format!("保存强制探测接口失败：{err}"));
+                Ok(_) => self.clear_control_save_error(),
+                Err(err) => self.set_control_save_error(format!("保存强制探测接口失败：{err}")),
             }
+        } else {
+            self.clear_control_save_error();
         }
         self.publish_snapshot_event();
     }
@@ -843,6 +959,9 @@ impl RuntimeCore {
         }
 
         self.polluted_until.remove(name);
+        self.guard_polluted_until.remove(name);
+        self.guard_pollution_signal_by_endpoint.remove(name);
+        self.pollution_recovery_successes_by_endpoint.remove(name);
         if self.fixed_endpoint.as_deref() == Some(name) {
             self.fixed_endpoint = None;
         }
@@ -861,7 +980,7 @@ impl RuntimeCore {
         }
 
         if let Some(config_path) = &self.config.config_path {
-            let _ = update_control_state(
+            match update_control_state(
                 config_path,
                 &[
                     (
@@ -873,10 +992,23 @@ impl RuntimeCore {
                         serde_json::json!(self.force_probe_endpoint.clone().unwrap_or_default()),
                     ),
                 ],
-            );
+            ) {
+                Ok(_) => self.clear_control_save_error(),
+                Err(err) => self.set_control_save_error(format!("保存禁用接口状态失败：{err}")),
+            }
+        } else {
+            self.clear_control_save_error();
         }
         self.publish_snapshot_event();
         true
+    }
+
+    fn set_control_save_error(&mut self, error: String) {
+        self.control_save_error = Some(error);
+    }
+
+    fn clear_control_save_error(&mut self) {
+        self.control_save_error = None;
     }
 
     pub fn set_endpoint_guard_proxy_enabled(&mut self, name: &str, enabled: bool) -> bool {
@@ -893,7 +1025,13 @@ impl RuntimeCore {
             return true;
         }
 
+        let replaces_direct_pollution = endpoint.guard_proxy.replace_direct_pollution_detection;
         endpoint.guard_proxy.enabled = enabled;
+        if enabled && replaces_direct_pollution {
+            self.clear_replaced_direct_pollution_cooldown(name);
+        } else if !enabled {
+            self.clear_guard_pollution_cooldown(name);
+        }
         let should_restart_current = self.current_endpoint.as_deref() == Some(name);
         if should_restart_current {
             self.restart_agent();
@@ -996,14 +1134,13 @@ impl RuntimeCore {
         force_full_probe: bool,
     ) -> (Option<EndpointConfig>, HashMap<String, ProbeResult>) {
         if force_full_probe {
+            let endpoints = if current_failed {
+                self.enabled_by_weight()
+            } else {
+                self.enabled_by_weight_preferring_current_tier()
+            };
             return self
-                .find_first_available(
-                    probe,
-                    self.enabled_by_weight(),
-                    false,
-                    ProbeMode::Full,
-                    true,
-                )
+                .find_first_available(probe, endpoints, false, ProbeMode::Full, true)
                 .await;
         }
 
@@ -1011,6 +1148,7 @@ impl RuntimeCore {
             if let Some(endpoint) = self.endpoint_by_name(fixed_name).cloned() {
                 if self.current_endpoint.as_deref() == Some(endpoint.name.as_str())
                     && !current_failed
+                    && !self.pollution_cooldown_active(&endpoint.name, Instant::now())
                 {
                     let cached = self
                         .last_availability
@@ -1104,7 +1242,83 @@ impl RuntimeCore {
         if upgraded.is_some() {
             return (upgraded, availability);
         }
+        let already_checked = availability.keys().cloned().collect::<HashSet<_>>();
+        let recovery = self
+            .enabled_by_weight()
+            .into_iter()
+            .filter(|endpoint| endpoint.name != current)
+            .filter(|endpoint| !already_checked.contains(&endpoint.name))
+            .collect::<Vec<_>>();
+        let recovery_availability = self
+            .probe_due_unhealthy_endpoints(probe, recovery, ProbeMode::Full)
+            .await;
+        availability.extend(recovery_availability);
         (current_endpoint, availability)
+    }
+
+    async fn probe_due_unhealthy_endpoints(
+        &mut self,
+        probe: &HttpProbe,
+        endpoints: Vec<EndpointConfig>,
+        probe_mode: ProbeMode,
+    ) -> HashMap<String, ProbeResult> {
+        let mut availability = HashMap::new();
+        let now = Instant::now();
+        for endpoint in endpoints {
+            if self.hard_cooldown_result(&endpoint, now).is_some() {
+                continue;
+            }
+            if self.cooldown_result(&endpoint, now).is_some() {
+                continue;
+            }
+            if self
+                .next_probe_at
+                .get(&endpoint.name)
+                .is_some_and(|next| now < *next)
+            {
+                continue;
+            }
+            let should_probe = self
+                .last_availability
+                .get(&endpoint.name)
+                .is_some_and(|cached| {
+                    !cached.available
+                        || cached.polluted
+                        || cached.quota_limited
+                        || cached.retry_after_seconds.is_some()
+                });
+            if !should_probe {
+                continue;
+            }
+
+            self.mark_probe_started(&endpoint);
+            let result = self
+                .probe_endpoint_with_mode(probe, &endpoint, probe_mode)
+                .await;
+            self.remember_single_probe_result(&endpoint, &result, now);
+            self.counted_probe_inflight.remove(&endpoint.name);
+            if self.probing_endpoint.as_deref() == Some(endpoint.name.as_str()) {
+                self.probing_endpoint = None;
+            }
+            self.publish_snapshot_event();
+            availability.insert(endpoint.name.clone(), cached_probe_result(result));
+        }
+        availability
+    }
+
+    async fn probe_due_background_recovery(
+        &mut self,
+        probe: &HttpProbe,
+        current: &str,
+        probe_mode: ProbeMode,
+    ) -> HashMap<String, ProbeResult> {
+        let endpoints = self
+            .enabled_by_weight()
+            .into_iter()
+            .filter(|endpoint| endpoint.name != current)
+            .collect::<Vec<_>>();
+        self.probe_due_unhealthy_endpoints(probe, endpoints, probe_mode)
+            .await
     }
 
     async fn find_first_available(
@@ -1140,8 +1354,10 @@ impl RuntimeCore {
                     .map(cached_probe_result)
                 {
                     let available = cached.available;
+                    let selectable =
+                        available && !self.pollution_cooldown_active(&endpoint.name, now);
                     availability.insert(endpoint.name.clone(), cached);
-                    if available {
+                    if selectable {
                         return (Some(endpoint), availability);
                     }
                     if !ignore_cooldown {
@@ -1160,8 +1376,9 @@ impl RuntimeCore {
             }
             self.publish_snapshot_event();
             let available = result.available;
+            let selectable = available && !self.pollution_cooldown_active(&endpoint.name, now);
             availability.insert(endpoint.name.clone(), cached_probe_result(result));
-            if available {
+            if selectable {
                 return (Some(endpoint), availability);
             }
         }
@@ -1174,8 +1391,12 @@ impl RuntimeCore {
         endpoint: &EndpointConfig,
         probe_mode: ProbeMode,
     ) -> ProbeResult {
+        let recovering_pollution = self.pollution_cooldown_active(&endpoint.name, Instant::now());
         match probe_mode {
             ProbeMode::Full => probe.probe_endpoint(endpoint, &self.config).await,
+            ProbeMode::ModelsOnly if recovering_pollution => {
+                probe.probe_endpoint(endpoint, &self.config).await
+            }
             ProbeMode::ModelsOnly => {
                 let result = probe.probe_models_endpoint(endpoint).await;
                 if result.available || result.status_code != Some(200) {
@@ -1183,6 +1404,9 @@ impl RuntimeCore {
                 } else {
                     probe.probe_endpoint(endpoint, &self.config).await
                 }
+            }
+            ProbeMode::Upgrade if recovering_pollution => {
+                probe.probe_endpoint(endpoint, &self.config).await
             }
             ProbeMode::Upgrade => {
                 if crate::aggregate_egress::lookup_runtime(&endpoint.base_url).is_some() {
@@ -1206,6 +1430,8 @@ impl RuntimeCore {
         if endpoint.guard_proxy.enabled {
             let guard = start_guard_proxy_with_stable_port(&self.config, &endpoint)?;
             launch_endpoint.base_url = guard.local_base_url().map_err(|err| err.to_string())?;
+            self.guard_pollution_signal_by_endpoint
+                .remove(&endpoint.name);
             self.guard_proxy = Some(guard);
         }
         let mut agent = AgentProcess::new(
@@ -1242,8 +1468,11 @@ impl RuntimeCore {
         self.last_auto_prompt_signature = None;
         self.waiting_for_assistant_progress = false;
         self.goal_synced_this_run = false;
+        self.goal_request_clear_failed_signature = None;
         self.trigger_now_clear_failed = false;
+        self.manual_prompt_requeue_error = None;
         self.state = RuntimeState::Running;
+        agent.set_terminal_activity_wakeup(self.event_wakeup.clone());
         self.agent = Some(agent);
         self.publish_snapshot_event();
         Ok(())
@@ -1285,7 +1514,7 @@ impl RuntimeCore {
         {
             return None;
         }
-        if let Some(prompt) = control_state_goal_prompt(control_state) {
+        if let Some(prompt) = control_state_goal_prompt_for_config(&self.config, control_state) {
             return Some(prompt);
         }
         if should_resume_goal_runtime(&self.config, control_state) {
@@ -1322,7 +1551,13 @@ impl RuntimeCore {
                 return;
             };
             if agent.needs_submit_retry(self.config.prompt_submit_retry_seconds) {
-                let _ = agent.retry_submit();
+                if let Err(err) = agent.retry_submit() {
+                    agent.mark_current_turn_failed();
+                    self.waiting_for_assistant_progress = false;
+                    self.state = RuntimeState::Error(format!("重试提交失败：{err}"));
+                    self.publish_snapshot_event();
+                    return;
+                }
                 self.state = RuntimeState::Running;
                 return;
             }
@@ -1373,27 +1608,42 @@ impl RuntimeCore {
             self.trigger_now_clear_failed = false;
         }
         let trigger_now_requested = trigger_now && !self.trigger_now_clear_failed;
+        let goal_request_signature = control_state_goal_request_signature(&control_state);
+        if self.goal_request_clear_failed_signature.as_deref() != goal_request_signature.as_deref()
+        {
+            self.goal_request_clear_failed_signature = None;
+        }
         let auto_paused = control_state
             .get("auto_paused")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
-        let goal_enabled = control_state
-            .get("goal_enabled")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let explicit_goal_prompt = control_state_goal_prompt(&control_state);
+        let goal_enabled = goal_mode_enabled_runtime(&self.config, &control_state);
+        let goal_request_clear_failed =
+            goal_request_signature.as_deref().is_some_and(|signature| {
+                self.goal_request_clear_failed_signature.as_deref() == Some(signature)
+            });
+        let explicit_goal_prompt = (!goal_request_clear_failed)
+            .then(|| control_state_goal_prompt_for_config(&self.config, &control_state))
+            .flatten();
+        let explicit_goal_request_signature = explicit_goal_prompt
+            .is_some()
+            .then(|| goal_request_signature.clone())
+            .flatten();
         if goal_enabled
             && self.pending_goal_prompt.is_none()
             && (!self.goal_synced_this_run || explicit_goal_prompt.is_some())
         {
-            self.pending_goal_prompt = explicit_goal_prompt
-                .or_else(|| self.goal_prompt_for_active_session(&control_state));
+            let fallback_goal_prompt = if goal_request_clear_failed {
+                self.goal_prompt_for_active_session(&control_state_without_goal_request(
+                    &control_state,
+                ))
+            } else {
+                self.goal_prompt_for_active_session(&control_state)
+            };
+            self.pending_goal_prompt = explicit_goal_prompt.or(fallback_goal_prompt);
             if self.pending_goal_prompt.is_some() {
-                if let Some(config_path) = &self.config.config_path {
-                    let _ = update_control_state(
-                        config_path,
-                        &[("goal_request", serde_json::Value::Null)],
-                    );
+                if let Some(signature) = explicit_goal_request_signature {
+                    self.clear_goal_request_control_state(signature);
                 }
             }
         }
@@ -1410,9 +1660,7 @@ impl RuntimeCore {
             || (!auto_paused && (self.pending_initial_prompt.is_some() || can_send_by_interval));
         if !can_send_prompt {
             if let Some(prompt) = manual_prompt.as_ref() {
-                if let Some(config_path) = &self.config.config_path {
-                    let _ = enqueue_manual_prompt(config_path, prompt);
-                }
+                self.requeue_manual_prompt(prompt);
             }
             if automatic_requested || manual_prompt.is_some() {
                 let reason = input_block_reason.unwrap_or("终端未就绪");
@@ -1457,9 +1705,7 @@ impl RuntimeCore {
         }
         let Some(agent) = self.agent.as_mut() else {
             if is_manual {
-                if let Some(config_path) = &self.config.config_path {
-                    let _ = enqueue_manual_prompt(config_path, &prompt);
-                }
+                self.requeue_manual_prompt(&prompt);
             } else if restore_goal_prompt {
                 self.pending_goal_prompt = Some(prompt);
             } else if restore_initial_prompt {
@@ -1497,16 +1743,35 @@ impl RuntimeCore {
             self.state = cleanup_error
                 .map(RuntimeState::Error)
                 .unwrap_or(RuntimeState::Running);
-        } else if is_manual {
-            if let Some(config_path) = &self.config.config_path {
-                let _ = enqueue_manual_prompt(config_path, &prompt);
+            if is_manual {
+                self.manual_prompt_requeue_error = None;
             }
+        } else if is_manual {
+            self.requeue_manual_prompt(&prompt);
         } else if restore_goal_prompt {
             self.pending_goal_prompt = Some(prompt);
         } else if restore_initial_prompt {
             self.pending_initial_prompt = Some(prompt);
         }
         self.publish_snapshot_event();
+    }
+
+    fn requeue_manual_prompt(&mut self, prompt: &str) -> bool {
+        let previous_error = self.manual_prompt_requeue_error.clone();
+        let result = if let Some(config_path) = &self.config.config_path {
+            enqueue_manual_prompt(config_path, prompt)
+                .map_err(|err| format!("恢复手动提示失败：{err}"))
+        } else {
+            Err("恢复手动提示失败：未设置配置路径".to_string())
+        };
+        match result {
+            Ok(()) => self.manual_prompt_requeue_error = None,
+            Err(err) => self.manual_prompt_requeue_error = Some(err),
+        }
+        if previous_error != self.manual_prompt_requeue_error {
+            self.publish_snapshot_event();
+        }
+        self.manual_prompt_requeue_error.is_none()
     }
 
     fn record_agent_usage(&mut self, endpoint: &EndpointConfig) {
@@ -1553,11 +1818,7 @@ impl RuntimeCore {
     }
 
     fn disable_goal_mode_after_completed_turn(&mut self) {
-        let Some(config_path) = &self.config.config_path else {
-            return;
-        };
-        let _ = update_control_state(
-            config_path,
+        self.update_goal_control_state(
             &[
                 ("goal_enabled", serde_json::json!(false)),
                 ("goal_completed", serde_json::json!(true)),
@@ -1571,15 +1832,12 @@ impl RuntimeCore {
                 ),
                 ("goal_request", serde_json::Value::Null),
             ],
+            "保存目标完成状态失败",
         );
     }
 
     fn mark_goal_synced(&mut self) {
-        let Some(config_path) = &self.config.config_path else {
-            return;
-        };
-        let _ = update_control_state(
-            config_path,
+        self.update_goal_control_state(
             &[
                 (
                     "goal_synced_revision",
@@ -1598,8 +1856,45 @@ impl RuntimeCore {
                     serde_json::json!(self.config.agent_goal.source),
                 ),
                 ("goal_completed", serde_json::json!(false)),
+                ("goal_request", serde_json::Value::Null),
             ],
+            "保存目标同步状态失败",
         );
+    }
+
+    fn clear_goal_request_control_state(&mut self, signature: String) {
+        if self.update_goal_control_state(
+            &[("goal_request", serde_json::Value::Null)],
+            "清理目标请求失败",
+        ) {
+            self.goal_request_clear_failed_signature = None;
+        } else {
+            self.goal_request_clear_failed_signature = Some(signature);
+        }
+    }
+
+    fn update_goal_control_state(&mut self, updates: &[(&str, Value)], error_prefix: &str) -> bool {
+        let Some(config_path) = &self.config.config_path else {
+            self.clear_control_save_error();
+            return true;
+        };
+        let previous_error = self.control_save_error.clone();
+        match update_control_state(config_path, updates) {
+            Ok(_) => {
+                self.clear_control_save_error();
+                if previous_error != self.control_save_error {
+                    self.publish_snapshot_event();
+                }
+                true
+            }
+            Err(err) => {
+                self.set_control_save_error(format!("{error_prefix}：{err}"));
+                if previous_error != self.control_save_error {
+                    self.publish_snapshot_event();
+                }
+                false
+            }
+        }
     }
 
     fn save_usage_state(&mut self) -> bool {
@@ -1667,6 +1962,48 @@ impl RuntimeCore {
             .is_some_and(|guard| !guard.is_listening())
     }
 
+    fn record_current_guard_pollution_signal(
+        &mut self,
+        endpoint_name: &str,
+        overrides: &mut HashMap<String, ProbeResult>,
+    ) -> bool {
+        let Some(endpoint) = self.endpoint_by_name(endpoint_name).cloned() else {
+            return false;
+        };
+        let Some(audit) = self
+            .guard_proxy
+            .as_ref()
+            .filter(|guard| guard.endpoint_name() == endpoint.name)
+            .map(|guard| guard.audit_snapshot())
+        else {
+            return false;
+        };
+        let previous_signal = self
+            .guard_pollution_signal_by_endpoint
+            .get(&endpoint.name)
+            .copied();
+        let Some((signal, error)) =
+            guard_audit_endpoint_pollution_signal(&audit, &endpoint.guard_proxy, previous_signal)
+        else {
+            return false;
+        };
+
+        overrides.insert(
+            endpoint.name.clone(),
+            ProbeResult {
+                available: false,
+                polluted: true,
+                request_made: false,
+                error,
+                ..Default::default()
+            },
+        );
+        self.guard_pollution_signal_by_endpoint
+            .insert(endpoint.name.clone(), signal);
+        self.mark_endpoint_guard_polluted(&endpoint.name);
+        true
+    }
+
     fn startup_failure_retry_seconds(&self) -> f64 {
         self.config.probe_interval_seconds.clamp(2.0, 8.0)
     }
@@ -1710,6 +2047,42 @@ impl RuntimeCore {
             .collect();
         endpoints.sort_by_key(|endpoint| std::cmp::Reverse(endpoint.weight));
         endpoints
+    }
+
+    fn enabled_by_weight_preferring_current_tier(&self) -> Vec<EndpointConfig> {
+        let current = self.current_endpoint.as_deref();
+        let mut endpoints = self.enabled_by_weight();
+        endpoints.sort_by_key(|endpoint| {
+            (
+                std::cmp::Reverse(endpoint.weight),
+                current != Some(endpoint.name.as_str()),
+            )
+        });
+        endpoints
+    }
+
+    fn running_single_current_endpoint_without_cooldown(
+        &self,
+        availability: &HashMap<String, ProbeResult>,
+    ) -> Option<EndpointConfig> {
+        let current = self.current_endpoint.as_deref()?;
+        let endpoint = self.endpoint_by_name(current)?.clone();
+        if self.enabled_by_weight().len() != 1 {
+            return None;
+        }
+        if availability
+            .get(current)
+            .is_some_and(|result| result.polluted)
+        {
+            return None;
+        }
+        if self.pollution_cooldown_active(&endpoint.name, Instant::now()) {
+            return None;
+        }
+        if !self.agent.as_ref().is_some_and(AgentProcess::is_running) {
+            return None;
+        }
+        Some(endpoint)
     }
 
     fn remember_probe_results(&mut self, results: HashMap<String, ProbeResult>) {
@@ -1761,6 +2134,10 @@ impl RuntimeCore {
             self.clear_endpoint_request_failures(&endpoint.name);
             self.endpoint_auto_prompt_blocked_until
                 .remove(&endpoint.name);
+            self.record_pollution_recovery_success(&endpoint.name, now);
+        } else if result.request_made && !result.available {
+            self.pollution_recovery_successes_by_endpoint
+                .remove(&endpoint.name);
         }
         if let Some(seconds) = result.retry_after_seconds {
             self.endpoint_auto_prompt_blocked_until
@@ -1773,9 +2150,12 @@ impl RuntimeCore {
                 .or_default();
             *entry = *entry + result.usage;
         }
+        let recovering_pollution = self.pollution_cooldown_active(&endpoint.name, now);
         let next = if let Some(seconds) = result.retry_after_seconds {
             now + Duration::from_secs(seconds)
-        } else if result.polluted || result.quota_limited {
+        } else if result.polluted || (result.available && recovering_pollution) {
+            now + Duration::from_secs_f64(self.config.probe_interval_seconds)
+        } else if result.quota_limited {
             now + Duration::from_secs_f64(self.config.polluted_endpoint_cooldown_seconds)
         } else if result.available {
             now + Duration::from_secs_f64(
@@ -1789,6 +2169,49 @@ impl RuntimeCore {
         self.next_probe_at.insert(endpoint.name.clone(), next);
     }
 
+    fn record_pollution_recovery_success(&mut self, endpoint_name: &str, now: Instant) {
+        if !self.pollution_cooldown_active(endpoint_name, now) {
+            self.clear_pollution_recovery(endpoint_name);
+            return;
+        }
+        let threshold = self.pollution_recovery_threshold();
+        let successes = self
+            .pollution_recovery_successes_by_endpoint
+            .entry(endpoint_name.to_string())
+            .or_default();
+        *successes += 1;
+        if *successes >= threshold {
+            self.clear_pollution_recovery(endpoint_name);
+        }
+    }
+
+    fn pollution_recovery_threshold(&self) -> u32 {
+        self.config.endpoint_recovery_threshold.max(3)
+    }
+
+    fn pollution_cooldown_active(&self, endpoint_name: &str, now: Instant) -> bool {
+        self.polluted_until
+            .get(endpoint_name)
+            .is_some_and(|until| now < *until)
+            || self
+                .guard_polluted_until
+                .get(endpoint_name)
+                .is_some_and(|until| now < *until)
+    }
+
+    fn pollution_recovery_probe_due(&self, endpoint_name: &str, now: Instant) -> bool {
+        self.next_probe_at
+            .get(endpoint_name)
+            .is_none_or(|next| now >= *next)
+    }
+
+    fn clear_pollution_recovery(&mut self, endpoint_name: &str) {
+        self.polluted_until.remove(endpoint_name);
+        self.guard_polluted_until.remove(endpoint_name);
+        self.pollution_recovery_successes_by_endpoint
+            .remove(endpoint_name);
+    }
+
     fn cooldown_result(&mut self, endpoint: &EndpointConfig, now: Instant) -> Option<ProbeResult> {
         if let Some(until) = self.startup_failed_until.get(&endpoint.name).copied() {
             if now < until {
@@ -1797,11 +2220,28 @@ impl RuntimeCore {
             self.startup_failed_until.remove(&endpoint.name);
             self.startup_failure_error.remove(&endpoint.name);
         }
+        if let Some(until) = self.guard_polluted_until.get(&endpoint.name).copied() {
+            if now < until {
+                if self.pollution_recovery_probe_due(&endpoint.name, now) {
+                    return None;
+                }
+                return Some(ProbeResult::synthetic_polluted());
+            }
+            self.guard_polluted_until.remove(&endpoint.name);
+        }
+        if guard_replaces_direct_pollution_detection(endpoint) {
+            self.clear_replaced_direct_pollution_cooldown(&endpoint.name);
+        }
         if let Some(until) = self.polluted_until.get(&endpoint.name).copied() {
             if now < until {
+                if self.pollution_recovery_probe_due(&endpoint.name, now) {
+                    return None;
+                }
                 return Some(ProbeResult::synthetic_polluted());
             }
             self.polluted_until.remove(&endpoint.name);
+            self.pollution_recovery_successes_by_endpoint
+                .remove(&endpoint.name);
         }
         let cached = self.last_availability.get(&endpoint.name)?;
         if !(cached.polluted || cached.quota_limited || cached.retry_after_seconds.is_some()) {
@@ -1818,35 +2258,141 @@ impl RuntimeCore {
     }
 
     fn hard_cooldown_result(&self, endpoint: &EndpointConfig, now: Instant) -> Option<ProbeResult> {
-        let cached = self.last_availability.get(&endpoint.name)?;
-        cached.retry_after_seconds?;
+        if let Some(cached) = self.last_availability.get(&endpoint.name) {
+            if cached.retry_after_seconds.is_some()
+                && self
+                    .next_probe_at
+                    .get(&endpoint.name)
+                    .is_some_and(|next| now < *next)
+            {
+                return Some(cached_probe_result(cached.clone()));
+            }
+        }
         if self
-            .next_probe_at
+            .guard_polluted_until
             .get(&endpoint.name)
-            .is_some_and(|next| now < *next)
+            .is_some_and(|until| now < *until)
         {
-            return Some(cached_probe_result(cached.clone()));
+            if self.pollution_recovery_probe_due(&endpoint.name, now) {
+                return None;
+            }
+            return Some(ProbeResult::synthetic_polluted());
+        }
+        if self
+            .polluted_until
+            .get(&endpoint.name)
+            .is_some_and(|until| now < *until)
+        {
+            if self.pollution_recovery_probe_due(&endpoint.name, now) {
+                return None;
+            }
+            return Some(ProbeResult::synthetic_polluted());
         }
         None
     }
 
     fn mark_endpoint_polluted(&mut self, endpoint_name: &str) {
+        let now = Instant::now();
         self.polluted_until.insert(
             endpoint_name.to_string(),
-            Instant::now()
-                + Duration::from_secs_f64(self.config.polluted_endpoint_cooldown_seconds),
+            now + Duration::from_secs_f64(self.config.polluted_endpoint_cooldown_seconds),
+        );
+        self.pollution_recovery_successes_by_endpoint
+            .insert(endpoint_name.to_string(), 0);
+        self.schedule_pollution_recovery_probe(endpoint_name, now);
+    }
+
+    fn mark_endpoint_guard_polluted(&mut self, endpoint_name: &str) {
+        let now = Instant::now();
+        let until =
+            now + Duration::from_secs_f64(self.guard_polluted_cooldown_seconds(endpoint_name));
+        self.polluted_until.insert(endpoint_name.to_string(), until);
+        self.guard_polluted_until
+            .insert(endpoint_name.to_string(), until);
+        self.pollution_recovery_successes_by_endpoint
+            .insert(endpoint_name.to_string(), 0);
+        self.schedule_pollution_recovery_probe(endpoint_name, now);
+    }
+
+    fn schedule_pollution_recovery_probe(&mut self, endpoint_name: &str, now: Instant) {
+        let next_due = now + Duration::from_secs_f64(self.config.probe_interval_seconds);
+        self.next_probe_at
+            .entry(endpoint_name.to_string())
+            .and_modify(|current| {
+                if *current > next_due {
+                    *current = next_due;
+                }
+            })
+            .or_insert(next_due);
+    }
+
+    fn guard_polluted_cooldown_seconds(&self, endpoint_name: &str) -> f64 {
+        self.endpoint_by_name(endpoint_name)
+            .map(|endpoint| endpoint.guard_proxy.polluted_cooldown_seconds)
+            .unwrap_or(self.config.polluted_endpoint_cooldown_seconds)
+    }
+
+    fn clear_guard_pollution_cooldown(&mut self, endpoint_name: &str) {
+        self.guard_pollution_signal_by_endpoint
+            .remove(endpoint_name);
+        if self.guard_polluted_until.remove(endpoint_name).is_none() {
+            return;
+        }
+        self.polluted_until.remove(endpoint_name);
+        self.pollution_recovery_successes_by_endpoint
+            .remove(endpoint_name);
+        self.next_probe_at.remove(endpoint_name);
+        self.last_availability
+            .insert(endpoint_name.to_string(), ProbeResult::cached_available());
+        self.health.reset(endpoint_name);
+        self.health.update(
+            &self.config.endpoints,
+            &HashMap::from([(endpoint_name.to_string(), ProbeResult::cached_available())]),
+        );
+    }
+
+    fn clear_replaced_direct_pollution_cooldown(&mut self, endpoint_name: &str) {
+        if self.guard_polluted_until.contains_key(endpoint_name) {
+            return;
+        }
+        let direct_polluted = self.polluted_until.remove(endpoint_name).is_some()
+            || self
+                .last_availability
+                .get(endpoint_name)
+                .is_some_and(|result| result.polluted);
+        if !direct_polluted {
+            return;
+        }
+        self.next_probe_at.remove(endpoint_name);
+        self.pollution_recovery_successes_by_endpoint
+            .remove(endpoint_name);
+        self.last_availability
+            .insert(endpoint_name.to_string(), ProbeResult::cached_available());
+        self.health.reset(endpoint_name);
+        self.health.update(
+            &self.config.endpoints,
+            &HashMap::from([(endpoint_name.to_string(), ProbeResult::cached_available())]),
         );
     }
 
     fn select_from_effective(&self, effective: &HashMap<String, bool>) -> Option<&EndpointConfig> {
+        let now = Instant::now();
         if let Some(fixed_name) = &self.fixed_endpoint {
             return self.config.endpoints.iter().find(|endpoint| {
                 endpoint.enabled
                     && endpoint.name == *fixed_name
                     && effective.get(&endpoint.name).copied().unwrap_or(false)
+                    && !self.pollution_cooldown_active(&endpoint.name, now)
             });
         }
-        choose_best_endpoint(&self.config.endpoints, effective)
+        self.config
+            .endpoints
+            .iter()
+            .filter(|endpoint| {
+                endpoint.enabled && effective.get(&endpoint.name).copied().unwrap_or(false)
+            })
+            .filter(|endpoint| !self.pollution_cooldown_active(&endpoint.name, now))
+            .max_by_key(|endpoint| endpoint.weight)
     }
 
     fn request_status_label(&self, endpoint: &EndpointConfig, selected: bool) -> String {
@@ -1887,11 +2433,20 @@ impl RuntimeCore {
                     .last_upstream_error
                     .as_deref()
                     .filter(|error| !error.trim().is_empty())
-                    .map(|error| format!(" 错误{}", error))
+                    .map(|error| format!(" 错误{}", guard_upstream_error_display(error)))
+                    .unwrap_or_default();
+                let filtered_preview = audit
+                    .last_filtered_response_preview
+                    .as_deref()
+                    .filter(|preview| !preview.trim().is_empty())
+                    .map(|preview| {
+                        format!(" 预览{}", guard_filtered_response_preview_display(preview))
+                    })
                     .unwrap_or_default();
                 format!(
-                    " | 保护 请求{} 污染{} 高危替换{} 连续高危{} 过滤{} 脱敏{}",
+                    " | 保护 请求{} 命中{} 污染{} 高危替换{} 连续高危{} 过滤{} 脱敏{}",
                     audit.requests,
+                    guard_keyword_hit_count(audit),
                     audit.pollution_failures,
                     audit.high_risk_replacements,
                     audit.consecutive_high_risk,
@@ -1899,6 +2454,7 @@ impl RuntimeCore {
                     audit.redactions
                 ) + &upstream
                     + &error
+                    + &filtered_preview
             })
             .unwrap_or_default();
         let startup_error = self
@@ -1911,6 +2467,9 @@ impl RuntimeCore {
         if let Some(error) = startup_error {
             return format!("启动失败: {error}{guard_suffix}");
         }
+        if let Some(status) = self.pollution_recovery_status_label(&endpoint.name, now) {
+            return format!("{status}{guard_suffix}");
+        }
         if let Some(status) = guard_audit
             .as_ref()
             .and_then(|audit| audit.last_upstream_status)
@@ -1920,9 +2479,15 @@ impl RuntimeCore {
                 .as_ref()
                 .and_then(|audit| audit.last_upstream_error.as_deref())
                 .filter(|error| !error.trim().is_empty())
-                .map(|error| format!(": {error}"))
+                .map(|error| format!(": {}", guard_upstream_error_display(error)))
                 .unwrap_or_default();
             return format!("不可用: HTTP {status}{error}{guard_suffix}");
+        }
+        if let Some(error) = guard_audit.as_ref().and_then(guard_upstream_failure_error) {
+            return format!(
+                "不可用: {}{guard_suffix}",
+                guard_upstream_error_display(error)
+            );
         }
         if let Some(failures) = self
             .endpoint_request_failures_by_endpoint
@@ -1961,6 +2526,25 @@ impl RuntimeCore {
             return format!("{label}: {error}{guard_suffix}");
         }
         format!("{label}{guard_suffix}")
+    }
+
+    fn pollution_recovery_status_label(&self, endpoint_name: &str, now: Instant) -> Option<String> {
+        if !self.pollution_cooldown_active(endpoint_name, now) {
+            return None;
+        }
+        let successes = self
+            .pollution_recovery_successes_by_endpoint
+            .get(endpoint_name)
+            .copied()
+            .unwrap_or_default();
+        if successes == 0 {
+            return Some("污染不可用".to_string());
+        }
+        Some(format!(
+            "污染恢复中 {}/{}",
+            successes,
+            self.pollution_recovery_threshold()
+        ))
     }
 
     fn sync_control_state(&mut self) {
@@ -2012,6 +2596,44 @@ impl RuntimeCore {
             self.config.endpoint_failure_threshold.max(1)
         ));
         *entry >= self.config.endpoint_failure_threshold.max(1)
+    }
+
+    fn endpoint_request_failure_threshold_reached(&self, endpoint_name: &str) -> bool {
+        self.endpoint_request_failures_by_endpoint
+            .get(endpoint_name)
+            .copied()
+            .unwrap_or_default()
+            >= self.config.endpoint_failure_threshold.max(1)
+    }
+
+    fn endpoint_request_failure_state_text(&self, endpoint_name: &str) -> String {
+        let failures = self
+            .endpoint_request_failures_by_endpoint
+            .get(endpoint_name)
+            .copied()
+            .unwrap_or_default();
+        format!(
+            "请求失败 {}/{}",
+            failures,
+            self.config.endpoint_failure_threshold.max(1)
+        )
+    }
+
+    fn clear_endpoint_request_failures_on_session_success(&mut self, endpoint_name: &str) -> bool {
+        let Some(endpoint) = self.endpoint_by_name(endpoint_name).cloned() else {
+            return false;
+        };
+        let Some(agent) = self.agent.as_mut() else {
+            return false;
+        };
+        let _ = agent.capture_session_id(&endpoint.workdir);
+        if !agent.has_session_assistant_message_since_prompt() {
+            return false;
+        }
+        self.clear_endpoint_request_failures(endpoint_name);
+        self.endpoint_auto_prompt_blocked_until
+            .remove(endpoint_name);
+        true
     }
 
     fn auto_prompt_blocked_by_endpoint_cooldown(&mut self, endpoint_name: &str) -> bool {
@@ -2111,10 +2733,26 @@ impl RuntimeCore {
             RuntimeState::WaitingInput(reason) => format!("等待可输入：{reason}"),
             RuntimeState::Error(error) => format!("异常：{error}"),
         };
-        match self.usage_save_error.as_deref() {
-            Some(error) if !error.trim().is_empty() => format!("{base} | {error}"),
-            _ => base,
+        let mut label = base;
+        if let Some(error) = self.control_save_error.as_deref() {
+            if !error.trim().is_empty() {
+                label.push_str(" | ");
+                label.push_str(error);
+            }
         }
+        if let Some(error) = self.usage_save_error.as_deref() {
+            if !error.trim().is_empty() {
+                label.push_str(" | ");
+                label.push_str(error);
+            }
+        }
+        if let Some(error) = self.manual_prompt_requeue_error.as_deref() {
+            if !error.trim().is_empty() {
+                label.push_str(" | ");
+                label.push_str(error);
+            }
+        }
+        label
     }
 
     fn publish_snapshot_event(&self) {
@@ -2134,7 +2772,11 @@ impl RuntimeCore {
                 }
                 *last = Some(snapshot.clone());
             }
-            let _ = tx.send(RuntimeEvent::Snapshot(snapshot));
+            if tx.send(RuntimeEvent::Snapshot(snapshot)).is_ok() {
+                if let Some(wakeup) = &self.event_wakeup {
+                    wakeup();
+                }
+            }
         }
     }
 }
@@ -2207,6 +2849,79 @@ fn probe_result_status_label(result: &ProbeResult) -> String {
     format!("{status} 不可用")
 }
 
+fn guard_upstream_failure_error(audit: &GuardAuditSnapshot) -> Option<&str> {
+    if audit.upstream_failures == 0 {
+        return None;
+    }
+    audit
+        .last_upstream_error
+        .as_deref()
+        .filter(|error| !error.trim().is_empty())
+}
+
+fn guard_keyword_hit_count(audit: &GuardAuditSnapshot) -> u64 {
+    audit.keyword_hits.values().copied().sum()
+}
+
+fn guard_replaces_direct_pollution_detection(endpoint: &EndpointConfig) -> bool {
+    endpoint.guard_proxy.enabled && endpoint.guard_proxy.replace_direct_pollution_detection
+}
+
+fn guard_audit_endpoint_pollution_signal(
+    audit: &GuardAuditSnapshot,
+    config: &crate::config::GuardProxyConfig,
+    previous: Option<GuardPollutionSignal>,
+) -> Option<(GuardPollutionSignal, String)> {
+    let current = GuardPollutionSignal {
+        pollution_failures: audit.pollution_failures,
+        high_risk_replacements: audit.high_risk_replacements,
+    };
+    let previous = previous.unwrap_or_default();
+    if current.pollution_failures > previous.pollution_failures {
+        return Some((current, "保护层污染响应".to_string()));
+    }
+    let threshold = config.high_risk_failure_threshold.max(1);
+    if audit.consecutive_high_risk >= threshold
+        && current.high_risk_replacements > previous.high_risk_replacements
+    {
+        return Some((
+            current,
+            format!(
+                "保护层连续高危 {}/{}",
+                audit.consecutive_high_risk, threshold
+            ),
+        ));
+    }
+    None
+}
+
+fn guard_filtered_response_preview_display(preview: &str) -> String {
+    let clean = preview.split_whitespace().collect::<Vec<_>>().join(" ");
+    if clean.chars().count() <= 80 {
+        return clean;
+    }
+    let mut out = clean.chars().take(79).collect::<String>();
+    out.push('…');
+    out
+}
+
+fn guard_upstream_error_display(error: &str) -> String {
+    let trimmed = error.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("stream upstream closed before response.completed") {
+        return "上游流提前断开，未收到 response.completed".to_string();
+    }
+    if lower.contains("stream upstream interrupted after partial response")
+        || lower.contains("stream upstream interrupted before completion")
+    {
+        return "上游流中断，响应未完整结束".to_string();
+    }
+    if lower.contains("invalid_encrypted_content") || lower.contains("encrypted content") {
+        return "会话加密内容失效，需新会话或去除 encrypted_content 重试".to_string();
+    }
+    trimmed.to_string()
+}
+
 fn cached_probe_result(mut result: ProbeResult) -> ProbeResult {
     result.request_made = false;
     result.usage = TokenUsage::default();
@@ -2246,6 +2961,9 @@ fn completed_imported_goal_matches_runtime(config: &AppConfig, state: &Value) ->
 }
 
 fn should_resume_goal_runtime(config: &AppConfig, state: &Value) -> bool {
+    if !goal_config_ready_runtime(config) {
+        return false;
+    }
     if completed_imported_goal_matches_runtime(config, state) {
         return false;
     }
@@ -2282,6 +3000,41 @@ fn synced_goal_matches_current_runtime(config: &AppConfig, state: &Value) -> boo
         .trim();
     !synced_text.is_empty() && synced_text == config.agent_goal.text.trim()
 }
+
+fn goal_config_ready_runtime(config: &AppConfig) -> bool {
+    config.agent_goal.enabled && !config.agent_goal.text.trim().is_empty()
+}
+
+fn goal_mode_enabled_runtime(config: &AppConfig, state: &Value) -> bool {
+    goal_config_ready_runtime(config)
+        && state
+            .get("goal_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+fn control_state_goal_prompt_for_config(config: &AppConfig, state: &Value) -> Option<String> {
+    if !goal_config_ready_runtime(config) {
+        return None;
+    }
+    control_state_goal_prompt(state)
+}
+
+fn control_state_without_goal_request(state: &Value) -> Value {
+    let mut state = state.clone();
+    if let Some(map) = state.as_object_mut() {
+        map.remove("goal_request");
+    }
+    state
+}
+
+fn control_state_goal_request_signature(state: &Value) -> Option<String> {
+    state
+        .get("goal_request")
+        .filter(|request| !request.is_null())
+        .map(|request| serde_json::to_string(request).unwrap_or_else(|_| request.to_string()))
+}
+
 fn control_state_goal_prompt(state: &Value) -> Option<String> {
     let request = state.get("goal_request")?;
     let action = request
@@ -2456,7 +3209,91 @@ fn load_usage_state(path: &PathBuf) -> HashMap<String, TokenUsage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    fn block_control_state_path(config_path: &Path) -> PathBuf {
+        let control_path = crate::control::control_state_path(config_path);
+        unblock_control_state_path(&control_path);
+        std::fs::create_dir_all(&control_path).unwrap();
+        control_path
+    }
+
+    fn unblock_control_state_path(path: &Path) {
+        if path.is_dir() {
+            std::fs::remove_dir_all(path).unwrap();
+        } else if path.exists() {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    fn read_test_http_request(socket: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        let _ = socket.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match socket.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(size) => {
+                    request.extend_from_slice(&buffer[..size]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n")
+                        || request.len() >= 8192
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
+    fn start_test_json_upstream(body: &'static str) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::thread;
+
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let _ = read_test_http_request(&mut socket);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).unwrap();
+        });
+        (port, handle)
+    }
+
+    fn send_test_guard_chat_request(port: u16) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let body = r#"{"model":"gpt-test","messages":[{"role":"user","content":"hello"}]}"#;
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: local\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    fn attach_test_guard_proxy(runtime: &mut RuntimeCore, endpoint: &EndpointConfig) -> u16 {
+        let mut guard = GuardProxyServer::new(endpoint.clone());
+        guard.start().unwrap();
+        let base_url = guard.local_base_url().unwrap();
+        let port = url::Url::parse(&base_url).unwrap().port().unwrap();
+        runtime.guard_proxy = Some(guard);
+        port
+    }
 
     fn endpoint(name: &str, weight: i64) -> EndpointConfig {
         EndpointConfig {
@@ -2517,6 +3354,23 @@ mod tests {
         }
     }
 
+    fn long_running_test_command() -> crate::config::AgentCommand {
+        if cfg!(windows) {
+            crate::config::AgentCommand::Args(vec![
+                "cmd.exe".to_string(),
+                "/d".to_string(),
+                "/c".to_string(),
+                "ping -n 30 127.0.0.1 >nul".to_string(),
+            ])
+        } else {
+            crate::config::AgentCommand::Args(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "sleep 30".to_string(),
+            ])
+        }
+    }
+
     #[test]
     fn selects_highest_available_endpoint_and_builds_rows() {
         let mut runtime = RuntimeCore::new(config());
@@ -2570,6 +3424,123 @@ mod tests {
     }
 
     #[test]
+    fn disabling_guard_proxy_clears_guard_polluted_cooldown() {
+        let mut cfg = config();
+        cfg.endpoint_recovery_threshold = 2;
+        cfg.endpoints[0].guard_proxy.enabled = true;
+        cfg.endpoints[0].guard_proxy.polluted_cooldown_seconds = 120.0;
+        let mut runtime = RuntimeCore::new(cfg);
+        let endpoint = runtime.config.endpoints[0].clone();
+        runtime.remember_single_probe_result(
+            &endpoint,
+            &ProbeResult::synthetic_polluted(),
+            Instant::now(),
+        );
+        runtime.mark_endpoint_guard_polluted(&endpoint.name);
+        runtime.health.update(
+            &runtime.config.endpoints,
+            &HashMap::from([(endpoint.name.clone(), ProbeResult::synthetic_polluted())]),
+        );
+
+        assert!(runtime.cooldown_result(&endpoint, Instant::now()).is_some());
+        assert_eq!(runtime.rows()[0].request_status, "污染不可用");
+
+        assert!(runtime.set_endpoint_guard_proxy_enabled(&endpoint.name, false));
+
+        assert!(!runtime.guard_polluted_until.contains_key(&endpoint.name));
+        assert!(!runtime.polluted_until.contains_key(&endpoint.name));
+        assert!(!runtime.next_probe_at.contains_key(&endpoint.name));
+        assert!(runtime.cooldown_result(&endpoint, Instant::now()).is_none());
+        assert_eq!(runtime.rows()[0].request_status, "正常");
+    }
+
+    #[test]
+    fn enabling_guard_replacement_clears_direct_polluted_cooldown() {
+        let mut cfg = config();
+        cfg.endpoint_recovery_threshold = 2;
+        cfg.endpoints[0].guard_proxy.enabled = false;
+        cfg.endpoints[0]
+            .guard_proxy
+            .replace_direct_pollution_detection = true;
+        let mut runtime = RuntimeCore::new(cfg);
+        let endpoint = runtime.config.endpoints[0].clone();
+        runtime.remember_single_probe_result(
+            &endpoint,
+            &ProbeResult::synthetic_polluted(),
+            Instant::now(),
+        );
+        runtime.mark_endpoint_polluted(&endpoint.name);
+        runtime.health.update(
+            &runtime.config.endpoints,
+            &HashMap::from([(endpoint.name.clone(), ProbeResult::synthetic_polluted())]),
+        );
+
+        assert!(runtime.cooldown_result(&endpoint, Instant::now()).is_some());
+        assert_eq!(runtime.rows()[0].request_status, "污染不可用");
+
+        assert!(runtime.set_endpoint_guard_proxy_enabled(&endpoint.name, true));
+
+        assert!(!runtime.polluted_until.contains_key(&endpoint.name));
+        assert!(!runtime.next_probe_at.contains_key(&endpoint.name));
+        assert!(runtime.cooldown_result(&endpoint, Instant::now()).is_none());
+        assert_eq!(runtime.rows()[0].request_status, "正常");
+    }
+
+    #[test]
+    fn enabling_guard_fallback_keeps_direct_polluted_cooldown() {
+        let mut cfg = config();
+        cfg.endpoints[0].guard_proxy.enabled = false;
+        cfg.endpoints[0]
+            .guard_proxy
+            .replace_direct_pollution_detection = false;
+        let mut runtime = RuntimeCore::new(cfg);
+        let endpoint = runtime.config.endpoints[0].clone();
+        runtime.remember_single_probe_result(
+            &endpoint,
+            &ProbeResult::synthetic_polluted(),
+            Instant::now(),
+        );
+        runtime.mark_endpoint_polluted(&endpoint.name);
+
+        assert!(runtime.set_endpoint_guard_proxy_enabled(&endpoint.name, true));
+
+        assert!(runtime.polluted_until.contains_key(&endpoint.name));
+        assert!(runtime.cooldown_result(&endpoint, Instant::now()).is_some());
+    }
+
+    #[test]
+    fn guard_replacement_cooldown_result_clears_stale_direct_pollution() {
+        let mut cfg = config();
+        cfg.endpoint_recovery_threshold = 2;
+        cfg.endpoints[0].guard_proxy.enabled = true;
+        cfg.endpoints[0]
+            .guard_proxy
+            .replace_direct_pollution_detection = true;
+        let mut runtime = RuntimeCore::new(cfg);
+        let endpoint = runtime.config.endpoints[0].clone();
+        runtime.remember_single_probe_result(
+            &endpoint,
+            &ProbeResult::synthetic_polluted(),
+            Instant::now(),
+        );
+        runtime.mark_endpoint_polluted(&endpoint.name);
+        runtime.health.update(
+            &runtime.config.endpoints,
+            &HashMap::from([(endpoint.name.clone(), ProbeResult::synthetic_polluted())]),
+        );
+
+        assert!(runtime.polluted_until.contains_key(&endpoint.name));
+        assert_eq!(runtime.rows()[0].request_status, "污染不可用");
+
+        assert!(runtime.cooldown_result(&endpoint, Instant::now()).is_none());
+
+        assert!(!runtime.polluted_until.contains_key(&endpoint.name));
+        assert!(!runtime.next_probe_at.contains_key(&endpoint.name));
+        assert!(runtime.last_availability[&endpoint.name].available);
+        assert_eq!(runtime.rows()[0].request_status, "正常");
+    }
+
+    #[test]
     fn rows_expose_guard_proxy_upstream_diagnostics() {
         let mut runtime = RuntimeCore::new(config());
         runtime.guard_audit_by_endpoint.insert(
@@ -2593,6 +3564,51 @@ mod tests {
         assert!(status.contains("错误upstream transient"), "{status}");
     }
 
+    #[test]
+    fn rows_expose_guard_proxy_keyword_hit_count_separately_from_failures() {
+        let mut runtime = RuntimeCore::new(config());
+        runtime.guard_audit_by_endpoint.insert(
+            "high".to_string(),
+            GuardAuditSnapshot {
+                requests: 2,
+                pollution_failures: 0,
+                filtered_responses: 1,
+                keyword_hits: HashMap::from([("余额不足".to_string(), 2), ("公益".to_string(), 1)]),
+                ..Default::default()
+            },
+        );
+
+        let rows = runtime.rows();
+        let status = &rows[0].request_status;
+
+        assert!(status.contains("命中3"), "{status}");
+        assert!(status.contains("污染0"), "{status}");
+        assert!(status.contains("过滤1"), "{status}");
+    }
+
+    #[test]
+    fn rows_expose_guard_proxy_filtered_response_preview_compactly() {
+        let mut runtime = RuntimeCore::new(config());
+        runtime.guard_audit_by_endpoint.insert(
+            "high".to_string(),
+            GuardAuditSnapshot {
+                requests: 2,
+                filtered_responses: 1,
+                last_filtered_response_preview: Some(format!(
+                    "处理后响应 {}",
+                    "safe text ".repeat(20)
+                )),
+                ..Default::default()
+            },
+        );
+
+        let rows = runtime.rows();
+        let status = &rows[0].request_status;
+
+        assert!(status.contains("过滤1"), "{status}");
+        assert!(status.contains("预览处理后响应"), "{status}");
+        assert!(status.contains('…'), "{status}");
+    }
     #[test]
     fn guard_proxy_upstream_error_takes_precedence_over_stale_healthy_label() {
         let mut runtime = RuntimeCore::new(config());
@@ -2621,6 +3637,248 @@ mod tests {
         assert!(status.starts_with("不可用: HTTP 400"), "{status}");
         assert!(!status.starts_with("正常"), "{status}");
         assert!(status.contains("休息一会"), "{status}");
+    }
+
+    #[test]
+    fn guard_proxy_stream_interruption_without_status_is_not_reported_as_healthy() {
+        let mut runtime = RuntimeCore::new(config());
+        let endpoint = runtime.config.endpoints[0].clone();
+        runtime.remember_probe_results(HashMap::from([(
+            endpoint.name.clone(),
+            ProbeResult::available(),
+        )]));
+        runtime.health.update(
+            &runtime.config.endpoints,
+            &HashMap::from([(endpoint.name.clone(), ProbeResult::available())]),
+        );
+        runtime.guard_audit_by_endpoint.insert(
+            endpoint.name.clone(),
+            GuardAuditSnapshot {
+                requests: 3,
+                upstream_failures: 1,
+                last_upstream_status: None,
+                last_upstream_error: Some(
+                    "stream upstream closed before response.completed".to_string(),
+                ),
+                last_upstream_attempts: 1,
+                ..Default::default()
+            },
+        );
+
+        let status = runtime.rows()[0].request_status.clone();
+
+        assert!(status.starts_with("不可用: 上游流提前断开"), "{status}");
+        assert!(!status.starts_with("正常"), "{status}");
+        assert!(status.contains("未收到 response.completed"), "{status}");
+    }
+
+    #[test]
+    fn guard_proxy_pollution_signal_skips_polluted_fallback_and_switches_clean() {
+        let (port, handle) = start_test_json_upstream(r#"{"output_text":"余额不足"}"#);
+        let mut cfg = config();
+        cfg.endpoints.push(endpoint("clean", 1));
+        cfg.endpoints[0].base_url = format!("http://127.0.0.1:{port}/v1");
+        cfg.endpoints[0].guard_proxy.enabled = true;
+        cfg.endpoints[0].guard_proxy.fail_keywords = vec!["余额不足".to_string()];
+        let mut runtime = RuntimeCore::new(cfg);
+        let high = runtime.config.endpoints[0].clone();
+        let low = runtime.config.endpoints[1].clone();
+        let clean = runtime.config.endpoints[2].clone();
+        runtime.current_endpoint = Some(high.name.clone());
+        runtime.remember_single_probe_result(&high, &ProbeResult::available(), Instant::now());
+        runtime.remember_single_probe_result(&low, &ProbeResult::available(), Instant::now());
+        runtime.remember_single_probe_result(&clean, &ProbeResult::available(), Instant::now());
+        runtime.health.update(
+            &runtime.config.endpoints,
+            &HashMap::from([
+                (high.name.clone(), ProbeResult::available()),
+                (low.name.clone(), ProbeResult::available()),
+                (clean.name.clone(), ProbeResult::available()),
+            ]),
+        );
+        let guard_port = attach_test_guard_proxy(&mut runtime, &high);
+        let response = send_test_guard_chat_request(guard_port);
+        handle.join().unwrap();
+        assert!(response.contains("本地保护层"), "{response}");
+        runtime.remember_single_probe_result(
+            &low,
+            &ProbeResult::synthetic_polluted(),
+            Instant::now(),
+        );
+        runtime.mark_endpoint_guard_polluted(&low.name);
+        runtime
+            .next_probe_at
+            .insert(low.name.clone(), Instant::now() + Duration::from_secs(600));
+
+        let probe = HttpProbe::new(0.1).unwrap();
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let selected = tokio.block_on(runtime.tick(&probe));
+
+        assert_eq!(selected.unwrap().name, clean.name);
+        assert!(runtime.last_availability[&high.name].polluted);
+        assert!(runtime.polluted_until.contains_key(&high.name));
+        assert!(runtime.guard_polluted_until.contains_key(&high.name));
+        assert!(runtime.guard_polluted_until.contains_key(&low.name));
+        assert_eq!(runtime.health.status_label(&high.name), "污染不可用");
+        runtime.stop();
+    }
+
+    #[test]
+    fn paused_current_endpoint_records_guard_proxy_pollution_before_holding_agent() {
+        let (port, handle) = start_test_json_upstream(r#"{"output_text":"余额不足"}"#);
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        crate::control::update_control_state(&config_path, &[("auto_paused", json!(true))])
+            .unwrap();
+        let mut cfg = config();
+        cfg.config_path = Some(config_path);
+        cfg.endpoints[0].base_url = format!("http://127.0.0.1:{port}/v1");
+        cfg.endpoints[0].guard_proxy.enabled = true;
+        cfg.endpoints[0].guard_proxy.fail_keywords = vec!["余额不足".to_string()];
+        let mut runtime = RuntimeCore::new(cfg);
+        let current = runtime.config.endpoints[0].clone();
+        runtime.current_endpoint = Some(current.name.clone());
+        let guard_port = attach_test_guard_proxy(&mut runtime, &current);
+        let response = send_test_guard_chat_request(guard_port);
+        handle.join().unwrap();
+        assert!(response.contains("本地保护层"), "{response}");
+        let probe = HttpProbe::new(0.1).unwrap();
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let selected = tokio.block_on(runtime.tick(&probe));
+
+        assert_eq!(selected.unwrap().name, current.name);
+        assert!(runtime.last_availability[&current.name].polluted);
+        assert!(runtime.polluted_until.contains_key(&current.name));
+        assert!(runtime.guard_polluted_until.contains_key(&current.name));
+        assert_eq!(runtime.health.status_label(&current.name), "污染不可用");
+        runtime.stop();
+    }
+
+    #[test]
+    fn paused_guard_pollution_signal_does_not_extend_same_cooldown_every_tick() {
+        let (port, handle) = start_test_json_upstream(r#"{"output_text":"余额不足"}"#);
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        crate::control::update_control_state(&config_path, &[("auto_paused", json!(true))])
+            .unwrap();
+        let mut cfg = config();
+        cfg.config_path = Some(config_path);
+        cfg.probe_interval_seconds = 60.0;
+        cfg.endpoints[0].base_url = format!("http://127.0.0.1:{port}/v1");
+        cfg.endpoints[0].guard_proxy.enabled = true;
+        cfg.endpoints[0].guard_proxy.polluted_cooldown_seconds = 120.0;
+        cfg.endpoints[0].guard_proxy.fail_keywords = vec!["余额不足".to_string()];
+        let mut runtime = RuntimeCore::new(cfg);
+        let current = runtime.config.endpoints[0].clone();
+        runtime.current_endpoint = Some(current.name.clone());
+        let guard_port = attach_test_guard_proxy(&mut runtime, &current);
+        let response = send_test_guard_chat_request(guard_port);
+        handle.join().unwrap();
+        assert!(response.contains("本地保护层"), "{response}");
+        let probe = HttpProbe::new(0.1).unwrap();
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        tokio.block_on(runtime.tick(&probe));
+        let first_until = runtime.guard_polluted_until[&current.name];
+        std::thread::sleep(Duration::from_millis(20));
+
+        let selected = tokio.block_on(runtime.tick(&probe));
+        let second_until = runtime.guard_polluted_until[&current.name];
+
+        assert_eq!(selected.unwrap().name, current.name);
+        assert_eq!(second_until, first_until);
+        assert_eq!(runtime.health.status_label(&current.name), "污染不可用");
+        runtime.stop();
+    }
+
+    #[test]
+    fn guard_polluted_fallback_keeps_searching_to_clean_endpoint() {
+        let mut cfg = config();
+        cfg.endpoints = vec![
+            endpoint("high", 100),
+            endpoint("low", 10),
+            endpoint("clean", 1),
+        ];
+        cfg.probe_interval_seconds = 1.0;
+        cfg.polluted_endpoint_cooldown_seconds = 300.0;
+        let mut runtime = RuntimeCore::new(cfg);
+        let high = runtime.config.endpoints[0].clone();
+        let low = runtime.config.endpoints[1].clone();
+        let clean = runtime.config.endpoints[2].clone();
+        runtime.current_endpoint = Some(high.name.clone());
+        runtime.remember_single_probe_result(
+            &high,
+            &ProbeResult::synthetic_polluted(),
+            Instant::now() - Duration::from_secs(2),
+        );
+        runtime.mark_endpoint_guard_polluted(&high.name);
+        runtime.remember_single_probe_result(
+            &low,
+            &ProbeResult::synthetic_polluted(),
+            Instant::now() - Duration::from_secs(2),
+        );
+        runtime.mark_endpoint_guard_polluted(&low.name);
+        let future_probe = Instant::now() + Duration::from_secs(120);
+        runtime
+            .next_probe_at
+            .insert(high.name.clone(), future_probe);
+        runtime.next_probe_at.insert(low.name.clone(), future_probe);
+        runtime.remember_single_probe_result(&clean, &ProbeResult::available(), Instant::now());
+        let probe = HttpProbe::new(0.5).unwrap();
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (selected, availability) = tokio.block_on(runtime.select_endpoint(&probe, true, true));
+
+        assert_eq!(selected.unwrap().name, clean.name);
+        assert!(availability[&low.name].polluted);
+        assert!(!availability[&low.name].request_made);
+        assert!(availability[&clean.name].available);
+        assert!(!availability[&clean.name].request_made);
+        assert!(runtime.guard_polluted_until.contains_key(&low.name));
+    }
+
+    #[test]
+    fn guard_polluted_cooldown_uses_endpoint_guard_config() {
+        let mut cfg = config();
+        cfg.polluted_endpoint_cooldown_seconds = 300.0;
+        cfg.endpoints[0].guard_proxy.enabled = true;
+        cfg.endpoints[0].guard_proxy.polluted_cooldown_seconds = 120.0;
+        let mut runtime = RuntimeCore::new(cfg);
+        let endpoint = runtime.config.endpoints[0].clone();
+
+        runtime.mark_endpoint_guard_polluted(&endpoint.name);
+
+        let remaining = runtime.guard_polluted_until[&endpoint.name]
+            .saturating_duration_since(Instant::now())
+            .as_secs_f64();
+        assert!(
+            (100.0..=121.0).contains(&remaining),
+            "remaining={remaining}"
+        );
+        assert_eq!(
+            runtime.polluted_until[&endpoint.name],
+            runtime.guard_polluted_until[&endpoint.name]
+        );
+        let next_probe_remaining = runtime.next_probe_at[&endpoint.name]
+            .saturating_duration_since(Instant::now())
+            .as_secs_f64();
+        assert!(
+            (0.0..=2.0).contains(&next_probe_remaining),
+            "next_probe_remaining={next_probe_remaining}"
+        );
     }
 
     #[test]
@@ -2678,6 +3936,30 @@ mod tests {
         assert!(!rows[0].selected);
         assert_eq!(rows[0].request_status, "已禁用");
         assert_eq!(runtime.state_label(), "等待可用接口");
+    }
+
+    #[test]
+    fn disabling_endpoint_clears_guard_polluted_cooldown_before_reenable() {
+        let mut cfg = config();
+        cfg.endpoints[0].guard_proxy.enabled = true;
+        cfg.endpoints[0].guard_proxy.polluted_cooldown_seconds = 120.0;
+        let mut runtime = RuntimeCore::new(cfg);
+        let endpoint = runtime.config.endpoints[0].clone();
+        runtime.mark_endpoint_guard_polluted(&endpoint.name);
+
+        assert!(runtime.cooldown_result(&endpoint, Instant::now()).is_some());
+
+        assert!(runtime.set_endpoint_enabled(&endpoint.name, false));
+        assert!(!runtime.guard_polluted_until.contains_key(&endpoint.name));
+        assert!(!runtime.polluted_until.contains_key(&endpoint.name));
+        assert!(!runtime.next_probe_at.contains_key(&endpoint.name));
+
+        assert!(runtime.set_endpoint_enabled(&endpoint.name, true));
+        let reenabled = runtime.config.endpoints[0].clone();
+
+        assert!(runtime
+            .cooldown_result(&reenabled, Instant::now())
+            .is_none());
     }
 
     #[test]
@@ -2892,6 +4174,273 @@ mod tests {
     }
 
     #[test]
+    fn successful_probes_clear_pending_polluted_cooldown_after_three_clean_results() {
+        let mut runtime = RuntimeCore::new(config());
+        let endpoint = endpoint("high", 100);
+        let now = Instant::now();
+        runtime.remember_single_probe_result(&endpoint, &ProbeResult::synthetic_polluted(), now);
+        runtime.mark_endpoint_polluted(&endpoint.name);
+
+        runtime.remember_single_probe_result(&endpoint, &ProbeResult::available(), now);
+        runtime.next_probe_at.insert(endpoint.name.clone(), now);
+        let blocked = runtime.cooldown_result(&endpoint, now + Duration::from_millis(1));
+
+        assert!(blocked.is_none());
+        assert!(runtime.polluted_until.contains_key(&endpoint.name));
+
+        runtime.remember_single_probe_result(&endpoint, &ProbeResult::available(), now);
+        runtime.remember_single_probe_result(&endpoint, &ProbeResult::available(), now);
+
+        assert!(!runtime.polluted_until.contains_key(&endpoint.name));
+    }
+
+    #[test]
+    fn applied_available_probe_results_clear_pending_polluted_cooldown_after_three_clean_results() {
+        let mut runtime = RuntimeCore::new(config());
+        let endpoint = endpoint("high", 100);
+        runtime.mark_endpoint_polluted(&endpoint.name);
+
+        for _ in 0..2 {
+            runtime.apply_probe_results(HashMap::from([(
+                endpoint.name.clone(),
+                ProbeResult::available(),
+            )]));
+        }
+        assert!(runtime.polluted_until.contains_key(&endpoint.name));
+
+        runtime.apply_probe_results(HashMap::from([(
+            endpoint.name.clone(),
+            ProbeResult::available(),
+        )]));
+
+        assert!(!runtime.polluted_until.contains_key(&endpoint.name));
+    }
+
+    #[test]
+    fn polluted_endpoint_requires_three_clean_results_before_selection() {
+        let mut runtime = RuntimeCore::new(config());
+        let high = runtime.config.endpoints[0].clone();
+        let low = runtime.config.endpoints[1].clone();
+        runtime.apply_probe_results(HashMap::from([(
+            low.name.clone(),
+            ProbeResult::available(),
+        )]));
+        runtime.mark_endpoint_polluted(&high.name);
+
+        for expected_successes in 1..=2 {
+            let selected = runtime.apply_probe_results(HashMap::from([(
+                high.name.clone(),
+                ProbeResult::available(),
+            )]));
+
+            assert_eq!(selected.unwrap().name, low.name);
+            assert!(runtime.polluted_until.contains_key(&high.name));
+            assert_eq!(
+                runtime.rows()[0].request_status,
+                format!("污染恢复中 {expected_successes}/3")
+            );
+        }
+
+        let selected = runtime.apply_probe_results(HashMap::from([(
+            high.name.clone(),
+            ProbeResult::available(),
+        )]));
+
+        assert_eq!(selected.unwrap().name, high.name);
+        assert!(!runtime.polluted_until.contains_key(&high.name));
+        assert_eq!(runtime.rows()[0].request_status, "正常");
+    }
+
+    #[test]
+    fn polluted_background_endpoint_reprobes_without_clearing_before_three_clean_results() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let port = server.local_addr().unwrap().port();
+        let done = Arc::new(AtomicBool::new(false));
+        let response_requests = Arc::new(AtomicUsize::new(0));
+        let server_done = Arc::clone(&done);
+        let server_response_requests = Arc::clone(&response_requests);
+        let handle = thread::spawn(move || loop {
+            let (mut socket, _) = match server.accept() {
+                Ok(value) => value,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if server_done.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            let request = read_test_http_request(&mut socket);
+            let (status, reason, body) = if request.starts_with("GET /v1/models ") {
+                (200_u16, "OK", r#"{"data":[{"id":"gpt-5.5"}]}"#)
+            } else if request.starts_with("POST /v1/responses ") {
+                server_response_requests.fetch_add(1, Ordering::SeqCst);
+                (200_u16, "OK", r#"{"output_text":"WATCHAPI_OK"}"#)
+            } else {
+                (404_u16, "Not Found", r#"{"error":"not found"}"#)
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes());
+        });
+
+        let mut cfg = config();
+        cfg.probe_interval_seconds = 1.0;
+        cfg.polluted_endpoint_cooldown_seconds = 300.0;
+        cfg.endpoints[0].base_url = format!("http://127.0.0.1:{port}/v1");
+        let mut runtime = RuntimeCore::new(cfg);
+        let high = runtime.config.endpoints[0].clone();
+        let low = runtime.config.endpoints[1].clone();
+        runtime.current_endpoint = Some(low.name.clone());
+        runtime.remember_single_probe_result(&low, &ProbeResult::available(), Instant::now());
+        runtime.remember_single_probe_result(
+            &high,
+            &ProbeResult::synthetic_polluted(),
+            Instant::now() - Duration::from_secs(2),
+        );
+        runtime.mark_endpoint_polluted(&high.name);
+
+        let availability = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(runtime.probe_due_unhealthy_endpoints(
+                &HttpProbe::new(2.0).unwrap(),
+                vec![high.clone()],
+                ProbeMode::Full,
+            ));
+
+        done.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        assert_eq!(response_requests.load(Ordering::SeqCst), 1);
+        assert!(runtime.last_availability[&high.name].available);
+        assert!(runtime.polluted_until.contains_key(&high.name));
+        assert_eq!(runtime.rows()[0].request_status, "污染恢复中 1/3");
+        assert!(availability[&high.name].available);
+    }
+
+    #[test]
+    fn polluted_upgrade_candidate_uses_full_probe_and_waits_for_three_clean_results() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let port = server.local_addr().unwrap().port();
+        let done = Arc::new(AtomicBool::new(false));
+        let model_requests = Arc::new(AtomicUsize::new(0));
+        let response_requests = Arc::new(AtomicUsize::new(0));
+        let server_done = Arc::clone(&done);
+        let server_model_requests = Arc::clone(&model_requests);
+        let server_response_requests = Arc::clone(&response_requests);
+        let handle = thread::spawn(move || loop {
+            let (mut socket, _) = match server.accept() {
+                Ok(value) => value,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if server_done.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            let request = read_test_http_request(&mut socket);
+            let (status, reason, body) = if request.starts_with("GET /v1/models ") {
+                server_model_requests.fetch_add(1, Ordering::SeqCst);
+                (200_u16, "OK", r#"{"data":[{"id":"gpt-5.5"}]}"#)
+            } else if request.starts_with("POST /v1/responses ") {
+                server_response_requests.fetch_add(1, Ordering::SeqCst);
+                (200_u16, "OK", r#"{"output_text":"WATCHAPI_OK"}"#)
+            } else {
+                (404_u16, "Not Found", r#"{"error":"not found"}"#)
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes());
+        });
+
+        let mut cfg = config();
+        cfg.probe_interval_seconds = 1.0;
+        cfg.polluted_endpoint_cooldown_seconds = 300.0;
+        cfg.endpoints[0].base_url = format!("http://127.0.0.1:{port}/v1");
+        let mut runtime = RuntimeCore::new(cfg);
+        let high = runtime.config.endpoints[0].clone();
+        let low = runtime.config.endpoints[1].clone();
+        runtime.current_endpoint = Some(low.name.clone());
+        runtime.remember_single_probe_result(&low, &ProbeResult::available(), Instant::now());
+        runtime.remember_single_probe_result(
+            &high,
+            &ProbeResult::synthetic_polluted(),
+            Instant::now() - Duration::from_secs(2),
+        );
+        runtime.mark_endpoint_polluted(&high.name);
+        let probe = HttpProbe::new(2.0).unwrap();
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        for expected_successes in 1..=2 {
+            let (selected, _) =
+                tokio.block_on(runtime.select_endpoint_with_options(&probe, false, false, false));
+
+            assert_eq!(selected.unwrap().name, low.name);
+            assert_eq!(
+                runtime.rows()[0].request_status,
+                format!("污染恢复中 {expected_successes}/3")
+            );
+            runtime
+                .next_probe_at
+                .insert(high.name.clone(), Instant::now() - Duration::from_secs(1));
+        }
+
+        let (selected, _) =
+            tokio.block_on(runtime.select_endpoint_with_options(&probe, false, false, false));
+
+        done.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        assert_eq!(selected.unwrap().name, high.name);
+        assert_eq!(response_requests.load(Ordering::SeqCst), 3);
+        assert!(!runtime.polluted_until.contains_key(&high.name));
+    }
+
+    #[test]
+    fn healthy_current_endpoint_still_reprobes_due_unhealthy_background_endpoints() {
+        let source = include_str!("runtime.rs");
+        let select_block = source
+            .split("fn select_endpoint_with_options")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn find_first_available").next())
+            .expect("endpoint selection block should be discoverable");
+
+        assert!(source.contains("fn probe_due_unhealthy_endpoints"));
+        assert!(select_block.contains("probe_due_unhealthy_endpoints("));
+        assert!(
+            select_block.find("find_first_available(probe, higher")
+                < select_block.find("probe_due_unhealthy_endpoints("),
+            "当前接口健康时应先尝试高权重升级，再后台复探冷却到期的异常接口"
+        );
+    }
+
+    #[test]
     fn rows_expose_next_probe_countdown_seconds() {
         let mut runtime = RuntimeCore::new(config());
         runtime
@@ -2941,6 +4490,84 @@ mod tests {
         assert_eq!(selected.unwrap().name, low.name);
         assert!(!availability[&high.name].request_made);
         assert_eq!(runtime.request_count_by_endpoint[&high.name], 1);
+    }
+
+    #[test]
+    fn guard_polluted_cooldown_blocks_force_full_probe_until_due() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let port = server.local_addr().unwrap().port();
+        let done = Arc::new(AtomicBool::new(false));
+        let high_requests = Arc::new(AtomicUsize::new(0));
+        let server_done = Arc::clone(&done);
+        let server_high_requests = Arc::clone(&high_requests);
+        let handle = thread::spawn(move || loop {
+            let (mut socket, _) = match server.accept() {
+                Ok(value) => value,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if server_done.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            let request = read_test_http_request(&mut socket);
+            if request.starts_with("POST /v1/responses ") && request.contains("high-model") {
+                server_high_requests.fetch_add(1, Ordering::SeqCst);
+            }
+            let body = r#"{"output_text":"WATCHAPI_OK"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes());
+        });
+
+        let mut cfg = config();
+        cfg.endpoints[0].base_url = format!("http://127.0.0.1:{port}/v1");
+        cfg.endpoints[0].model = "high-model".to_string();
+        cfg.endpoints[0].guard_proxy.enabled = true;
+        cfg.endpoints[0].guard_proxy.polluted_cooldown_seconds = 120.0;
+        cfg.endpoints[1].base_url = format!("http://127.0.0.1:{port}/v1");
+        cfg.endpoints[1].model = "low-model".to_string();
+        let mut runtime = RuntimeCore::new(cfg);
+        let high = runtime.config.endpoints[0].clone();
+        let low = runtime.config.endpoints[1].clone();
+        runtime.remember_single_probe_result(
+            &high,
+            &ProbeResult::synthetic_polluted(),
+            Instant::now(),
+        );
+        runtime.mark_endpoint_guard_polluted(&high.name);
+
+        let (selected, availability) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(runtime.find_first_available(
+                &HttpProbe::new(0.5).unwrap(),
+                vec![high.clone(), low.clone()],
+                false,
+                ProbeMode::Full,
+                true,
+            ));
+
+        done.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        assert_eq!(selected.unwrap().name, low.name);
+        assert_eq!(high_requests.load(Ordering::SeqCst), 0);
+        assert!(!availability[&high.name].request_made);
+        assert!(availability[&high.name].polluted);
+        assert!(runtime.guard_polluted_until.contains_key(&high.name));
     }
 
     #[test]
@@ -3264,15 +4891,72 @@ mod tests {
             .and_then(|tail| tail.split("pub fn set_endpoint_enabled").next())
             .expect("force probe setter should be discoverable");
 
-        assert!(block.contains("if let Err(err) = update_control_state"));
+        assert!(block.contains("match update_control_state"));
+        assert!(block.contains("Ok(_) => self.clear_control_save_error()"));
         assert!(block.contains("保存强制探测接口失败"));
         assert!(block.contains("self.publish_snapshot_event();"));
         assert!(!block.contains("let _ = update_control_state"));
     }
 
     #[test]
+    fn fixed_endpoint_control_state_save_failure_is_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        let control_path = block_control_state_path(&config_path);
+        let mut cfg = config();
+        cfg.config_path = Some(config_path);
+        let mut runtime = RuntimeCore::new(cfg);
+
+        runtime.set_fixed_endpoint(Some("high".to_string()));
+
+        assert!(runtime.state_label().contains("保存固定接口失败"));
+        unblock_control_state_path(&control_path);
+    }
+
+    #[test]
+    fn control_state_save_failure_preserves_and_recovers_runtime_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        let control_path = block_control_state_path(&config_path);
+        let mut cfg = config();
+        cfg.config_path = Some(config_path);
+        let mut runtime = RuntimeCore::new(cfg);
+        runtime.state = RuntimeState::Running;
+
+        runtime.set_fixed_endpoint(Some("high".to_string()));
+
+        let failed_label = runtime.state_label();
+        assert!(failed_label.starts_with("运行中 | "), "{failed_label}");
+        assert!(failed_label.contains("保存固定接口失败"), "{failed_label}");
+
+        unblock_control_state_path(&control_path);
+        runtime.set_fixed_endpoint(None);
+
+        assert_eq!(runtime.state_label(), "运行中");
+    }
+
+    #[test]
+    fn disabling_endpoint_control_state_save_failure_is_reported() {
+        let source = include_str!("runtime.rs");
+        let block = source
+            .split("pub fn set_endpoint_enabled")
+            .nth(1)
+            .and_then(|tail| tail.split("pub fn set_endpoint_guard_proxy_enabled").next())
+            .expect("endpoint enabled setter should be discoverable");
+
+        assert!(block.contains("match update_control_state"));
+        assert!(block.contains("Ok(_) => self.clear_control_save_error()"));
+        assert!(block.contains("保存禁用接口状态失败"));
+        assert!(block.contains("self.publish_snapshot_event();"));
+        assert!(
+            !block.contains("let _ = update_control_state"),
+            "禁用接口时清理 fixed/force 控制状态失败不能静默忽略"
+        );
+    }
+
+    #[test]
     fn models_only_probe_falls_back_to_real_request_when_models_miss_configured_model() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -3280,7 +4964,6 @@ mod tests {
         use std::time::Duration;
 
         let server = TcpListener::bind("127.0.0.1:0").unwrap();
-        server.set_nonblocking(true).unwrap();
         let port = server.local_addr().unwrap().port();
         let done = Arc::new(AtomicBool::new(false));
         let models_requests = Arc::new(AtomicUsize::new(0));
@@ -3291,18 +4974,14 @@ mod tests {
         let handle = thread::spawn(move || loop {
             let (mut socket, _) = match server.accept() {
                 Ok(value) => value,
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    if server_done.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
                 Err(_) => break,
             };
-            let mut buffer = [0_u8; 8192];
-            let size = socket.read(&mut buffer).unwrap_or(0);
-            let request = String::from_utf8_lossy(&buffer[..size]);
+            if server_done.load(Ordering::SeqCst) {
+                break;
+            }
+            let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = socket.set_write_timeout(Some(Duration::from_secs(5)));
+            let request = read_test_http_request(&mut socket);
             let (status, body) = if request.starts_with("GET /v1/models ") {
                 server_models_requests.fetch_add(1, Ordering::SeqCst);
                 (200_u16, r#"{"data":[{"id":"yuzyuz"}]}"#)
@@ -3339,13 +5018,14 @@ mod tests {
         ));
 
         done.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
         handle.join().unwrap();
+        assert!(availability["high"].available, "{:?}", availability["high"]);
+        assert_eq!(availability["high"].status_code, Some(200));
         assert_eq!(
             selected.as_ref().map(|endpoint| endpoint.name.as_str()),
             Some("high")
         );
-        assert!(availability["high"].available);
-        assert_eq!(availability["high"].status_code, Some(200));
         assert_eq!(models_requests.load(Ordering::SeqCst), 1);
         assert_eq!(response_requests.load(Ordering::SeqCst), 1);
     }
@@ -3571,6 +5251,25 @@ mod tests {
     }
 
     #[test]
+    fn stale_goal_request_without_goal_text_is_ignored() {
+        let mut cfg = config();
+        cfg.agent_goal.enabled = false;
+        cfg.agent_goal.text.clear();
+        let state = json!({
+            "goal_enabled": true,
+            "goal_request": {"action": "resume"}
+        });
+
+        assert_eq!(control_state_goal_prompt_for_config(&cfg, &state), None);
+        assert!(!goal_mode_enabled_runtime(&cfg, &state));
+        assert!(!should_resume_goal_runtime(&cfg, &state));
+
+        cfg.agent_goal.enabled = true;
+        assert_eq!(control_state_goal_prompt_for_config(&cfg, &state), None);
+        assert!(!goal_mode_enabled_runtime(&cfg, &state));
+    }
+
+    #[test]
     fn active_goal_session_prefers_resume_for_imported_goal() {
         let tmp = tempfile::tempdir().unwrap();
         let config_path = tmp.path().join("config.json");
@@ -3624,9 +5323,142 @@ mod tests {
             .and_then(|tail| tail.split("let manual_prompt =").next())
             .expect("goal request loading block should be discoverable");
 
-        assert!(prompt_block.contains("let explicit_goal_prompt = control_state_goal_prompt"));
-        assert!(prompt_block.contains("!self.goal_synced_this_run || explicit_goal_prompt.is_some()"));
+        assert!(prompt_block.contains("let explicit_goal_prompt"));
+        assert!(prompt_block.contains("control_state_goal_prompt_for_config"));
+        assert!(
+            prompt_block.contains("!self.goal_synced_this_run || explicit_goal_prompt.is_some()")
+        );
         assert!(prompt_block.contains("self.pending_goal_prompt = explicit_goal_prompt"));
+    }
+
+    #[test]
+    fn goal_request_cleanup_failure_is_reported_and_gated() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        let control_path = block_control_state_path(&config_path);
+        let mut cfg = config();
+        cfg.config_path = Some(config_path.clone());
+        cfg.agent_goal.enabled = true;
+        cfg.agent_goal.text = "默认目标".to_string();
+        let mut runtime = RuntimeCore::new(cfg);
+        let state = json!({"goal_request": {"action": "set", "text": "新目标"}});
+        let signature = control_state_goal_request_signature(&state).unwrap();
+
+        runtime.clear_goal_request_control_state(signature.clone());
+
+        let failed_label = runtime.state_label();
+        assert!(failed_label.contains("清理目标请求失败"), "{failed_label}");
+        assert_eq!(
+            runtime.goal_request_clear_failed_signature.as_deref(),
+            Some(signature.as_str())
+        );
+
+        unblock_control_state_path(&control_path);
+        crate::control::update_control_state(
+            &config_path,
+            &[("goal_request", json!({"action": "set", "text": "新目标"}))],
+        )
+        .unwrap();
+
+        runtime.clear_goal_request_control_state(signature);
+
+        let recovered_label = runtime.state_label();
+        let state = crate::control::read_control_state(&config_path);
+        assert!(state.get("goal_request").is_some_and(Value::is_null));
+        assert_eq!(runtime.goal_request_clear_failed_signature, None);
+        assert!(
+            !recovered_label.contains("清理目标请求失败"),
+            "{recovered_label}"
+        );
+    }
+
+    #[test]
+    fn goal_control_state_save_failures_are_reported_and_recover() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        let mut cfg = config();
+        cfg.config_path = Some(config_path.clone());
+        cfg.agent_goal.enabled = true;
+        cfg.agent_goal.text = "目标".to_string();
+        cfg.agent_goal.revision = 7;
+        let mut runtime = RuntimeCore::new(cfg);
+
+        let control_path = block_control_state_path(&config_path);
+        runtime.mark_goal_synced();
+        let synced_failed_label = runtime.state_label();
+        assert!(
+            synced_failed_label.contains("保存目标同步状态失败"),
+            "{synced_failed_label}"
+        );
+
+        unblock_control_state_path(&control_path);
+        runtime.mark_goal_synced();
+        let synced_state = crate::control::read_control_state(&config_path);
+        assert_eq!(synced_state["goal_synced_revision"], json!(7));
+        assert!(synced_state.get("goal_request").is_some_and(Value::is_null));
+        assert_eq!(runtime.state_label(), "已停止");
+
+        let control_path = block_control_state_path(&config_path);
+        runtime.disable_goal_mode_after_completed_turn();
+        let completed_failed_label = runtime.state_label();
+        assert!(
+            completed_failed_label.contains("保存目标完成状态失败"),
+            "{completed_failed_label}"
+        );
+
+        unblock_control_state_path(&control_path);
+        runtime.disable_goal_mode_after_completed_turn();
+        let completed_state = crate::control::read_control_state(&config_path);
+        assert_eq!(completed_state["goal_enabled"], json!(false));
+        assert_eq!(completed_state["goal_completed"], json!(true));
+        assert!(completed_state
+            .get("goal_request")
+            .is_some_and(Value::is_null));
+        assert_eq!(runtime.state_label(), "已停止");
+    }
+
+    #[test]
+    fn goal_request_cleanup_failure_skips_same_stale_request_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.json");
+        crate::control::update_control_state(&config_path, &[("goal_enabled", json!(true))])
+            .unwrap();
+        let mut cfg = config();
+        cfg.config_path = Some(config_path);
+        cfg.agent_goal.enabled = true;
+        cfg.agent_goal.text = "默认目标".to_string();
+        let mut runtime = RuntimeCore::new(cfg);
+        let stale_state = json!({
+            "goal_enabled": true,
+            "goal_request": {"action": "set", "text": "旧请求"}
+        });
+        let fresh_state = json!({
+            "goal_enabled": true,
+            "goal_request": {"action": "set", "text": "新请求"}
+        });
+        runtime.goal_request_clear_failed_signature =
+            control_state_goal_request_signature(&stale_state);
+
+        let stale_signature = control_state_goal_request_signature(&stale_state);
+        let stale_failed = stale_signature.as_deref().is_some_and(|signature| {
+            runtime.goal_request_clear_failed_signature.as_deref() == Some(signature)
+        });
+        let fresh_signature = control_state_goal_request_signature(&fresh_state);
+        let fresh_failed = fresh_signature.as_deref().is_some_and(|signature| {
+            runtime.goal_request_clear_failed_signature.as_deref() == Some(signature)
+        });
+
+        assert!(stale_failed);
+        assert!(!fresh_failed);
+        assert_eq!(
+            runtime
+                .goal_prompt_for_active_session(&control_state_without_goal_request(&stale_state,)),
+            Some("/goal 默认目标".to_string())
+        );
+        assert_eq!(
+            control_state_goal_prompt_for_config(&runtime.config, &fresh_state),
+            Some("/goal 新请求".to_string())
+        );
     }
 
     #[test]
@@ -3741,10 +5573,60 @@ mod tests {
             .and_then(|tail| tail.split("if manual_prompt.is_none()").next())
             .expect("blocked can_send_prompt block should be discoverable");
 
-        assert!(blocked_block.contains("enqueue_manual_prompt"));
+        assert!(blocked_block.contains("self.requeue_manual_prompt"));
         assert!(blocked_block.contains("automatic_requested || manual_prompt.is_some()"));
         assert!(prompt_block.contains("agent.auto_input_block_reason()"));
         assert!(blocked_block.contains("RuntimeState::WaitingInput(reason.to_string())"));
+    }
+
+    #[test]
+    fn manual_prompt_requeue_failure_is_visible_and_recovers() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        let queue_path = crate::control::prompt_queue_path(&config_path);
+        if queue_path.is_dir() {
+            std::fs::remove_dir_all(&queue_path).unwrap();
+        } else if queue_path.exists() {
+            std::fs::remove_file(&queue_path).unwrap();
+        }
+        std::fs::create_dir_all(&queue_path).unwrap();
+        let mut cfg = config();
+        cfg.config_path = Some(config_path.clone());
+        let mut runtime = RuntimeCore::new(cfg);
+        runtime.state = RuntimeState::WaitingInput("终端未就绪".to_string());
+
+        assert!(!runtime.requeue_manual_prompt("继续执行"));
+
+        let failed_label = runtime.state_label();
+        assert!(failed_label.starts_with("等待可输入：终端未就绪 | "));
+        assert!(failed_label.contains("恢复手动提示失败"), "{failed_label}");
+
+        std::fs::remove_dir_all(&queue_path).unwrap();
+
+        assert!(runtime.requeue_manual_prompt("继续执行"));
+
+        let recovered_label = runtime.state_label();
+        assert_eq!(
+            crate::control::pop_manual_prompt(&config_path),
+            Some("继续执行".to_string())
+        );
+        assert_eq!(recovered_label, "等待可输入：终端未就绪");
+    }
+
+    #[test]
+    fn manual_prompt_requeue_failures_are_not_silent() {
+        let source = include_str!("runtime.rs");
+        let prompt_block = source
+            .split("fn maybe_drive_prompt")
+            .nth(1)
+            .and_then(|tail| tail.split("fn requeue_manual_prompt").next())
+            .expect("prompt driver should be discoverable");
+
+        assert!(prompt_block.contains("self.requeue_manual_prompt"));
+        assert!(
+            !prompt_block.contains("let _ = enqueue_manual_prompt"),
+            "手动提示回队列失败不能静默吞掉，否则用户输入可能丢失"
+        );
     }
 
     #[test]
@@ -3938,6 +5820,272 @@ mod tests {
         assert_eq!(selected.unwrap().name, "low");
         assert_eq!(request_count.load(Ordering::SeqCst), 0);
     }
+
+    #[test]
+    fn paused_current_endpoint_records_pollution_signal_before_holding_agent() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        crate::control::update_control_state(&config_path, &[("auto_paused", json!(true))])
+            .unwrap();
+        let mut cfg = config();
+        cfg.config_path = Some(config_path);
+        let mut runtime = RuntimeCore::new(cfg);
+        let current = runtime.config.endpoints[0].clone();
+        runtime.current_endpoint = Some(current.name.clone());
+        let mut agent = AgentProcess::new(runtime.config.clone(), current.clone(), false);
+        agent.pollution_detected = true;
+        runtime.agent = Some(agent);
+        let probe = HttpProbe::new(0.1).unwrap();
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let selected = tokio.block_on(runtime.tick(&probe));
+
+        assert_eq!(selected.unwrap().name, current.name);
+        assert!(runtime.polluted_until.contains_key(&current.name));
+        assert!(runtime.last_availability[&current.name].polluted);
+        assert!(!runtime
+            .agent
+            .as_ref()
+            .is_some_and(|agent| agent.pollution_detected));
+    }
+
+    #[test]
+    fn guard_replacement_ignores_direct_pollution_signal_while_paused() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        crate::control::update_control_state(&config_path, &[("auto_paused", json!(true))])
+            .unwrap();
+        let mut cfg = config();
+        cfg.config_path = Some(config_path);
+        cfg.endpoints[0].guard_proxy.enabled = true;
+        cfg.endpoints[0]
+            .guard_proxy
+            .replace_direct_pollution_detection = true;
+        let mut runtime = RuntimeCore::new(cfg);
+        let current = runtime.config.endpoints[0].clone();
+        runtime.current_endpoint = Some(current.name.clone());
+        runtime.remember_single_probe_result(&current, &ProbeResult::available(), Instant::now());
+        let mut agent = AgentProcess::new(runtime.config.clone(), current.clone(), false);
+        agent.pollution_detected = true;
+        runtime.agent = Some(agent);
+        let probe = HttpProbe::new(0.1).unwrap();
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let selected = tokio.block_on(runtime.tick(&probe));
+
+        assert_eq!(selected.unwrap().name, current.name);
+        assert!(!runtime.polluted_until.contains_key(&current.name));
+        assert!(runtime.last_availability[&current.name].available);
+        assert!(!runtime
+            .agent
+            .as_ref()
+            .is_some_and(|agent| agent.pollution_detected));
+    }
+
+    #[test]
+    fn guard_fallback_keeps_direct_pollution_signal_while_paused() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        crate::control::update_control_state(&config_path, &[("auto_paused", json!(true))])
+            .unwrap();
+        let mut cfg = config();
+        cfg.config_path = Some(config_path);
+        cfg.endpoints[0].guard_proxy.enabled = true;
+        cfg.endpoints[0]
+            .guard_proxy
+            .replace_direct_pollution_detection = false;
+        let mut runtime = RuntimeCore::new(cfg);
+        let current = runtime.config.endpoints[0].clone();
+        runtime.current_endpoint = Some(current.name.clone());
+        let mut agent = AgentProcess::new(runtime.config.clone(), current.clone(), false);
+        agent.pollution_detected = true;
+        runtime.agent = Some(agent);
+        let probe = HttpProbe::new(0.1).unwrap();
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let selected = tokio.block_on(runtime.tick(&probe));
+
+        assert_eq!(selected.unwrap().name, current.name);
+        assert!(runtime.polluted_until.contains_key(&current.name));
+        assert!(runtime.last_availability[&current.name].polluted);
+        assert!(!runtime
+            .agent
+            .as_ref()
+            .is_some_and(|agent| agent.pollution_detected));
+    }
+
+    #[test]
+    fn paused_current_endpoint_still_reprobes_due_polluted_background_endpoint() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let port = server.local_addr().unwrap().port();
+        let done = Arc::new(AtomicBool::new(false));
+        let response_requests = Arc::new(AtomicUsize::new(0));
+        let server_done = Arc::clone(&done);
+        let server_response_requests = Arc::clone(&response_requests);
+        let handle = thread::spawn(move || loop {
+            let (mut socket, _) = match server.accept() {
+                Ok(value) => value,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if server_done.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            let request = read_test_http_request(&mut socket);
+            let (status, reason, body) = if request.starts_with("GET /v1/models ") {
+                (200_u16, "OK", r#"{"data":[{"id":"gpt-5.5"}]}"#)
+            } else if request.starts_with("POST /v1/responses ") {
+                server_response_requests.fetch_add(1, Ordering::SeqCst);
+                (200_u16, "OK", r#"{"output_text":"WATCHAPI_OK"}"#)
+            } else {
+                (404_u16, "Not Found", r#"{"error":"not found"}"#)
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes());
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        crate::control::update_control_state(&config_path, &[("auto_paused", json!(true))])
+            .unwrap();
+        let mut cfg = config();
+        cfg.config_path = Some(config_path);
+        cfg.probe_interval_seconds = 1.0;
+        cfg.polluted_endpoint_cooldown_seconds = 300.0;
+        cfg.endpoints[0].base_url = format!("http://127.0.0.1:{port}/v1");
+        let mut runtime = RuntimeCore::new(cfg);
+        let high = runtime.config.endpoints[0].clone();
+        let low = runtime.config.endpoints[1].clone();
+        runtime.current_endpoint = Some(low.name.clone());
+        runtime.remember_single_probe_result(&low, &ProbeResult::available(), Instant::now());
+        runtime.remember_single_probe_result(
+            &high,
+            &ProbeResult::synthetic_polluted(),
+            Instant::now() - Duration::from_secs(2),
+        );
+        runtime.mark_endpoint_polluted(&high.name);
+        runtime
+            .next_probe_at
+            .insert(high.name.clone(), Instant::now() - Duration::from_secs(1));
+        let probe = HttpProbe::new(0.5).unwrap();
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let selected = tokio.block_on(runtime.tick(&probe));
+
+        done.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        assert_eq!(selected.unwrap().name, low.name);
+        assert_eq!(response_requests.load(Ordering::SeqCst), 1);
+        assert!(runtime.last_availability[&high.name].available);
+        assert!(runtime.polluted_until.contains_key(&high.name));
+        assert_eq!(runtime.rows()[0].request_status, "污染恢复中 1/3");
+    }
+
+    #[test]
+    fn paused_current_endpoint_reprobes_itself_when_polluted_recovery_is_due() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let port = server.local_addr().unwrap().port();
+        let done = Arc::new(AtomicBool::new(false));
+        let response_requests = Arc::new(AtomicUsize::new(0));
+        let server_done = Arc::clone(&done);
+        let server_response_requests = Arc::clone(&response_requests);
+        let handle = thread::spawn(move || loop {
+            let (mut socket, _) = match server.accept() {
+                Ok(value) => value,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if server_done.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            let request = read_test_http_request(&mut socket);
+            let (status, reason, body) = if request.starts_with("GET /v1/models ") {
+                (200_u16, "OK", r#"{"data":[{"id":"gpt-5.5"}]}"#)
+            } else if request.starts_with("POST /v1/responses ") {
+                server_response_requests.fetch_add(1, Ordering::SeqCst);
+                (200_u16, "OK", r#"{"output_text":"WATCHAPI_OK"}"#)
+            } else {
+                (404_u16, "Not Found", r#"{"error":"not found"}"#)
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes());
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        crate::control::update_control_state(&config_path, &[("auto_paused", json!(true))])
+            .unwrap();
+        let mut cfg = config();
+        cfg.config_path = Some(config_path);
+        cfg.probe_interval_seconds = 1.0;
+        cfg.polluted_endpoint_cooldown_seconds = 300.0;
+        cfg.endpoints[0].base_url = format!("http://127.0.0.1:{port}/v1");
+        let mut runtime = RuntimeCore::new(cfg);
+        let current = runtime.config.endpoints[0].clone();
+        runtime.current_endpoint = Some(current.name.clone());
+        runtime.remember_single_probe_result(
+            &current,
+            &ProbeResult::synthetic_polluted(),
+            Instant::now() - Duration::from_secs(2),
+        );
+        runtime.mark_endpoint_polluted(&current.name);
+        let probe = HttpProbe::new(0.5).unwrap();
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let selected = tokio.block_on(runtime.tick(&probe));
+
+        done.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        assert_eq!(selected.unwrap().name, current.name);
+        assert_eq!(response_requests.load(Ordering::SeqCst), 1);
+        assert!(runtime.last_availability[&current.name].available);
+        assert!(runtime.polluted_until.contains_key(&current.name));
+        assert_eq!(runtime.rows()[0].request_status, "污染恢复中 1/3");
+    }
+
     #[test]
     fn force_current_probe_switches_when_current_endpoint_is_unavailable() {
         use std::io::{Read, Write};
@@ -4159,6 +6307,36 @@ mod tests {
             crate::control::read_control_state(&config_path)["auto_paused"],
             json!(true)
         );
+    }
+
+    #[test]
+    fn force_full_probe_keeps_running_equal_weight_endpoint() {
+        let mut cfg = config();
+        cfg.endpoints = vec![
+            endpoint("peer", 100),
+            endpoint("current", 100),
+            endpoint("lower", 10),
+        ];
+        let mut runtime = RuntimeCore::new(cfg);
+        runtime.current_endpoint = Some("current".to_string());
+        runtime.remember_probe_results(HashMap::from([
+            ("peer".to_string(), ProbeResult::available()),
+            ("current".to_string(), ProbeResult::available()),
+            ("lower".to_string(), ProbeResult::available()),
+        ]));
+        let future = Instant::now() + Duration::from_secs(60);
+        runtime.next_probe_at.insert("peer".to_string(), future);
+        runtime.next_probe_at.insert("current".to_string(), future);
+
+        let probe = HttpProbe::new(0.1).unwrap();
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (selected, _) =
+            tokio.block_on(runtime.select_endpoint_with_options(&probe, false, false, true));
+
+        assert_eq!(selected.unwrap().name, "current");
     }
 
     #[test]
@@ -4436,6 +6614,44 @@ mod tests {
     }
 
     #[test]
+    fn single_running_endpoint_soft_failure_does_not_stop_and_restart_agent() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        crate::control::update_control_state(&config_path, &[("auto_paused", json!(false))])
+            .unwrap();
+        let mut cfg = config();
+        cfg.config_path = Some(config_path);
+        cfg.agent_driver = crate::config::AgentDriver::Generic;
+        cfg.agent_command = long_running_test_command();
+        cfg.endpoints.truncate(1);
+        cfg.endpoint_failure_threshold = 1;
+        let mut runtime = RuntimeCore::new(cfg);
+        let endpoint = runtime.config.endpoints[0].clone();
+        runtime.switch_to(endpoint.clone()).unwrap();
+        let first_pid = runtime.terminal_process_id();
+        assert!(first_pid.is_some());
+        runtime.remember_single_probe_result(&endpoint, &ProbeResult::available(), Instant::now());
+        if let Some(agent) = runtime.agent.as_mut() {
+            agent.endpoint_failure_detected = true;
+            agent.endpoint_failure_status_code = Some(502);
+        }
+
+        let selected = runtime.tick_blocking(&HttpProbe::new(0.1).unwrap());
+
+        assert_eq!(selected.unwrap().name, endpoint.name);
+        assert_eq!(
+            runtime.current_endpoint.as_deref(),
+            Some(endpoint.name.as_str())
+        );
+        assert_eq!(runtime.terminal_process_id(), first_pid);
+        assert_eq!(runtime.state_label(), "异常：请求失败 1/1");
+        let selected = runtime.tick_blocking(&HttpProbe::new(0.1).unwrap());
+        assert_eq!(selected.unwrap().name, endpoint.name);
+        assert_eq!(runtime.terminal_process_id(), first_pid);
+        runtime.stop();
+    }
+
+    #[test]
     fn runtime_snapshot_contains_pty_terminal_output_only() {
         let runtime = RuntimeCore::new(config());
         let snapshot = runtime.snapshot();
@@ -4548,6 +6764,53 @@ mod tests {
         let RuntimeEvent::Snapshot(snapshot) = event;
         assert_eq!(snapshot.state_label, "已停止");
         assert_eq!(snapshot.rows.len(), runtime.config.endpoints.len());
+    }
+    #[test]
+    fn runtime_event_publish_wakes_after_successful_send() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wakeups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wakeups_for_callback = std::sync::Arc::clone(&wakeups);
+        let mut runtime = RuntimeCore::new(config());
+        runtime.set_event_wakeup(Some(std::sync::Arc::new(move || {
+            wakeups_for_callback.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })));
+
+        runtime.set_event_sender(Some(tx));
+
+        rx.try_recv().expect("initial snapshot should publish");
+        assert_eq!(wakeups.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        runtime.publish_snapshot();
+
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            wakeups.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "deduplicated runtime events must not wake the UI without a new snapshot"
+        );
+    }
+
+    #[test]
+    fn runtime_event_wakeup_is_installed_on_terminal_activity() {
+        let source = include_str!("runtime.rs");
+        let set_wakeup_block = source
+            .split("pub fn set_event_wakeup")
+            .nth(1)
+            .and_then(|tail| tail.split("pub fn snapshot").next())
+            .expect("set_event_wakeup block should be discoverable");
+        let switch_block = source
+            .split("fn switch_to(&mut self, endpoint: EndpointConfig)")
+            .nth(1)
+            .and_then(|tail| tail.split("fn goal_prompt_for_new_session").next())
+            .expect("switch_to block should be discoverable");
+
+        assert!(set_wakeup_block.contains("agent.set_terminal_activity_wakeup"));
+        assert!(
+            switch_block.contains("agent.set_terminal_activity_wakeup(self.event_wakeup.clone())")
+                && switch_block.find("agent.set_terminal_activity_wakeup")
+                    < switch_block.find("self.agent = Some(agent);"),
+            "newly started PTY sessions must inherit the GUI repaint wakeup before the runtime snapshot is published"
+        );
     }
 
     #[test]
@@ -4663,6 +6926,29 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_request_failure_threshold_switches_away_on_next_tick() {
+        let mut cfg = config();
+        cfg.agent_driver = crate::config::AgentDriver::Generic;
+        cfg.agent_command = long_running_test_command();
+        cfg.endpoint_failure_threshold = 3;
+        let mut runtime = RuntimeCore::new(cfg);
+        let high = runtime.config.endpoints[0].clone();
+        let low = runtime.config.endpoints[1].clone();
+        runtime.switch_to(high.clone()).unwrap();
+        runtime.remember_single_probe_result(&high, &ProbeResult::available(), Instant::now());
+        runtime.remember_single_probe_result(&low, &ProbeResult::available(), Instant::now());
+        runtime
+            .endpoint_request_failures_by_endpoint
+            .insert(high.name.clone(), 3);
+
+        let selected = runtime.tick_blocking(&HttpProbe::new(0.1).unwrap());
+
+        assert_eq!(selected.unwrap().name, low.name);
+        assert_eq!(runtime.current_endpoint.as_deref(), Some(low.name.as_str()));
+        runtime.stop();
+    }
+
+    #[test]
     fn endpoint_failure_branch_releases_auto_wait_before_retry() {
         let source = include_str!("runtime.rs");
         let failure_branch = source
@@ -4679,6 +6965,25 @@ mod tests {
         assert!(failure_branch.contains("result.status_code = agent.endpoint_failure_status_code"));
         assert!(failure_branch
             .contains("result.retry_after_seconds = agent.endpoint_failure_retry_after_seconds"));
+    }
+
+    #[test]
+    fn submit_retry_failure_is_visible_and_releases_auto_wait() {
+        let source = include_str!("runtime.rs");
+        let retry_block = source
+            .split("if agent.needs_submit_retry(self.config.prompt_submit_retry_seconds) {")
+            .nth(1)
+            .and_then(|tail| tail.split("if !agent.is_idle(").next())
+            .expect("submit retry branch should be discoverable");
+
+        assert!(
+            !retry_block.contains("let _ = agent.retry_submit();"),
+            "自动提交重试失败不能静默忽略，否则终端写入失败时界面会继续显示运行中"
+        );
+        assert!(retry_block.contains("agent.mark_current_turn_failed();"));
+        assert!(retry_block.contains("self.waiting_for_assistant_progress = false;"));
+        assert!(retry_block.contains("重试提交失败"));
+        assert!(retry_block.contains("self.publish_snapshot_event();"));
     }
 
     #[test]
@@ -4701,7 +7006,9 @@ mod tests {
     fn endpoint_failure_counter_is_cleared_only_by_success_evidence() {
         let source = include_str!("runtime.rs");
         let normal_agent_branch = source
-            .split("} else if agent.is_turn_stalled(self.config.turn_stall_seconds) {")
+            .split(
+                "} else if !auto_paused && agent.is_turn_stalled(self.config.turn_stall_seconds) {",
+            )
             .nth(1)
             .and_then(|tail| tail.split("if mark_polluted {").next())
             .expect("normal agent branch should be discoverable");

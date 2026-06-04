@@ -23,7 +23,8 @@ use wreq::{Client as EmulatedClient, Proxy as EmulatedProxy};
 use wreq_util::Emulation;
 
 use crate::guard_proxy::{
-    GUARD_STREAM_HEARTBEAT_INTERVAL, GUARD_UPSTREAM_CONNECT_TIMEOUT, GUARD_UPSTREAM_TOTAL_TIMEOUT,
+    responses_api_stream_requires_completed, GUARD_STREAM_HEARTBEAT_INTERVAL,
+    GUARD_UPSTREAM_CONNECT_TIMEOUT, GUARD_UPSTREAM_TOTAL_TIMEOUT,
 };
 
 const MIN_KEY_EXPLORATION_REQUESTS: u64 = 2;
@@ -303,10 +304,13 @@ struct QualityWrite {
     quality: PersistedKeyQuality,
 }
 
+const QUALITY_FLUSH_ATTEMPTS: usize = 40;
+const QUALITY_FAST_FLUSH_ATTEMPTS: usize = 2;
+
 #[derive(Debug)]
 enum QualityWriteCommand {
     Write(QualityWrite),
-    Flush(Sender<()>),
+    Flush { done: Sender<()>, attempts: usize },
 }
 
 #[derive(Debug)]
@@ -428,8 +432,14 @@ impl QualityWriteHandle {
                         store.keys.insert(write.quality_key, write.quality);
                         pending += 1;
                     }
-                    QualityWriteCommand::Flush(done) => {
-                        flush_quality_pending(&store, &path, &mut pending, &mut last_flush, 40);
+                    QualityWriteCommand::Flush { done, attempts } => {
+                        flush_quality_pending(
+                            &store,
+                            &path,
+                            &mut pending,
+                            &mut last_flush,
+                            attempts,
+                        );
                         let _ = done.send(());
                         continue;
                     }
@@ -440,8 +450,14 @@ impl QualityWriteHandle {
                             store.keys.insert(write.quality_key, write.quality);
                             pending += 1;
                         }
-                        QualityWriteCommand::Flush(done) => {
-                            flush_quality_pending(&store, &path, &mut pending, &mut last_flush, 40);
+                        QualityWriteCommand::Flush { done, attempts } => {
+                            flush_quality_pending(
+                                &store,
+                                &path,
+                                &mut pending,
+                                &mut last_flush,
+                                attempts,
+                            );
                             let _ = done.send(());
                         }
                     }
@@ -471,9 +487,20 @@ impl QualityWriteHandle {
     }
 
     fn flush(&self) {
+        self.flush_with_timeout(Duration::from_secs(2), QUALITY_FLUSH_ATTEMPTS);
+    }
+
+    fn flush_with_timeout(&self, timeout: Duration, attempts: usize) {
         let (tx, rx) = mpsc::channel();
-        if self.tx.send(QualityWriteCommand::Flush(tx)).is_ok() {
-            let _ = rx.recv_timeout(Duration::from_secs(2));
+        if self
+            .tx
+            .send(QualityWriteCommand::Flush {
+                done: tx,
+                attempts: attempts.max(1),
+            })
+            .is_ok()
+        {
+            let _ = rx.recv_timeout(timeout);
         }
     }
 }
@@ -840,7 +867,8 @@ impl AggregateEgressRuntime {
         let Some((fingerprint_index, fingerprint, combo)) = self.select_combo_fingerprint() else {
             return Err(anyhow!("no available fingerprint"));
         };
-        mark_upstream_request_started(&self.upstreams, &deployment.base_url);
+        let upstream_request_started_at =
+            mark_upstream_request_started(&self.upstreams, &deployment.base_url);
         let forwarded_body = request_body.rewrite_model(&deployment.actual_model);
         let headers = forward_headers(raw_request, &deployment.key, forwarded_body.len(), true)?;
         let started_at = Instant::now();
@@ -863,6 +891,13 @@ impl AggregateEgressRuntime {
             Ok(response) => {
                 if (200..300).contains(&response.status) {
                     self.record_success(deployment_index, fingerprint_index, &combo, latency);
+                } else if is_invalid_encrypted_content_response(&response) {
+                    forget_upstream_recent_request(
+                        &self.upstreams,
+                        &deployment.base_url,
+                        upstream_request_started_at,
+                    );
+                    // This is tied to the caller's conversation state, not key health.
                 } else {
                     self.record_failure(
                         deployment_index,
@@ -878,7 +913,20 @@ impl AggregateEgressRuntime {
                 if should_suppress_local_failure_response(&err) {
                     return Err(err);
                 }
-                self.record_transport_failure(deployment_index, fingerprint_index, &combo, latency);
+                if is_invalid_encrypted_content_text(&err.to_string()) {
+                    forget_upstream_recent_request(
+                        &self.upstreams,
+                        &deployment.base_url,
+                        upstream_request_started_at,
+                    );
+                } else {
+                    self.record_transport_failure(
+                        deployment_index,
+                        fingerprint_index,
+                        &combo,
+                        latency,
+                    );
+                }
                 Err(err)
             }
         }
@@ -902,9 +950,22 @@ impl AggregateEgressRuntime {
                     if (200..300).contains(&response.status) {
                         return Ok(response);
                     }
+                    let stop_retrying = is_invalid_encrypted_content_response(&response);
                     last_response = Some(response);
+                    if stop_retrying {
+                        break;
+                    }
                 }
-                Err(err) => last_error = Some(err),
+                Err(err) => {
+                    if last_response.is_some()
+                        && err
+                            .to_string()
+                            .contains("no available key for requested model")
+                    {
+                        break;
+                    }
+                    last_error = Some(err);
+                }
             }
         }
         if let Some(response) = last_response {
@@ -935,7 +996,21 @@ impl AggregateEgressRuntime {
                 path,
             ) {
                 Ok(()) => return Ok(()),
-                Err(err) => last_error = Some(err),
+                Err(err) => {
+                    let err_text = err.to_string();
+                    if last_error.is_some()
+                        && err_text.contains("no available key for requested model")
+                    {
+                        break;
+                    }
+                    let stop_retrying = should_suppress_local_failure_response(&err)
+                        || is_incomplete_stream_error(&err)
+                        || is_invalid_encrypted_content_text(&err_text);
+                    last_error = Some(err);
+                    if stop_retrying {
+                        break;
+                    }
+                }
             }
         }
         Err(last_error.unwrap_or_else(|| anyhow!("aggregate upstream unavailable")))
@@ -957,7 +1032,8 @@ impl AggregateEgressRuntime {
         let Some((fingerprint_index, fingerprint, combo)) = self.select_combo_fingerprint() else {
             return Err(anyhow!("no available fingerprint"));
         };
-        mark_upstream_request_started(&self.upstreams, &deployment.base_url);
+        let upstream_request_started_at =
+            mark_upstream_request_started(&self.upstreams, &deployment.base_url);
         let forwarded_body = request_body.rewrite_model(&deployment.actual_model);
         let headers = forward_headers(raw_request, &deployment.key, forwarded_body.len(), true)?;
         let started_at = Instant::now();
@@ -993,7 +1069,23 @@ impl AggregateEgressRuntime {
                 }
             }
             Err(err) => {
-                self.record_transport_failure(deployment_index, fingerprint_index, &combo, latency);
+                if should_suppress_local_failure_response(&err) {
+                    return Err(err);
+                }
+                if is_invalid_encrypted_content_text(&err.to_string()) {
+                    forget_upstream_recent_request(
+                        &self.upstreams,
+                        &deployment.base_url,
+                        upstream_request_started_at,
+                    );
+                } else {
+                    self.record_transport_failure(
+                        deployment_index,
+                        fingerprint_index,
+                        &combo,
+                        latency,
+                    );
+                }
                 Err(err)
             }
         }
@@ -1028,9 +1120,8 @@ impl AggregateEgressRuntime {
                             .as_ref()
                             .and_then(|egress| egress.node.clone())
                             .unwrap_or_default();
-                        let row_clash_egress_ip = row_egress
-                            .and_then(|egress| egress.ip)
-                            .unwrap_or_default();
+                        let row_clash_egress_ip =
+                            row_egress.and_then(|egress| egress.ip).unwrap_or_default();
                         AggregateKeyRow {
                             upstream: item.upstream.clone(),
                             base_url: item.base_url.clone(),
@@ -1115,6 +1206,14 @@ impl AggregateEgressRuntime {
 
     pub fn flush_quality(&self) {
         self.quality_writer.flush();
+    }
+
+    pub fn flush_quality_with_timeout(&self, timeout: Duration, attempts: usize) {
+        self.quality_writer.flush_with_timeout(timeout, attempts);
+    }
+
+    pub fn flush_quality_fast(&self) {
+        self.flush_quality_with_timeout(Duration::from_millis(150), QUALITY_FAST_FLUSH_ATTEMPTS);
     }
 
     fn select_deployment(
@@ -1730,25 +1829,255 @@ fn stream_emulated_request<W: Write>(writer: &mut W, request: EmulatedRequest<'_
     })?;
     let status = response.status();
     if !status.is_success() {
-        return Err(anyhow!("aggregate upstream returned {}", status.as_u16()));
+        let payload = request
+            .runtime
+            .block_on(async { response.bytes().await })?
+            .to_vec();
+        let preview = aggregate_error_preview(&payload);
+        if preview.trim().is_empty() {
+            return Err(anyhow!("aggregate upstream returned {}", status.as_u16()));
+        }
+        return Err(anyhow!(
+            "aggregate upstream returned {}: {}",
+            status.as_u16(),
+            preview
+        ));
     }
     request.runtime.block_on(async {
+        let mut terminal_tracker =
+            SseTerminalTracker::new(responses_api_stream_requires_completed(request.path));
+        let mut forwarded_bytes = 0_usize;
         loop {
             match time::timeout(GUARD_STREAM_HEARTBEAT_INTERVAL, response.chunk()).await {
                 Ok(Ok(Some(chunk))) => {
+                    terminal_tracker.observe(&chunk);
                     writer.write_all(&chunk)?;
                     writer.flush()?;
+                    forwarded_bytes += chunk.len();
                 }
                 Ok(Ok(None)) => break,
+                Ok(Err(err)) if forwarded_bytes > 0 => {
+                    return Err(anyhow!(
+                        "stream upstream interrupted after partial response: {err}"
+                    ));
+                }
                 Ok(Err(err)) => return Err(err.into()),
                 Err(_) => {
                     write_sse_heartbeat(writer)?;
                 }
             }
         }
+        terminal_tracker.finish();
+        match terminal_tracker.terminal {
+            SseTerminalOutcome::Pending => {
+                return Err(anyhow!("stream upstream closed before response.completed"));
+            }
+            SseTerminalOutcome::Failed(detail) => {
+                return Err(anyhow!("stream upstream returned terminal error: {detail}"));
+            }
+            SseTerminalOutcome::Completed => {}
+        }
         Ok::<(), anyhow::Error>(())
     })?;
     Ok(status.as_u16())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SseTerminalOutcome {
+    Pending,
+    Completed,
+    Failed(String),
+}
+
+struct SseTerminalTracker {
+    carry: String,
+    terminal: SseTerminalOutcome,
+    require_response_event: bool,
+    event: Option<String>,
+    data_lines: Vec<String>,
+}
+
+impl SseTerminalTracker {
+    fn new(require_response_event: bool) -> Self {
+        Self {
+            carry: String::new(),
+            terminal: SseTerminalOutcome::Pending,
+            require_response_event,
+            event: None,
+            data_lines: Vec::new(),
+        }
+    }
+
+    fn observe(&mut self, chunk: &[u8]) {
+        self.carry.push_str(&String::from_utf8_lossy(chunk));
+        while let Some(index) = self.carry.find('\n') {
+            let line = self.carry[..index].trim_end_matches('\r').to_string();
+            self.carry.drain(..=index);
+            self.observe_line(&line);
+        }
+    }
+
+    fn finish(&mut self) {
+        if !self.carry.is_empty() {
+            let line = self.carry.trim_end_matches('\r').to_string();
+            self.carry.clear();
+            self.observe_line(&line);
+        }
+        self.dispatch_event();
+    }
+
+    fn observe_line(&mut self, line: &str) {
+        if let Some(event) = line.strip_prefix("event:") {
+            let event = event.trim();
+            self.event = Some(event.to_string());
+            if let Some(outcome) = terminal_sse_event_outcome(event) {
+                self.set_terminal(outcome);
+            }
+            return;
+        }
+        if let Some(data) = line.strip_prefix("data:") {
+            self.data_lines
+                .push(data.strip_prefix(' ').unwrap_or(data).to_string());
+            return;
+        }
+        if line.is_empty() {
+            self.dispatch_event();
+        }
+    }
+
+    fn dispatch_event(&mut self) {
+        if !self.data_lines.is_empty() {
+            let data = self.data_lines.join("\n");
+            if let Some(outcome) = terminal_sse_data_outcome(
+                data.trim(),
+                self.require_response_event,
+                self.event.as_deref(),
+            ) {
+                self.set_terminal(outcome);
+            }
+            self.data_lines.clear();
+        }
+        self.event = None;
+    }
+
+    fn set_terminal(&mut self, outcome: SseTerminalOutcome) {
+        match (&mut self.terminal, outcome) {
+            (SseTerminalOutcome::Failed(current), SseTerminalOutcome::Failed(next)) => {
+                if current.starts_with("stream upstream returned ") && !next.trim().is_empty() {
+                    *current = next;
+                }
+            }
+            (SseTerminalOutcome::Failed(_), _) => {}
+            (_, next) => self.terminal = next,
+        }
+    }
+}
+
+fn terminal_sse_event_outcome(event: &str) -> Option<SseTerminalOutcome> {
+    match event {
+        "response.completed" => Some(SseTerminalOutcome::Completed),
+        "response.failed" | "response.incomplete" | "error" => Some(SseTerminalOutcome::Failed(
+            format!("stream upstream returned {event}"),
+        )),
+        _ => None,
+    }
+}
+
+fn terminal_sse_data_outcome(
+    data: &str,
+    require_response_event: bool,
+    event: Option<&str>,
+) -> Option<SseTerminalOutcome> {
+    if data == "[DONE]" {
+        return (!require_response_event).then_some(SseTerminalOutcome::Completed);
+    }
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return None;
+    };
+    if let Some(event_type) = value.get("type").and_then(Value::as_str) {
+        if let Some(outcome) = terminal_sse_event_outcome(event_type) {
+            return Some(terminal_outcome_with_payload_detail(outcome, &value));
+        }
+    }
+    if let Some(outcome) = event.and_then(terminal_sse_event_outcome) {
+        return Some(terminal_outcome_with_payload_detail(outcome, &value));
+    }
+    (!require_response_event && json_has_terminal_chat_finish_reason(&value))
+        .then_some(SseTerminalOutcome::Completed)
+}
+
+fn terminal_outcome_with_payload_detail(
+    outcome: SseTerminalOutcome,
+    value: &Value,
+) -> SseTerminalOutcome {
+    match outcome {
+        SseTerminalOutcome::Failed(fallback) => {
+            SseTerminalOutcome::Failed(sse_error_detail(value).unwrap_or(fallback))
+        }
+        other => other,
+    }
+}
+
+fn sse_error_detail(value: &Value) -> Option<String> {
+    value
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .pointer("/response/error/message")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_string)
+}
+
+fn json_has_terminal_chat_finish_reason(value: &Value) -> bool {
+    value
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| {
+            choices.iter().any(|choice| {
+                choice
+                    .get("finish_reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reason| !reason.is_empty())
+            })
+        })
+}
+
+fn is_incomplete_stream_error(err: &anyhow::Error) -> bool {
+    let text = err.to_string();
+    text.contains("stream upstream closed before response.completed")
+        || text.contains("stream upstream interrupted after partial response")
+        || text.contains("stream upstream returned terminal error")
+}
+
+fn aggregate_error_preview(payload: &[u8]) -> String {
+    let text = String::from_utf8_lossy(payload);
+    serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("message").and_then(Value::as_str))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| text.to_string())
+}
+
+fn is_invalid_encrypted_content_response(response: &AggregateResponse) -> bool {
+    response.status == 400
+        && is_invalid_encrypted_content_text(&aggregate_error_preview(&response.payload))
+}
+
+fn is_invalid_encrypted_content_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("invalid_encrypted_content")
+        || (lower.contains("encrypted content") && lower.contains("could not be decrypted"))
+        || (lower.contains("encrypted content") && lower.contains("could not be verified"))
 }
 
 fn write_sse_heartbeat<W: Write>(writer: &mut W) -> Result<()> {
@@ -1979,11 +2308,11 @@ fn upstream_available(
 fn mark_upstream_request_started(
     upstreams: &Arc<Mutex<HashMap<String, AggregateUpstreamRuntime>>>,
     base_url: &str,
-) {
-    let Ok(mut upstreams) = upstreams.lock() else {
-        return;
-    };
+) -> Instant {
     let now = Instant::now();
+    let Ok(mut upstreams) = upstreams.lock() else {
+        return now;
+    };
     let state = upstreams
         .entry(base_url.to_string())
         .or_insert_with(|| AggregateUpstreamRuntime {
@@ -1996,6 +2325,7 @@ fn mark_upstream_request_started(
     state
         .recent_request_times
         .retain(|at| now.duration_since(*at) < Duration::from_secs(60));
+    now
 }
 
 fn mark_upstream_request_finished(
@@ -2007,6 +2337,25 @@ fn mark_upstream_request_finished(
     };
     if let Some(state) = upstreams.get_mut(base_url) {
         state.in_flight = state.in_flight.saturating_sub(1);
+    }
+}
+
+fn forget_upstream_recent_request(
+    upstreams: &Arc<Mutex<HashMap<String, AggregateUpstreamRuntime>>>,
+    base_url: &str,
+    started_at: Instant,
+) {
+    let Ok(mut upstreams) = upstreams.lock() else {
+        return;
+    };
+    if let Some(state) = upstreams.get_mut(base_url) {
+        if let Some(index) = state
+            .recent_request_times
+            .iter()
+            .rposition(|at| *at == started_at)
+        {
+            state.recent_request_times.remove(index);
+        }
     }
 }
 
@@ -2158,6 +2507,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
     use std::thread;
 
     fn seed(upstream: &str, base_url: &str, key: &str) -> AggregateDeploymentSeed {
@@ -2183,6 +2533,913 @@ mod tests {
             body.len()
         )
         .into_bytes()
+    }
+
+    fn invalid_encrypted_content_body() -> &'static str {
+        r#"{"error":{"message":"The encrypted content gAAA... could not be verified. Reason: Encrypted content could not be decrypted or parsed.","type":"invalid_request_error","code":"invalid_encrypted_content"}}"#
+    }
+
+    struct BrokenPipeWriter;
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "client disconnected",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn aggregate_stream_reports_missing_completed_as_failure() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let _ = read_http_request(&mut socket).unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            socket
+                .write_all(b"event: response.output_text.delta\ndata: {\"delta\":\"partial\"}\n\n")
+                .unwrap();
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = AggregateEgressRuntime::new(
+            AggregateEgressConfig {
+                enabled: true,
+                fingerprints: vec![AggregateFingerprint::Chrome132],
+                recent_fingerprint_window: 0,
+                recent_fingerprint_ttl_seconds: 0,
+            },
+            vec![seed(
+                "dc",
+                &format!("http://127.0.0.1:{port}/v1"),
+                "sk-stream",
+            )],
+            temp.path().join("quality.json"),
+            None,
+            35,
+        )
+        .unwrap();
+        let body = r#"{"model":"gpt-5.5","input":"hello","stream":true}"#;
+        let mut out = Vec::new();
+
+        let err = runtime
+            .forward_stream_with_failover(
+                &mut out,
+                &raw_request(body),
+                body.as_bytes(),
+                "POST",
+                "/v1/responses",
+                1,
+            )
+            .unwrap_err();
+        handle.join().unwrap();
+
+        assert!(
+            err.to_string()
+                .contains("stream upstream closed before response.completed"),
+            "{err}"
+        );
+        assert!(String::from_utf8(out).unwrap().contains("partial"));
+        assert_eq!(runtime.snapshot().rows[0].failure_requests, 1);
+    }
+
+    #[test]
+    fn aggregate_stream_does_not_retry_after_partial_body_error() {
+        let first_upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let first_port = first_upstream.local_addr().unwrap().port();
+        let first_handle = thread::spawn(move || {
+            let (mut socket, _) = first_upstream.accept().unwrap();
+            let _ = read_http_request(&mut socket).unwrap();
+            let payload =
+                b"event: response.output_text.delta\ndata: {\"delta\":\"FIRST_PARTIAL\"}\n\n";
+            let response_head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+                payload.len()
+            );
+            socket.write_all(response_head.as_bytes()).unwrap();
+            socket.write_all(payload).unwrap();
+            socket.write_all(b"\r\nzz\r\n").unwrap();
+            socket.flush().unwrap();
+        });
+        let second_upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        second_upstream.set_nonblocking(true).unwrap();
+        let second_port = second_upstream.local_addr().unwrap().port();
+        let second_handle = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < deadline {
+                match second_upstream.accept() {
+                    Ok((mut socket, _)) => {
+                        socket.set_nonblocking(false).unwrap();
+                        let _ = read_http_request(&mut socket).unwrap();
+                        socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                            )
+                            .unwrap();
+                        socket
+                            .write_all(
+                                b"event: response.output_text.delta\ndata: {\"delta\":\"SECOND_OK\"}\n\n",
+                            )
+                            .unwrap();
+                        socket
+                            .write_all(b"event: response.completed\ndata: {}\n\n")
+                            .unwrap();
+                        socket.flush().unwrap();
+                        return true;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(err) => panic!("accept failed: {err}"),
+                }
+            }
+            false
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = AggregateEgressRuntime::new(
+            AggregateEgressConfig {
+                enabled: true,
+                fingerprints: vec![AggregateFingerprint::Chrome132],
+                recent_fingerprint_window: 0,
+                recent_fingerprint_ttl_seconds: 0,
+            },
+            vec![
+                seed(
+                    "first",
+                    &format!("http://127.0.0.1:{first_port}/v1"),
+                    "sk-first",
+                ),
+                seed(
+                    "second",
+                    &format!("http://127.0.0.1:{second_port}/v1"),
+                    "sk-second",
+                ),
+            ],
+            temp.path().join("quality.json"),
+            None,
+            35,
+        )
+        .unwrap();
+        {
+            let mut deployments = runtime.deployments.lock().unwrap();
+            deployments[1].stats.total_requests = 1;
+            deployments[1].stats.success_requests = 1;
+            deployments[1].stats.recalculate_score();
+        }
+        let body = r#"{"model":"gpt-5.5","input":"hello","stream":true}"#;
+        let mut out = Vec::new();
+
+        let err = runtime
+            .forward_stream_with_failover(
+                &mut out,
+                &raw_request(body),
+                body.as_bytes(),
+                "POST",
+                "/v1/responses",
+                2,
+            )
+            .unwrap_err();
+        first_handle.join().unwrap();
+        let retried_second = second_handle.join().unwrap();
+        let text = String::from_utf8(out).unwrap();
+
+        assert!(
+            err.to_string()
+                .contains("stream upstream interrupted after partial response"),
+            "{err}"
+        );
+        assert!(text.contains("FIRST_PARTIAL"), "{text}");
+        assert!(
+            !retried_second && !text.contains("SECOND_OK"),
+            "retrying after partial bytes corrupts the client stream: {text}"
+        );
+    }
+
+    #[test]
+    fn aggregate_stream_reports_done_only_responses_stream_as_failure() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let _ = read_http_request(&mut socket).unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            socket.write_all(b"data: [DONE]\n\n").unwrap();
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = AggregateEgressRuntime::new(
+            AggregateEgressConfig {
+                enabled: true,
+                fingerprints: vec![AggregateFingerprint::Chrome132],
+                recent_fingerprint_window: 0,
+                recent_fingerprint_ttl_seconds: 0,
+            },
+            vec![seed(
+                "dc",
+                &format!("http://127.0.0.1:{port}/v1"),
+                "sk-done-only",
+            )],
+            temp.path().join("quality.json"),
+            None,
+            35,
+        )
+        .unwrap();
+        let body = r#"{"model":"gpt-5.5","input":"hello","stream":true}"#;
+        let mut out = Vec::new();
+
+        let err = runtime
+            .forward_stream_with_failover(
+                &mut out,
+                &raw_request(body),
+                body.as_bytes(),
+                "POST",
+                "/v1/responses",
+                1,
+            )
+            .unwrap_err();
+        handle.join().unwrap();
+
+        assert!(
+            err.to_string()
+                .contains("stream upstream closed before response.completed"),
+            "{err}"
+        );
+        assert!(String::from_utf8(out).unwrap().contains("[DONE]"));
+    }
+
+    #[test]
+    fn aggregate_stream_accepts_chat_finish_reason_without_done_marker() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let _ = read_http_request(&mut socket).unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            socket
+                .write_all(
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = AggregateEgressRuntime::new(
+            AggregateEgressConfig {
+                enabled: true,
+                fingerprints: vec![AggregateFingerprint::Chrome132],
+                recent_fingerprint_window: 0,
+                recent_fingerprint_ttl_seconds: 0,
+            },
+            vec![seed(
+                "dc",
+                &format!("http://127.0.0.1:{port}/v1"),
+                "sk-chat",
+            )],
+            temp.path().join("quality.json"),
+            None,
+            35,
+        )
+        .unwrap();
+        let body =
+            r#"{"model":"gpt-5.5","messages":[{"role":"user","content":"hello"}],"stream":true}"#;
+        let mut out = Vec::new();
+
+        runtime
+            .forward_stream_with_failover(
+                &mut out,
+                &raw_request(body),
+                body.as_bytes(),
+                "POST",
+                "/v1/chat/completions",
+                1,
+            )
+            .unwrap();
+        handle.join().unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"finish_reason\":\"stop\""), "{text}");
+        let row = &runtime.snapshot().rows[0];
+        assert_eq!(row.success_requests, 1);
+        assert_eq!(row.failure_requests, 0);
+    }
+
+    #[test]
+    fn aggregate_stream_accepts_multiline_chat_finish_reason_without_done_marker() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let _ = read_http_request(&mut socket).unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            socket
+                .write_all(
+                    concat!(
+                        "data: {\"choices\":[\n",
+                        "data: {\"delta\":{},\"finish_reason\":\"stop\"}\n",
+                        "data: ]}\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = AggregateEgressRuntime::new(
+            AggregateEgressConfig {
+                enabled: true,
+                fingerprints: vec![AggregateFingerprint::Chrome132],
+                recent_fingerprint_window: 0,
+                recent_fingerprint_ttl_seconds: 0,
+            },
+            vec![seed(
+                "dc",
+                &format!("http://127.0.0.1:{port}/v1"),
+                "sk-chat",
+            )],
+            temp.path().join("quality.json"),
+            None,
+            35,
+        )
+        .unwrap();
+        let body =
+            r#"{"model":"gpt-5.5","messages":[{"role":"user","content":"hello"}],"stream":true}"#;
+        let mut out = Vec::new();
+
+        runtime
+            .forward_stream_with_failover(
+                &mut out,
+                &raw_request(body),
+                body.as_bytes(),
+                "POST",
+                "/v1/chat/completions",
+                1,
+            )
+            .unwrap();
+        handle.join().unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"finish_reason\":\"stop\""), "{text}");
+        let row = &runtime.snapshot().rows[0];
+        assert_eq!(row.success_requests, 1);
+        assert_eq!(row.failure_requests, 0);
+    }
+
+    #[test]
+    fn aggregate_stream_counts_sse_failed_event_as_failure() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let _ = read_http_request(&mut socket).unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            socket
+                .write_all(
+                    concat!(
+                        "event: response.failed\n",
+                        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"quota exhausted\"}}}\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = AggregateEgressRuntime::new(
+            AggregateEgressConfig {
+                enabled: true,
+                fingerprints: vec![AggregateFingerprint::Chrome132],
+                recent_fingerprint_window: 0,
+                recent_fingerprint_ttl_seconds: 0,
+            },
+            vec![seed(
+                "dc",
+                &format!("http://127.0.0.1:{port}/v1"),
+                "sk-failed-event",
+            )],
+            temp.path().join("quality.json"),
+            None,
+            35,
+        )
+        .unwrap();
+        let body = r#"{"model":"gpt-5.5","input":"hello","stream":true}"#;
+        let mut out = Vec::new();
+
+        let err = runtime
+            .forward_stream_with_failover(
+                &mut out,
+                &raw_request(body),
+                body.as_bytes(),
+                "POST",
+                "/v1/responses",
+                1,
+            )
+            .unwrap_err();
+        handle.join().unwrap();
+
+        assert!(err.to_string().contains("quota exhausted"), "{err}");
+        assert!(String::from_utf8(out).unwrap().contains("response.failed"));
+        let row = &runtime.snapshot().rows[0];
+        assert_eq!(row.success_requests, 0);
+        assert_eq!(row.failure_requests, 1);
+    }
+
+    #[test]
+    fn aggregate_stream_keeps_failed_terminal_state_when_completed_follows() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let _ = read_http_request(&mut socket).unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            socket
+                .write_all(
+                    concat!(
+                        "event: response.failed\n",
+                        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"quota exhausted\"}}}\n\n",
+                        "event: response.completed\n",
+                        "data: {}\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = AggregateEgressRuntime::new(
+            AggregateEgressConfig {
+                enabled: true,
+                fingerprints: vec![AggregateFingerprint::Chrome132],
+                recent_fingerprint_window: 0,
+                recent_fingerprint_ttl_seconds: 0,
+            },
+            vec![seed(
+                "dc",
+                &format!("http://127.0.0.1:{port}/v1"),
+                "sk-failed-then-completed",
+            )],
+            temp.path().join("quality.json"),
+            None,
+            35,
+        )
+        .unwrap();
+        let body = r#"{"model":"gpt-5.5","input":"hello","stream":true}"#;
+        let mut out = Vec::new();
+
+        let err = runtime
+            .forward_stream_with_failover(
+                &mut out,
+                &raw_request(body),
+                body.as_bytes(),
+                "POST",
+                "/v1/responses",
+                1,
+            )
+            .unwrap_err();
+        handle.join().unwrap();
+
+        assert!(err.to_string().contains("quota exhausted"), "{err}");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("response.failed"), "{text}");
+        assert!(text.contains("response.completed"), "{text}");
+        let row = &runtime.snapshot().rows[0];
+        assert_eq!(row.success_requests, 0);
+        assert_eq!(row.failure_requests, 1);
+    }
+
+    #[test]
+    fn aggregate_stream_keeps_failed_terminal_state_when_failed_follows_completed() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let _ = read_http_request(&mut socket).unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            socket
+                .write_all(
+                    concat!(
+                        "event: response.completed\n",
+                        "data: {}\n\n",
+                        "event: response.failed\n",
+                        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"late failure\"}}}\n\n",
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = AggregateEgressRuntime::new(
+            AggregateEgressConfig {
+                enabled: true,
+                fingerprints: vec![AggregateFingerprint::Chrome132],
+                recent_fingerprint_window: 0,
+                recent_fingerprint_ttl_seconds: 0,
+            },
+            vec![seed(
+                "dc",
+                &format!("http://127.0.0.1:{port}/v1"),
+                "sk-completed-then-failed",
+            )],
+            temp.path().join("quality.json"),
+            None,
+            35,
+        )
+        .unwrap();
+        let body = r#"{"model":"gpt-5.5","input":"hello","stream":true}"#;
+        let mut out = Vec::new();
+
+        let err = runtime
+            .forward_stream_with_failover(
+                &mut out,
+                &raw_request(body),
+                body.as_bytes(),
+                "POST",
+                "/v1/responses",
+                1,
+            )
+            .unwrap_err();
+        handle.join().unwrap();
+
+        assert!(err.to_string().contains("late failure"), "{err}");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("response.completed"), "{text}");
+        assert!(text.contains("response.failed"), "{text}");
+        let row = &runtime.snapshot().rows[0];
+        assert_eq!(row.success_requests, 0);
+        assert_eq!(row.failure_requests, 1);
+    }
+
+    #[test]
+    fn aggregate_stream_non_success_preserves_error_message() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let _ = read_http_request(&mut socket).unwrap();
+            let body = r#"{"error":{"message":"quota exhausted","code":"insufficient_quota"}}"#;
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).unwrap();
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = AggregateEgressRuntime::new(
+            AggregateEgressConfig {
+                enabled: true,
+                fingerprints: vec![AggregateFingerprint::Chrome132],
+                recent_fingerprint_window: 0,
+                recent_fingerprint_ttl_seconds: 0,
+            },
+            vec![seed(
+                "dc",
+                &format!("http://127.0.0.1:{port}/v1"),
+                "sk-stream",
+            )],
+            temp.path().join("quality.json"),
+            None,
+            35,
+        )
+        .unwrap();
+        let body = r#"{"model":"gpt-5.5","input":"hello","stream":true}"#;
+        let mut out = Vec::new();
+
+        let err = runtime
+            .forward_stream_with_failover(
+                &mut out,
+                &raw_request(body),
+                body.as_bytes(),
+                "POST",
+                "/v1/responses",
+                1,
+            )
+            .unwrap_err();
+        handle.join().unwrap();
+
+        let text = err.to_string();
+        assert!(text.contains("aggregate upstream returned 400"), "{text}");
+        assert!(text.contains("quota exhausted"), "{text}");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn aggregate_invalid_encrypted_content_response_does_not_retry_or_penalize_key() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            while done_rx.try_recv().is_err() {
+                match upstream.accept() {
+                    Ok((mut socket, _)) => {
+                        socket.set_nonblocking(false).unwrap();
+                        let raw = read_http_request(&mut socket).unwrap();
+                        requests.push(String::from_utf8_lossy(&raw).to_string());
+                        let body = invalid_encrypted_content_body();
+                        let response = format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        socket.write_all(response.as_bytes()).unwrap();
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) => panic!("accept failed: {err}"),
+                }
+            }
+            requests
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = AggregateEgressRuntime::new(
+            AggregateEgressConfig {
+                enabled: true,
+                fingerprints: vec![AggregateFingerprint::Chrome132],
+                recent_fingerprint_window: 0,
+                recent_fingerprint_ttl_seconds: 0,
+            },
+            vec![seed(
+                "dc",
+                &format!("http://127.0.0.1:{port}/v1"),
+                "sk-bad-blob",
+            )],
+            temp.path().join("quality.json"),
+            None,
+            35,
+        )
+        .unwrap();
+        let body = r#"{"model":"gpt-5.5","input":"hello"}"#;
+
+        let response = runtime
+            .forward_with_failover(
+                &raw_request(body),
+                body.as_bytes(),
+                "POST",
+                "/v1/responses",
+                2,
+            )
+            .unwrap();
+        done_tx.send(()).unwrap();
+        let requests = handle.join().unwrap();
+
+        assert_eq!(response.status, 400);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(runtime.snapshot().rows[0].failure_requests, 0);
+    }
+
+    #[test]
+    fn aggregate_invalid_encrypted_content_does_not_block_immediate_stripped_retry() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while requests.len() < 2 && Instant::now() < deadline {
+                match upstream.accept() {
+                    Ok((mut socket, _)) => {
+                        socket.set_nonblocking(false).unwrap();
+                        let raw = read_http_request(&mut socket).unwrap();
+                        requests.push(String::from_utf8_lossy(&raw).to_string());
+                        if requests.len() == 1 {
+                            let body = invalid_encrypted_content_body();
+                            let response = format!(
+                                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            socket.write_all(response.as_bytes()).unwrap();
+                        } else {
+                            let body = r#"{"output_text":"ok"}"#;
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            socket.write_all(response.as_bytes()).unwrap();
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(err) => panic!("accept failed: {err}"),
+                }
+            }
+            requests
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let mut seed = seed("dc", &format!("http://127.0.0.1:{port}/v1"), "sk-bad");
+        seed.max_qps = Some(1);
+        seed.max_rpm = Some(1);
+        let runtime = AggregateEgressRuntime::new(
+            AggregateEgressConfig {
+                enabled: true,
+                fingerprints: vec![AggregateFingerprint::Chrome132],
+                recent_fingerprint_window: 0,
+                recent_fingerprint_ttl_seconds: 0,
+            },
+            vec![seed],
+            temp.path().join("quality.json"),
+            None,
+            35,
+        )
+        .unwrap();
+        let bad_body = r#"{"model":"gpt-5.5","input":[{"type":"reasoning","encrypted_content":"bad-token"},{"role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#;
+        let stripped_body = r#"{"model":"gpt-5.5","input":[{"type":"reasoning"},{"role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#;
+
+        let first = runtime
+            .forward_with_failover(
+                &raw_request(bad_body),
+                bad_body.as_bytes(),
+                "POST",
+                "/v1/responses",
+                1,
+            )
+            .unwrap();
+        assert_eq!(first.status, 400);
+        let second = runtime
+            .forward_with_failover(
+                &raw_request(stripped_body),
+                stripped_body.as_bytes(),
+                "POST",
+                "/v1/responses",
+                1,
+            )
+            .unwrap();
+        let requests = handle.join().unwrap();
+
+        assert_eq!(second.status, 200);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("encrypted_content"));
+        assert!(!requests[1].contains("encrypted_content"));
+    }
+
+    #[test]
+    fn aggregate_stream_invalid_encrypted_content_does_not_retry_or_penalize_key() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            while done_rx.try_recv().is_err() {
+                match upstream.accept() {
+                    Ok((mut socket, _)) => {
+                        socket.set_nonblocking(false).unwrap();
+                        let raw = read_http_request(&mut socket).unwrap();
+                        requests.push(String::from_utf8_lossy(&raw).to_string());
+                        let body = invalid_encrypted_content_body();
+                        let response = format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        socket.write_all(response.as_bytes()).unwrap();
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) => panic!("accept failed: {err}"),
+                }
+            }
+            requests
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = AggregateEgressRuntime::new(
+            AggregateEgressConfig {
+                enabled: true,
+                fingerprints: vec![AggregateFingerprint::Chrome132],
+                recent_fingerprint_window: 0,
+                recent_fingerprint_ttl_seconds: 0,
+            },
+            vec![seed(
+                "dc",
+                &format!("http://127.0.0.1:{port}/v1"),
+                "sk-bad-stream",
+            )],
+            temp.path().join("quality.json"),
+            None,
+            35,
+        )
+        .unwrap();
+        let body = r#"{"model":"gpt-5.5","input":"hello","stream":true}"#;
+        let mut out = Vec::new();
+
+        let err = runtime
+            .forward_stream_with_failover(
+                &mut out,
+                &raw_request(body),
+                body.as_bytes(),
+                "POST",
+                "/v1/responses",
+                2,
+            )
+            .unwrap_err();
+        done_tx.send(()).unwrap();
+        let requests = handle.join().unwrap();
+
+        let text = err.to_string();
+        assert!(text.contains("encrypted content"), "{text}");
+        assert_eq!(requests.len(), 1);
+        assert!(out.is_empty());
+        assert_eq!(runtime.snapshot().rows[0].failure_requests, 0);
+    }
+
+    #[test]
+    fn aggregate_stream_local_disconnect_does_not_retry_or_penalize_key() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            while done_rx.try_recv().is_err() {
+                match upstream.accept() {
+                    Ok((mut socket, _)) => {
+                        socket.set_nonblocking(false).unwrap();
+                        let raw = read_http_request(&mut socket).unwrap();
+                        requests.push(String::from_utf8_lossy(&raw).to_string());
+                        socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                            .unwrap();
+                        socket
+                            .write_all(b"event: response.completed\ndata: {}\n\n")
+                            .unwrap();
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) => panic!("accept failed: {err}"),
+                }
+            }
+            requests
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = AggregateEgressRuntime::new(
+            AggregateEgressConfig {
+                enabled: true,
+                fingerprints: vec![AggregateFingerprint::Chrome132],
+                recent_fingerprint_window: 0,
+                recent_fingerprint_ttl_seconds: 0,
+            },
+            vec![seed(
+                "dc",
+                &format!("http://127.0.0.1:{port}/v1"),
+                "sk-local-disconnect",
+            )],
+            temp.path().join("quality.json"),
+            None,
+            35,
+        )
+        .unwrap();
+        let body = r#"{"model":"gpt-5.5","input":"hello","stream":true}"#;
+        let mut writer = BrokenPipeWriter;
+
+        let err = runtime
+            .forward_stream_with_failover(
+                &mut writer,
+                &raw_request(body),
+                body.as_bytes(),
+                "POST",
+                "/v1/responses",
+                2,
+            )
+            .unwrap_err();
+        done_tx.send(()).unwrap();
+        let requests = handle.join().unwrap();
+
+        assert!(err.to_string().contains("client disconnected"), "{err}");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(runtime.snapshot().rows[0].failure_requests, 0);
     }
 
     #[test]
@@ -2520,7 +3777,24 @@ mod tests {
         assert!(!block.contains("let _ = store.save"));
         assert!(source.contains("if store.save(path).is_ok()"));
         assert!(source.contains("for _ in 0..attempts.max(1)"));
-        assert!(block.contains("40"));
+        assert!(source.contains("const QUALITY_FLUSH_ATTEMPTS: usize = 40"));
+    }
+
+    #[test]
+    fn aggregate_quality_writer_fast_flush_is_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let blocked_parent = temp.path().join("blocked-parent");
+        fs::write(&blocked_parent, "not a directory").unwrap();
+        let writer = QualityWriteHandle::new(blocked_parent.join("quality.json"));
+        writer.persist("key-a".to_string(), PersistedKeyQuality::default());
+
+        let started = Instant::now();
+        writer.flush_with_timeout(Duration::from_millis(80), 1);
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "fast aggregate quality flush must not wait for the full retry window"
+        );
     }
 
     #[test]
@@ -2787,7 +4061,9 @@ mod tests {
         runtime.activate_combo_node(&combo);
 
         let requests = handle.join().unwrap();
-        assert!(requests.iter().any(|request| request.contains(r#""name":"node-b""#)));
+        assert!(requests
+            .iter()
+            .any(|request| request.contains(r#""name":"node-b""#)));
         assert!(!runtime
             .request_egress_ip_cache
             .lock()

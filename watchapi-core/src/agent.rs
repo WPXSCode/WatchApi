@@ -2,16 +2,18 @@ use crate::codex_files::{
     apply_codex_endpoint, ensure_codex_unattended_state, get_current_model_provider,
 };
 use crate::config::{
+    agent_driver_from_command_part, shell_wrapper_command_start, split_shell_like_command,
     AgentCommand, AgentDriver as AgentDriverKind, AppConfig, ContinuationMode, EndpointConfig,
 };
 use crate::cooldown::cooldown_seconds_from_text;
 use crate::sessions::{
-    ClaudeSessionIndex, ClaudeSessionMonitor, CodexSessionIndex, CodexSessionMonitor,
-    OpenCodeSessionMonitor, SessionBindingKey, SessionStore,
+    codex_session_file_matches, discover_codex_session_homes, ClaudeSessionIndex,
+    ClaudeSessionMonitor, CodexSessionIndex, CodexSessionMonitor, OpenCodeSessionMonitor,
+    SessionBindingKey, SessionStore,
 };
 use crate::terminal::{
-    resolved_command_parts, InputSource, TerminalControl, TerminalError, TerminalSession,
-    TerminalSnapshot,
+    resolved_command_parts, InputSource, TerminalActivityWakeup, TerminalControl, TerminalError,
+    TerminalSession, TerminalSnapshot,
 };
 use crate::terminal_emulator::TerminalView;
 use crate::tokens::TokenUsage;
@@ -20,7 +22,7 @@ use chrono::Utc;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const CODEX_READY_UNLOCK_GRACE: Duration = Duration::from_secs(2);
 const CODEX_STALE_WORKING_UNLOCK_GRACE: Duration = Duration::from_secs(20);
@@ -75,6 +77,13 @@ pub enum MissingSessionPolicy {
 struct IsolatedCodexHome {
     home: PathBuf,
     source_home: PathBuf,
+    session_baseline: HashMap<PathBuf, SessionFileFingerprint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionFileFingerprint {
+    len: u64,
+    modified_millis: Option<u128>,
 }
 
 enum AgentSessionMonitor {
@@ -100,25 +109,25 @@ impl AgentSessionMonitor {
         }
     }
 
-    fn pollution_detected(&self) -> bool {
+    fn take_pollution_detected(&mut self) -> bool {
         match self {
-            Self::Codex(monitor) => monitor.pollution_detected,
-            Self::Claude(monitor) => monitor.pollution_detected,
-            Self::OpenCode(monitor) => monitor.pollution_detected,
+            Self::Codex(monitor) => std::mem::take(&mut monitor.pollution_detected),
+            Self::Claude(monitor) => std::mem::take(&mut monitor.pollution_detected),
+            Self::OpenCode(monitor) => std::mem::take(&mut monitor.pollution_detected),
         }
     }
 
-    fn completion_pause_detected(&self) -> bool {
+    fn take_completion_pause_detected(&mut self) -> bool {
         match self {
-            Self::Codex(monitor) => monitor.completion_pause_detected,
-            Self::Claude(monitor) => monitor.completion_pause_detected,
-            Self::OpenCode(monitor) => monitor.completion_pause_detected,
+            Self::Codex(monitor) => std::mem::take(&mut monitor.completion_pause_detected),
+            Self::Claude(monitor) => std::mem::take(&mut monitor.completion_pause_detected),
+            Self::OpenCode(monitor) => std::mem::take(&mut monitor.completion_pause_detected),
         }
     }
 
-    fn endpoint_failure_detected(&self) -> bool {
+    fn take_endpoint_failure_detected(&mut self) -> bool {
         match self {
-            Self::Codex(monitor) => monitor.endpoint_failure_detected,
+            Self::Codex(monitor) => std::mem::take(&mut monitor.endpoint_failure_detected),
             Self::Claude(_) | Self::OpenCode(_) => false,
         }
     }
@@ -257,8 +266,29 @@ impl AgentProcess {
             );
             self.isolated_codex_home = Some(isolated_home);
         }
-        let mut launch = self.build_launch_for_config(&launch_config)?;
+        let mut launch =
+            self.build_launch_for_runtime_config(&launch_config, &self.config.clone())?;
         if launch_config.agent_driver == AgentDriverKind::Codex {
+            if let Some(session_id) = launch.session_id.as_deref().filter(|_| launch.resumed) {
+                let binding = session_binding_key(&self.config, &self.endpoint);
+                let bound_session_path = self.store.get_bound_session_path(&binding);
+                let copied_session = copy_codex_resume_session_to_isolated_home(
+                    &self.config.codex_home,
+                    &launch_config.codex_home,
+                    &self.endpoint.workdir,
+                    session_id,
+                    bound_session_path.as_deref(),
+                )?;
+                self.store
+                    .set_bound_session_id(&binding, session_id, Some(&copied_session))?;
+                if let Some(isolated) = self.isolated_codex_home.as_mut() {
+                    add_codex_session_baseline_file(
+                        &mut isolated.session_baseline,
+                        &isolated.home,
+                        &copied_session,
+                    );
+                }
+            }
             ensure_codex_unattended_state(&launch_config.codex_home)?;
             apply_codex_endpoint(
                 &self.endpoint,
@@ -292,13 +322,20 @@ impl AgentProcess {
         if let Some(pid) = terminal.process_id() {
             terminal.push_local_output(&format!("> PTY PID: {pid}\r\n"));
         }
+        let direct_pollution_keywords = if self.endpoint.guard_proxy.enabled
+            && self.endpoint.guard_proxy.replace_direct_pollution_detection
+        {
+            Vec::new()
+        } else {
+            launch_config.polluted_response_keywords.clone()
+        };
         self.monitor = match launch_config.agent_driver {
             AgentDriverKind::Codex => Some(AgentSessionMonitor::Codex(CodexSessionMonitor::new(
                 launch_config.codex_home.clone(),
                 self.endpoint.workdir.clone(),
                 Utc::now(),
                 launch.session_id.clone(),
-                launch_config.polluted_response_keywords.clone(),
+                direct_pollution_keywords.clone(),
                 launch_config.completion_pause_keywords.clone(),
                 launch_config.polluted_response_threshold,
                 launch_config.polluted_context_window,
@@ -313,7 +350,7 @@ impl AgentProcess {
                     self.endpoint.workdir.clone(),
                     Utc::now(),
                     launch.session_id.clone(),
-                    launch_config.polluted_response_keywords.clone(),
+                    direct_pollution_keywords.clone(),
                     launch_config.completion_pause_keywords.clone(),
                     launch_config.polluted_response_threshold,
                     launch_config.polluted_context_window,
@@ -326,7 +363,7 @@ impl AgentProcess {
                     self.endpoint.workdir.clone(),
                     Utc::now(),
                     launch.session_id.clone(),
-                    launch_config.polluted_response_keywords.clone(),
+                    direct_pollution_keywords.clone(),
                     launch_config.completion_pause_keywords.clone(),
                     launch_config.polluted_response_threshold,
                     launch_config.polluted_context_window,
@@ -347,7 +384,11 @@ impl AgentProcess {
         }
         self.monitor = None;
         if let Some(isolated) = self.isolated_codex_home.take() {
-            let _ = merge_codex_sessions_back(&isolated.home, &isolated.source_home);
+            let _ = merge_codex_sessions_back_with_baseline(
+                &isolated.home,
+                &isolated.source_home,
+                &isolated.session_baseline,
+            );
         }
     }
 
@@ -361,19 +402,24 @@ impl AgentProcess {
         self.drain_terminal_events();
         self.refresh_observed_terminal_view_text();
         self.handle_terminal_prompts();
+        let mut discovered_session = false;
         if let Some(monitor) = self.monitor.as_mut() {
             monitor.poll();
             if let Some(session_id) = monitor.session_id() {
                 if let Some(launch) = self.launch.as_mut() {
                     launch.session_id.get_or_insert(session_id);
                 }
+                discovered_session = true;
             }
-            self.pollution_detected |= monitor.pollution_detected();
-            self.completion_pause_detected |= monitor.completion_pause_detected();
-            self.endpoint_failure_detected |= monitor.endpoint_failure_detected();
+            self.pollution_detected |= monitor.take_pollution_detected();
+            self.completion_pause_detected |= monitor.take_completion_pause_detected();
+            self.endpoint_failure_detected |= monitor.take_endpoint_failure_detected();
             if !monitor.token_usage_total().is_empty() {
                 self.token_usage_total = monitor.token_usage_total();
             }
+        }
+        if discovered_session {
+            let _ = self.capture_session_id(&self.endpoint.workdir.clone());
         }
     }
 
@@ -383,6 +429,12 @@ impl AgentProcess {
 
     pub fn terminal_control(&self) -> Option<TerminalControl> {
         self.terminal.as_ref().map(TerminalSession::control)
+    }
+
+    pub fn set_terminal_activity_wakeup(&self, wakeup: Option<TerminalActivityWakeup>) {
+        if let Some(terminal) = &self.terminal {
+            terminal.set_activity_wakeup(wakeup);
+        }
     }
 
     pub fn terminal_output_text(&self) -> String {
@@ -481,6 +533,14 @@ impl AgentProcess {
         Ok(())
     }
 
+    pub fn clear_terminal_local_view(&self) -> Result<(), TerminalError> {
+        self.terminal
+            .as_ref()
+            .ok_or(TerminalError::NotRunning)?
+            .clear_local_view();
+        Ok(())
+    }
+
     pub fn send_prompt(&mut self, prompt: &str) -> Result<(), TerminalError> {
         self.poll_monitor();
         if !self.can_send_prompt() {
@@ -501,10 +561,12 @@ impl AgentProcess {
             &self.config.prompt_submit_sequence,
             InputSource::Auto,
         )?;
+        let sent_view_revision = terminal.view_revision();
+        self.clear_stale_terminal_failure_signals();
         let now = Instant::now();
         self.last_prompt_sent_at = Some(now);
         self.last_submit_attempt_at = Some(now);
-        self.last_prompt_sent_view_revision = Some(terminal.view_revision());
+        self.last_prompt_sent_view_revision = Some(sent_view_revision);
         self.submit_retry_count = 0;
         self.awaiting_turn_completion = true;
         self.saw_ready_banner = false;
@@ -514,6 +576,14 @@ impl AgentProcess {
             monitor.begin_waiting_for_new_turn();
         }
         Ok(())
+    }
+
+    fn clear_stale_terminal_failure_signals(&mut self) {
+        self.recent_output.clear();
+        self.endpoint_failure_detected = false;
+        self.transient_endpoint_failure_detected = false;
+        self.endpoint_failure_status_code = None;
+        self.endpoint_failure_retry_after_seconds = None;
     }
 
     pub fn retry_submit(&mut self) -> Result<(), TerminalError> {
@@ -782,7 +852,9 @@ impl AgentProcess {
             .and_then(|launch| launch.session_id.as_deref())
         {
             let key = session_binding_key(&self.config, &self.endpoint);
-            self.store.set_bound_session_id(&key, session_id, None)?;
+            let session_path = self.store.get_bound_session_path(&key);
+            self.store
+                .set_bound_session_id(&key, session_id, session_path.as_deref())?;
         }
         Ok(())
     }
@@ -799,6 +871,21 @@ impl AgentProcess {
             &self.endpoint,
             &mut self.store,
             &codex_index,
+            self.force_new_session,
+            MissingSessionPolicy::New,
+        )
+    }
+
+    fn build_launch_for_runtime_config(
+        &mut self,
+        runtime_config: &AppConfig,
+        restore_config: &AppConfig,
+    ) -> Result<AgentLaunch> {
+        build_agent_launch_for_codex_restore_home(
+            runtime_config,
+            restore_config,
+            &self.endpoint,
+            &mut self.store,
             self.force_new_session,
             MissingSessionPolicy::New,
         )
@@ -1133,6 +1220,48 @@ pub fn build_agent_launch_with_policy(
     }
 }
 
+fn build_agent_launch_for_codex_restore_home(
+    runtime_config: &AppConfig,
+    restore_config: &AppConfig,
+    endpoint: &EndpointConfig,
+    store: &mut SessionStore,
+    force_new_session: bool,
+    missing_policy: MissingSessionPolicy,
+) -> Result<AgentLaunch> {
+    if runtime_config.agent_driver != AgentDriverKind::Codex {
+        let index = CodexSessionIndex::new(runtime_config.codex_home.clone());
+        return build_agent_launch_with_policy(
+            runtime_config,
+            endpoint,
+            store,
+            &index,
+            force_new_session,
+            missing_policy,
+        );
+    }
+    let mut additional_homes = historical_isolated_codex_homes();
+    additional_homes.push(runtime_config.codex_home.clone());
+    let codex_index = CodexSessionIndex::new(restore_config.codex_home.clone())
+        .with_additional_homes(additional_homes);
+    let session_id = resume_session_id(
+        restore_config,
+        endpoint,
+        store,
+        &codex_index,
+        force_new_session,
+        missing_policy,
+    )?;
+    Ok(AgentLaunch {
+        command: codex_resume_command(
+            &codex_goal_feature_command(runtime_config),
+            &endpoint.workdir,
+            session_id.as_deref(),
+        ),
+        resumed: session_id.is_some(),
+        session_id,
+    })
+}
+
 fn claude_resume_session_id(
     config: &AppConfig,
     endpoint: &EndpointConfig,
@@ -1183,10 +1312,17 @@ fn resume_session_id(
             store.delete_bound_session_id(&binding)?;
             return Ok(None);
         }
-        if index
-            .find_latest_session_file_for_workdir(&endpoint.workdir, Some(&session_id))
-            .is_some()
+        if store
+            .get_bound_session_path(&binding)
+            .as_deref()
+            .is_some_and(|path| codex_session_file_matches(path, &endpoint.workdir, &session_id))
         {
+            return Ok(Some(session_id));
+        }
+        if let Some((_, path)) =
+            index.find_latest_session_for_workdir(&endpoint.workdir, Some(&session_id))
+        {
+            store.set_bound_session_id(&binding, &session_id, Some(&path))?;
             return Ok(Some(session_id));
         }
         store.delete_bound_session_id(&binding)?;
@@ -1194,8 +1330,9 @@ fn resume_session_id(
     if missing_policy == MissingSessionPolicy::New {
         return Ok(None);
     }
-    if let Some(session_id) = index.find_latest_session_id_for_workdir(&endpoint.workdir) {
-        store.set_bound_session_id(&binding, &session_id, None)?;
+    if let Some((session_id, path)) = index.find_latest_session_for_workdir(&endpoint.workdir, None)
+    {
+        store.set_bound_session_id(&binding, &session_id, Some(&path))?;
         return Ok(Some(session_id));
     }
     Ok(None)
@@ -1388,19 +1525,16 @@ fn prepare_isolated_codex_home(config: &AppConfig) -> Result<IsolatedCodexHome> 
             home.join(".codex-global-state.json").display()
         )
     })?;
-    copy_dir_recursive_best_effort(&config.codex_home.join("sessions"), &home.join("sessions"));
-    copy_dir_recursive_best_effort(
-        &config.codex_home.join("archived_sessions"),
-        &home.join("archived_sessions"),
-    );
     copy_file_if_exists(
         &config.codex_home.join("state_5.sqlite"),
         &home.join("state_5.sqlite"),
     )?;
+    let session_baseline = collect_codex_session_baseline(&home);
 
     Ok(IsolatedCodexHome {
         home,
         source_home: config.codex_home.clone(),
+        session_baseline,
     })
 }
 
@@ -1417,6 +1551,10 @@ fn app_runtime_dir() -> PathBuf {
         .and_then(|path| path.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         .join("Runtime")
+}
+
+fn historical_isolated_codex_homes() -> Vec<PathBuf> {
+    discover_codex_session_homes(&app_runtime_dir().join("codex-homes"))
 }
 
 fn stable_config_key(config: &AppConfig) -> String {
@@ -1490,6 +1628,19 @@ fn codex_command_with_cli_overrides(
         "-c".to_string(),
         "approval_policy=\"never\"".to_string(),
         "-c".to_string(),
+        "status_line=true".to_string(),
+        "-c".to_string(),
+        "status_line_use_colors=true".to_string(),
+        "-c".to_string(),
+        "tui.status_line=[\"model-with-reasoning\",\"context-remaining\",\"current-dir\",\"git-branch\",\"context-used\"]"
+            .to_string(),
+        "-c".to_string(),
+        "tui.show_tooltips=true".to_string(),
+        "-c".to_string(),
+        "tui.animations=true".to_string(),
+        "-c".to_string(),
+        "tui.raw_output_mode=false".to_string(),
+        "-c".to_string(),
         format!("model_provider={}", toml_cli_string(&provider_name)),
         "-c".to_string(),
         format!(
@@ -1509,29 +1660,50 @@ fn codex_command_with_cli_overrides(
     }
     match command {
         AgentCommand::Args(items) => {
-            let mut out = Vec::new();
-            if let Some(first) = items.first() {
-                out.push(first.clone());
-                out.append(&mut overrides);
-                out.extend(items.iter().skip(1).cloned());
-            }
-            AgentCommand::Args(out)
+            AgentCommand::Args(insert_codex_cli_overrides(items, overrides))
         }
         AgentCommand::Shell(text) => {
-            let extra = overrides
-                .into_iter()
-                .map(|item| {
-                    if item.contains(' ') {
-                        format!("\"{}\"", item.replace('"', "\\\""))
-                    } else {
-                        item
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-            AgentCommand::Shell(format!("{text} {extra}"))
+            let parts = split_shell_like_command(&text);
+            if parts.is_empty() {
+                return AgentCommand::Shell(text);
+            }
+            AgentCommand::Args(insert_codex_cli_overrides(parts, overrides))
         }
     }
+}
+
+fn insert_codex_cli_overrides(mut parts: Vec<String>, mut overrides: Vec<String>) -> Vec<String> {
+    if parts.is_empty() {
+        return parts;
+    }
+    if is_codex_command_part(&parts[0]) {
+        parts.splice(1..1, overrides);
+        return parts;
+    }
+    if let Some(start) = shell_wrapper_command_start(&parts) {
+        if is_codex_command_part(&parts[start]) {
+            parts.splice(start + 1..start + 1, overrides);
+            return parts;
+        }
+        let nested = split_shell_like_command(&parts[start]);
+        if nested
+            .first()
+            .is_some_and(|part| is_codex_command_part(part))
+        {
+            let mut replacement = Vec::with_capacity(nested.len() + overrides.len());
+            replacement.push(nested[0].clone());
+            replacement.append(&mut overrides);
+            replacement.extend(nested.into_iter().skip(1));
+            parts.splice(start..start + 1, replacement);
+            return parts;
+        }
+    }
+    parts.splice(1..1, overrides);
+    parts
+}
+
+fn is_codex_command_part(part: &str) -> bool {
+    agent_driver_from_command_part(part) == Some("codex")
 }
 
 fn toml_cli_string(value: &str) -> String {
@@ -1556,58 +1728,168 @@ fn copy_file_if_exists(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-fn copy_file_if_missing(source: &Path, target: &Path) -> Result<()> {
-    if target.exists() {
-        return Ok(());
+fn copy_codex_resume_session_to_isolated_home(
+    source_home: &Path,
+    isolated_home: &Path,
+    workdir: &Path,
+    session_id: &str,
+    source_session_path: Option<&Path>,
+) -> Result<PathBuf> {
+    let source = if let Some(path) = source_session_path {
+        if !codex_session_file_matches(path, workdir, session_id) {
+            anyhow::bail!(
+                "bound Codex session path {} does not match session {session_id} for workdir {}",
+                path.display(),
+                workdir.display()
+            );
+        }
+        path.to_path_buf()
+    } else {
+        let index = CodexSessionIndex::new(source_home.to_path_buf());
+        index
+            .find_latest_session_file_for_workdir(workdir, Some(session_id))
+            .with_context(|| {
+                format!(
+                    "find Codex session {session_id} for workdir {} in {}",
+                    workdir.display(),
+                    source_home.display()
+                )
+            })?
+    };
+    let relative = codex_session_relative_path(&source, source_home)?;
+    let target = isolated_home.join(relative);
+    if paths_equivalent(&source, &target) {
+        return Ok(target);
     }
-    copy_file_if_exists(source, target)
+    copy_file_if_exists(&source, &target).with_context(|| {
+        format!(
+            "copy Codex resume session from {} to {}",
+            source.display(),
+            target.display()
+        )
+    })?;
+    Ok(target)
 }
 
-fn copy_dir_recursive_if_exists(source: &Path, target: &Path) -> Result<()> {
-    if !source.exists() {
-        return Ok(());
+fn codex_session_relative_path(source: &Path, source_home: &Path) -> Result<PathBuf> {
+    if let Ok(relative) = source.strip_prefix(source_home) {
+        return Ok(relative.to_path_buf());
     }
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let path = entry.path();
-        let relative = path.strip_prefix(source).unwrap_or(path.as_path());
-        let target_path = target.join(relative);
-        if path.is_dir() {
-            fs::create_dir_all(&target_path)?;
-            copy_dir_recursive_if_exists(&path, &target_path)?;
-        } else {
-            copy_file_if_exists(&path, &target_path)?;
+    let mut relative = PathBuf::new();
+    let mut copying = false;
+    for component in source.components() {
+        if let std::path::Component::Normal(value) = component {
+            let text = value.to_string_lossy();
+            if text.eq_ignore_ascii_case("sessions")
+                || text.eq_ignore_ascii_case("archived_sessions")
+            {
+                copying = true;
+            }
+        }
+        if copying {
+            relative.push(Path::new(component.as_os_str()));
         }
     }
-    Ok(())
+    if copying {
+        return Ok(relative);
+    }
+    anyhow::bail!(
+        "session path {} is outside {} and does not contain a sessions directory",
+        source.display(),
+        source_home.display()
+    )
 }
 
-fn copy_dir_recursive_best_effort(source: &Path, target: &Path) {
-    if !source.exists() {
-        return;
+fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
     }
-    let Ok(entries) = fs::read_dir(source) else {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn collect_codex_session_baseline(home: &Path) -> HashMap<PathBuf, SessionFileFingerprint> {
+    let mut out = HashMap::new();
+    for root_name in ["sessions", "archived_sessions"] {
+        let root = home.join(root_name);
+        for path in jsonl_files_under(&root) {
+            let relative = path
+                .strip_prefix(home)
+                .unwrap_or(path.as_path())
+                .to_path_buf();
+            if let Some(fingerprint) = session_file_fingerprint(&path) {
+                out.insert(relative, fingerprint);
+            }
+        }
+    }
+    out
+}
+
+fn add_codex_session_baseline_file(
+    baseline: &mut HashMap<PathBuf, SessionFileFingerprint>,
+    home: &Path,
+    path: &Path,
+) {
+    let relative = path.strip_prefix(home).unwrap_or(path).to_path_buf();
+    if let Some(fingerprint) = session_file_fingerprint(path) {
+        baseline.insert(relative, fingerprint);
+    }
+}
+
+fn session_file_fingerprint(path: &Path) -> Option<SessionFileFingerprint> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified_millis = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis());
+    Some(SessionFileFingerprint {
+        len: metadata.len(),
+        modified_millis,
+    })
+}
+
+fn jsonl_files_under(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    collect_jsonl_files_under(root, &mut out);
+    out
+}
+
+fn collect_jsonl_files_under(path: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(path) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let relative = path.strip_prefix(source).unwrap_or(path.as_path());
-        let target_path = target.join(relative);
         if path.is_dir() {
-            let _ = fs::create_dir_all(&target_path);
-            copy_dir_recursive_best_effort(&path, &target_path);
-        } else {
-            let _ = copy_file_if_missing(&path, &target_path);
+            collect_jsonl_files_under(&path, out);
+        } else if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
+            out.push(path);
         }
     }
 }
 
-fn merge_codex_sessions_back(temp_home: &Path, source_home: &Path) -> Result<()> {
-    copy_dir_recursive_if_exists(&temp_home.join("sessions"), &source_home.join("sessions"))?;
-    copy_dir_recursive_if_exists(
-        &temp_home.join("archived_sessions"),
-        &source_home.join("archived_sessions"),
-    )?;
+fn merge_codex_sessions_back_with_baseline(
+    temp_home: &Path,
+    source_home: &Path,
+    baseline: &HashMap<PathBuf, SessionFileFingerprint>,
+) -> Result<()> {
+    for root_name in ["sessions", "archived_sessions"] {
+        let root = temp_home.join(root_name);
+        for path in jsonl_files_under(&root) {
+            let relative = path
+                .strip_prefix(temp_home)
+                .unwrap_or(path.as_path())
+                .to_path_buf();
+            let current = session_file_fingerprint(&path);
+            if current.is_some() && baseline.get(&relative).copied() == current {
+                continue;
+            }
+            copy_file_if_exists(&path, &source_home.join(&relative))?;
+        }
+    }
     copy_file_if_exists(
         &temp_home.join(".codex-global-state.json"),
         &source_home.join(".codex-global-state.json"),
@@ -1622,7 +1904,7 @@ fn merge_codex_sessions_back(temp_home: &Path, source_home: &Path) -> Result<()>
 fn command_args(command: &AgentCommand) -> Vec<String> {
     match command {
         AgentCommand::Args(items) => items.clone(),
-        AgentCommand::Shell(text) => text.split_whitespace().map(str::to_string).collect(),
+        AgentCommand::Shell(text) => split_shell_like_command(text),
     }
 }
 
@@ -1724,17 +2006,27 @@ fn codex_busy_prompt_visible(text: &str) -> bool {
 }
 
 fn codex_working_prompt_visible(text: &str) -> bool {
-    let lowered = text.to_ascii_lowercase();
-    let has_working = lowered.contains("working")
-        || text.contains("运行中")
-        || text.contains("处理中")
-        || text.contains("正在执行");
-    has_working
-        && (lowered.contains("interrupt")
+    text.lines().any(|line| {
+        if line.contains('›') {
+            return false;
+        }
+        let lowered = line.to_ascii_lowercase();
+        let has_working = lowered.contains("working")
+            || line.contains("运行中")
+            || line.contains("处理中")
+            || line.contains("正在执行");
+        let has_interrupt_control = lowered.contains("interrupt")
             || lowered.contains("esc")
             || lowered.contains("ctrl")
-            || text.contains("中断")
-            || text.contains("停止"))
+            || line.contains("中断")
+            || line.contains("停止");
+        let has_codex_interrupt_hint = lowered.contains("esc to interrupt")
+            || lowered.contains("ctrl-c to interrupt")
+            || lowered.contains("ctrl+c to interrupt")
+            || line.contains("esc 中断");
+
+        (has_working && has_interrupt_control) || has_codex_interrupt_hint
+    })
 }
 
 fn codex_queued_message_visible(text: &str) -> bool {
@@ -2005,6 +2297,7 @@ fn _launch_started_at() -> chrono::DateTime<Utc> {
 mod tests {
     use super::*;
     use crate::config::{AgentCommand, AgentDriver};
+    use chrono::Utc;
     use serde_json::json;
     use std::fs;
     use std::io::Write;
@@ -2075,6 +2368,158 @@ mod tests {
         }
     }
 
+    fn assert_session_monitor_signals_are_consumed_once(
+        driver: AgentDriver,
+        monitor: AgentSessionMonitor,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let cfg = config(
+            workdir.clone(),
+            driver,
+            AgentCommand::Args(vec!["codex".to_string()]),
+            tmp.path().join("state.json"),
+            tmp.path().join(".codex"),
+        );
+        let endpoint = cfg.endpoints[0].clone();
+        let mut agent = AgentProcess::new(cfg, endpoint, false);
+        agent.monitor = Some(monitor);
+
+        agent.poll_monitor();
+        assert!(agent.pollution_detected);
+        assert!(agent.completion_pause_detected);
+
+        agent.pollution_detected = false;
+        agent.completion_pause_detected = false;
+        agent.endpoint_failure_detected = false;
+        agent.poll_monitor();
+        assert!(!agent.pollution_detected);
+        assert!(!agent.completion_pause_detected);
+        assert!(!agent.endpoint_failure_detected);
+    }
+
+    #[test]
+    fn session_monitor_pollution_and_pause_signals_are_consumed_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let mut monitor = CodexSessionMonitor::new(
+            tmp.path().join(".codex"),
+            workdir.clone(),
+            Utc::now(),
+            None,
+            vec![],
+            vec![],
+            0.35,
+            12,
+            300,
+        );
+        monitor.pollution_detected = true;
+        monitor.completion_pause_detected = true;
+        monitor.endpoint_failure_detected = true;
+        assert_session_monitor_signals_are_consumed_once(
+            AgentDriver::Codex,
+            AgentSessionMonitor::Codex(monitor),
+        );
+
+        let mut monitor = ClaudeSessionMonitor::new(
+            tmp.path().join(".claude"),
+            workdir.clone(),
+            Utc::now(),
+            None,
+            vec![],
+            vec![],
+            0.35,
+            12,
+            300,
+        );
+        monitor.pollution_detected = true;
+        monitor.completion_pause_detected = true;
+        assert_session_monitor_signals_are_consumed_once(
+            AgentDriver::ClaudeCode,
+            AgentSessionMonitor::Claude(monitor),
+        );
+
+        let mut monitor = OpenCodeSessionMonitor::new(
+            vec!["opencode".to_string()],
+            workdir,
+            Utc::now(),
+            None,
+            vec![],
+            vec![],
+            0.35,
+            12,
+            300,
+        );
+        monitor.pollution_detected = true;
+        monitor.completion_pause_detected = true;
+        assert_session_monitor_signals_are_consumed_once(
+            AgentDriver::OpenCode,
+            AgentSessionMonitor::OpenCode(monitor),
+        );
+    }
+
+    #[test]
+    fn codex_session_monitor_endpoint_failure_signal_is_consumed_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let cfg = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Args(vec!["codex".to_string()]),
+            tmp.path().join("state.json"),
+            tmp.path().join(".codex"),
+        );
+        let endpoint = cfg.endpoints[0].clone();
+        let mut agent = AgentProcess::new(cfg, endpoint, false);
+        let mut monitor = CodexSessionMonitor::new(
+            tmp.path().join(".codex"),
+            workdir,
+            Utc::now(),
+            None,
+            vec![],
+            vec![],
+            0.35,
+            12,
+            300,
+        );
+        monitor.endpoint_failure_detected = true;
+        agent.monitor = Some(AgentSessionMonitor::Codex(monitor));
+
+        agent.poll_monitor();
+        assert!(agent.endpoint_failure_detected);
+
+        agent.endpoint_failure_detected = false;
+        agent.poll_monitor();
+        assert!(!agent.endpoint_failure_detected);
+    }
+
+    #[test]
+    fn codex_start_forces_tui_status_before_terminal_launch() {
+        let source = include_str!("agent.rs");
+        let start_block = source
+            .split("pub fn start(&mut self) -> Result<()>")
+            .nth(1)
+            .and_then(|tail| tail.split("pub fn stop(&mut self)").next())
+            .expect("AgentProcess::start block should be discoverable");
+
+        let apply_pos = start_block
+            .find("apply_codex_endpoint(")
+            .expect("Codex startup must write isolated config before launching");
+        let override_pos = start_block
+            .find("codex_command_with_cli_overrides(")
+            .expect("Codex startup must force CLI config overrides");
+        let terminal_pos = start_block
+            .find("TerminalSession::start_with_env(")
+            .expect("terminal launch should be discoverable");
+
+        assert!(apply_pos < terminal_pos);
+        assert!(override_pos < terminal_pos);
+        assert!(start_block.contains("launch_config.agent_driver == AgentDriverKind::Codex"));
+    }
+
     #[test]
     fn codex_launch_without_binding_starts_new_session_by_default() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2107,6 +2552,50 @@ mod tests {
             AgentCommand::Args(vec!["codex".to_string(), "--no-alt-screen".to_string()])
         );
         assert!(!launch.resumed);
+    }
+
+    #[test]
+    fn discovered_session_id_is_bound_before_idle_capture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let mut cfg = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Args(vec!["codex".to_string()]),
+            tmp.path().join("state.json"),
+            tmp.path().join(".codex"),
+        );
+        cfg.config_path = Some(tmp.path().join("config.json"));
+        let endpoint = endpoint(workdir.clone());
+        let mut agent = AgentProcess::new(cfg.clone(), endpoint.clone(), true);
+        agent.launch = Some(AgentLaunch {
+            command: cfg.agent_command.clone(),
+            resumed: false,
+            session_id: None,
+        });
+        agent.monitor = Some(AgentSessionMonitor::Codex(CodexSessionMonitor::new(
+            cfg.codex_home.clone(),
+            workdir.clone(),
+            Utc::now(),
+            None,
+            vec![],
+            vec![],
+            0.35,
+            12,
+            300,
+        )));
+        if let Some(AgentSessionMonitor::Codex(monitor)) = agent.monitor.as_mut() {
+            monitor.session_id = Some("new-session".to_string());
+        }
+
+        agent.poll_monitor();
+
+        let reloaded = SessionStore::new(cfg.session_state_path.clone());
+        assert_eq!(
+            reloaded.get_bound_session_id(&session_binding_key(&cfg, &endpoint)),
+            Some("new-session".to_string())
+        );
     }
 
     #[test]
@@ -2207,6 +2696,188 @@ mod tests {
             ])
         );
         assert!(launch.resumed);
+    }
+
+    #[test]
+    fn codex_restore_lookup_uses_source_home_for_isolated_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let source_home = tmp.path().join(".codex");
+        let session_file = source_home.join("sessions/2026/05/17/source-only.jsonl");
+        fs::create_dir_all(session_file.parent().unwrap()).unwrap();
+        fs::write(
+            &session_file,
+            serde_json::json!({"type": "session_meta", "payload": {"id": "source-session", "cwd": workdir.to_string_lossy()}}).to_string() + "\n",
+        )
+        .unwrap();
+        fs::write(
+            source_home.join("config.toml"),
+            "model_provider = \"custom\"\n",
+        )
+        .unwrap();
+        fs::write(
+            source_home.join("auth.json"),
+            "{\"OPENAI_API_KEY\":\"old\"}\n",
+        )
+        .unwrap();
+        let mut cfg = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Args(vec!["codex".to_string()]),
+            tmp.path().join("state.json"),
+            source_home.clone(),
+        );
+        cfg.config_path = Some(tmp.path().join("config.json"));
+        cfg.codex_config_path = source_home.join("config.toml");
+        cfg.codex_auth_path = source_home.join("auth.json");
+        let isolated = prepare_isolated_codex_home(&cfg).unwrap();
+        let mut runtime_cfg = cfg.clone();
+        runtime_cfg.codex_home = isolated.home.clone();
+        runtime_cfg.codex_config_path = isolated.home.join("config.toml");
+        runtime_cfg.codex_auth_path = isolated.home.join("auth.json");
+        let endpoint = endpoint(workdir.clone());
+        let mut store = SessionStore::new(cfg.session_state_path.clone());
+        store
+            .set_bound_session_id(
+                &session_binding_key(&cfg, &endpoint),
+                "source-session",
+                None,
+            )
+            .unwrap();
+
+        let launch = build_agent_launch_for_codex_restore_home(
+            &runtime_cfg,
+            &cfg,
+            &endpoint,
+            &mut store,
+            false,
+            MissingSessionPolicy::New,
+        )
+        .unwrap();
+
+        assert_eq!(launch.session_id, Some("source-session".to_string()));
+        assert!(launch.resumed);
+        assert_eq!(
+            launch.command,
+            AgentCommand::Args(vec![
+                "codex".to_string(),
+                "resume".to_string(),
+                "-C".to_string(),
+                workdir.to_string_lossy().to_string(),
+                "source-session".to_string()
+            ])
+        );
+        assert!(!isolated
+            .home
+            .join("sessions/2026/05/17/source-only.jsonl")
+            .exists());
+        let _ = fs::remove_dir_all(isolated.home);
+    }
+
+    #[test]
+    fn resuming_from_source_home_copies_only_selected_session_to_isolated_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let source_home = tmp.path().join(".codex");
+        let selected = source_home.join("sessions/2026/05/17/selected.jsonl");
+        let other = source_home.join("sessions/2026/05/17/other.jsonl");
+        fs::create_dir_all(selected.parent().unwrap()).unwrap();
+        fs::write(
+            &selected,
+            serde_json::json!({"type": "session_meta", "payload": {"id": "selected-session", "cwd": workdir.to_string_lossy()}}).to_string() + "\n",
+        )
+        .unwrap();
+        fs::write(
+            &other,
+            serde_json::json!({"type": "session_meta", "payload": {"id": "other-session", "cwd": workdir.to_string_lossy()}}).to_string() + "\n",
+        )
+        .unwrap();
+        let isolated_home = tmp.path().join("isolated");
+
+        let copied = copy_codex_resume_session_to_isolated_home(
+            &source_home,
+            &isolated_home,
+            &workdir,
+            "selected-session",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            copied,
+            isolated_home.join("sessions/2026/05/17/selected.jsonl")
+        );
+        assert_eq!(
+            fs::read_to_string(&copied).unwrap(),
+            fs::read_to_string(&selected).unwrap()
+        );
+        assert!(!isolated_home
+            .join("sessions/2026/05/17/other.jsonl")
+            .exists());
+    }
+
+    #[test]
+    fn bound_codex_session_path_outside_source_home_can_resume_and_copy_to_isolated_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let source_home = tmp.path().join(".codex");
+        let historical_home = tmp.path().join("Runtime/codex-homes/old-config/codex-main");
+        let historical_file = historical_home.join("sessions/2026/05/29/historical.jsonl");
+        fs::create_dir_all(historical_file.parent().unwrap()).unwrap();
+        fs::write(
+            &historical_file,
+            serde_json::json!({"type": "session_meta", "payload": {"id": "historical-session", "cwd": workdir.to_string_lossy()}}).to_string() + "\n",
+        )
+        .unwrap();
+        let isolated_home = tmp.path().join("isolated");
+        let mut cfg = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Args(vec!["codex".to_string()]),
+            tmp.path().join("state.json"),
+            source_home.clone(),
+        );
+        cfg.config_path = Some(tmp.path().join("config.json"));
+        let mut runtime_cfg = cfg.clone();
+        runtime_cfg.codex_home = isolated_home.clone();
+        let endpoint = endpoint(workdir.clone());
+        let mut store = SessionStore::new(cfg.session_state_path.clone());
+        let binding = session_binding_key(&cfg, &endpoint);
+        store
+            .set_bound_session_id(&binding, "historical-session", Some(&historical_file))
+            .unwrap();
+
+        let launch = build_agent_launch_for_codex_restore_home(
+            &runtime_cfg,
+            &cfg,
+            &endpoint,
+            &mut store,
+            false,
+            MissingSessionPolicy::New,
+        )
+        .unwrap();
+        let copied = copy_codex_resume_session_to_isolated_home(
+            &source_home,
+            &isolated_home,
+            &workdir,
+            "historical-session",
+            store.get_bound_session_path(&binding).as_deref(),
+        )
+        .unwrap();
+
+        assert_eq!(launch.session_id, Some("historical-session".to_string()));
+        assert!(launch.resumed);
+        assert_eq!(
+            copied,
+            isolated_home.join("sessions/2026/05/29/historical.jsonl")
+        );
+        assert_eq!(
+            fs::read_to_string(&copied).unwrap(),
+            fs::read_to_string(&historical_file).unwrap()
+        );
     }
 
     #[test]
@@ -2519,6 +3190,59 @@ mod tests {
         assert!(agent.recent_output.is_empty());
         assert_eq!(agent.endpoint_failure_status_code, None);
         assert_eq!(agent.endpoint_failure_retry_after_seconds, None);
+    }
+
+    #[test]
+    fn new_prompt_clears_stale_terminal_failure_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let mut agent = AgentProcess::new(
+            config(
+                workdir.clone(),
+                AgentDriver::Codex,
+                AgentCommand::Args(vec!["codex".to_string()]),
+                tmp.path().join("state.json"),
+                tmp.path().join(".codex"),
+            ),
+            endpoint(workdir),
+            false,
+        );
+        agent.recent_output = "unexpected status 503\nstream disconnected".to_string();
+        agent.endpoint_failure_detected = true;
+        agent.transient_endpoint_failure_detected = true;
+        agent.endpoint_failure_status_code = Some(503);
+        agent.endpoint_failure_retry_after_seconds = Some(40);
+        agent.pollution_detected = true;
+        agent.completion_pause_detected = true;
+
+        agent.clear_stale_terminal_failure_signals();
+
+        assert!(agent.recent_output.is_empty());
+        assert!(!agent.endpoint_failure_detected);
+        assert!(!agent.transient_endpoint_failure_detected);
+        assert_eq!(agent.endpoint_failure_status_code, None);
+        assert_eq!(agent.endpoint_failure_retry_after_seconds, None);
+        assert!(agent.pollution_detected);
+        assert!(agent.completion_pause_detected);
+    }
+
+    #[test]
+    fn send_prompt_resets_terminal_failure_context_after_successful_write() {
+        let source = include_str!("agent.rs");
+        let send_block = source
+            .split("pub fn send_prompt(&mut self, prompt: &str)")
+            .nth(1)
+            .and_then(|tail| tail.split("pub fn retry_submit").next())
+            .expect("send prompt block should be discoverable");
+
+        assert!(send_block.contains("terminal.send_prompt("));
+        assert!(send_block.contains("self.clear_stale_terminal_failure_signals();"));
+        assert!(
+            send_block.find("terminal.send_prompt(")
+                < send_block.find("self.clear_stale_terminal_failure_signals();"),
+            "旧终端失败上下文只能在新 prompt 成功写入后清掉，避免写入失败时丢失错误证据"
+        );
     }
 
     #[test]
@@ -3000,7 +3724,7 @@ mod tests {
         agent.last_prompt_sent_at = None;
         agent.observed_terminal_view_text = "• Working (12s • esc to interrupt)\n\
              ›"
-            .to_string();
+        .to_string();
 
         assert!(!agent.can_send_prompt());
         assert_eq!(agent.auto_input_block_reason(), Some("等待 Codex 就绪"));
@@ -3030,6 +3754,34 @@ mod tests {
 
         assert!(!agent.can_send_prompt());
         assert_eq!(agent.auto_input_block_reason(), Some("检测到 Working"));
+    }
+
+    #[test]
+    fn can_send_prompt_rejects_esc_to_interrupt_without_working_word() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let mut agent = AgentProcess::new(
+            config(
+                workdir.clone(),
+                AgentDriver::Codex,
+                AgentCommand::Args(vec!["codex".to_string()]),
+                tmp.path().join("state.json"),
+                tmp.path().join(".codex"),
+            ),
+            endpoint(workdir),
+            false,
+        );
+        agent.awaiting_turn_completion = false;
+        agent.saw_ready_banner = true;
+        agent.last_prompt_sent_at = Some(Instant::now() - Duration::from_secs(10));
+        agent.observed_terminal_view_text = "• Thinking (12s • esc to interrupt)\n\
+             › 我打算离开电脑一段时间，需要你进入无人值守模式"
+            .to_string();
+
+        assert!(!agent.can_send_prompt());
+        assert_eq!(agent.auto_input_block_reason(), Some("检测到 Working"));
+        assert!(!agent.auto_wait_safely_released());
     }
 
     #[test]
@@ -3472,8 +4224,10 @@ mod tests {
             .and_then(|tail| tail.split("fn write_auto_terminal_input").next())
             .expect("observed view refresh block should be discoverable");
 
-        assert!(send_block
-            .contains("self.last_prompt_sent_view_revision = Some(terminal.view_revision())"));
+        assert!(send_block.contains("let sent_view_revision = terminal.view_revision();"));
+        assert!(
+            send_block.contains("self.last_prompt_sent_view_revision = Some(sent_view_revision)")
+        );
         assert!(send_block.contains("self.poll_monitor();"));
         assert!(send_block.contains("if !self.can_send_prompt()"));
         assert!(refresh_block.contains("last_prompt_sent_view_revision"));
@@ -3537,7 +4291,7 @@ mod tests {
             .starts_with(app_runtime_dir().join("codex-homes")));
         assert!(isolated.home.ends_with("default"));
         assert!(!isolated.home.starts_with(std::env::temp_dir()));
-        assert!(isolated
+        assert!(!isolated
             .home
             .join("archived_sessions/2026/05/18/archived.jsonl")
             .exists());
@@ -3550,7 +4304,9 @@ mod tests {
             "{\"provider\":\"custom\"}\n"
         );
         fs::write(isolated.home.join("config.toml"), "changed").unwrap();
+        fs::create_dir_all(isolated.home.join("sessions/2026/05/19")).unwrap();
         fs::write(isolated.home.join("sessions/2026/05/19/new.jsonl"), "new\n").unwrap();
+        fs::create_dir_all(isolated.home.join("archived_sessions/2026/05/18")).unwrap();
         fs::write(
             isolated
                 .home
@@ -3564,7 +4320,12 @@ mod tests {
             "{\"provider\":\"custom\",\"visible\":true}\n",
         )
         .unwrap();
-        merge_codex_sessions_back(&isolated.home, &isolated.source_home).unwrap();
+        merge_codex_sessions_back_with_baseline(
+            &isolated.home,
+            &isolated.source_home,
+            &isolated.session_baseline,
+        )
+        .unwrap();
 
         assert_eq!(
             fs::read_to_string(codex_home.join("config.toml")).unwrap(),
@@ -3584,6 +4345,98 @@ mod tests {
             "{\"provider\":\"custom\",\"visible\":true}\n"
         );
         let _ = fs::remove_dir_all(isolated.home);
+    }
+
+    #[test]
+    fn isolated_codex_home_does_not_bulk_copy_historical_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let codex_home = tmp.path().join(".codex");
+        fs::create_dir_all(codex_home.join("sessions/2026/05/19")).unwrap();
+        fs::create_dir_all(codex_home.join("archived_sessions/2026/05/18")).unwrap();
+        fs::write(
+            codex_home.join("config.toml"),
+            "model_provider = \"custom\"\n",
+        )
+        .unwrap();
+        fs::write(
+            codex_home.join("auth.json"),
+            "{\"OPENAI_API_KEY\":\"old\"}\n",
+        )
+        .unwrap();
+        fs::write(codex_home.join("sessions/2026/05/19/old.jsonl"), "old\n").unwrap();
+        fs::write(
+            codex_home.join("archived_sessions/2026/05/18/archived.jsonl"),
+            "archived\n",
+        )
+        .unwrap();
+        let mut cfg = config(
+            workdir,
+            AgentDriver::Codex,
+            AgentCommand::Args(vec!["codex".to_string()]),
+            tmp.path().join("state.json"),
+            codex_home,
+        );
+        cfg.codex_config_path = cfg.codex_home.join("config.toml");
+        cfg.codex_auth_path = cfg.codex_home.join("auth.json");
+
+        let isolated = prepare_isolated_codex_home(&cfg).unwrap();
+
+        assert!(isolated.home.join("config.toml").exists());
+        assert!(isolated.home.join("auth.json").exists());
+        assert!(!isolated.home.join("sessions/2026/05/19/old.jsonl").exists());
+        assert!(!isolated
+            .home
+            .join("archived_sessions/2026/05/18/archived.jsonl")
+            .exists());
+        let _ = fs::remove_dir_all(isolated.home);
+    }
+
+    #[test]
+    fn merge_codex_sessions_back_skips_unchanged_precopied_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let isolated_home = tmp.path().join("isolated");
+        let source_home = tmp.path().join("source");
+        let historical = isolated_home.join("sessions/2026/05/17/history.jsonl");
+        let changed = isolated_home.join("sessions/2026/05/17/changed.jsonl");
+        let created = isolated_home.join("sessions/2026/05/17/new.jsonl");
+        fs::create_dir_all(historical.parent().unwrap()).unwrap();
+        fs::write(&historical, "history\n").unwrap();
+        fs::write(&changed, "before\n").unwrap();
+        let baseline = collect_codex_session_baseline(&isolated_home);
+        fs::write(&changed, "after\n").unwrap();
+        fs::write(&created, "new\n").unwrap();
+
+        merge_codex_sessions_back_with_baseline(&isolated_home, &source_home, &baseline).unwrap();
+
+        assert!(!source_home
+            .join("sessions/2026/05/17/history.jsonl")
+            .exists());
+        assert_eq!(
+            fs::read_to_string(source_home.join("sessions/2026/05/17/changed.jsonl")).unwrap(),
+            "after\n"
+        );
+        assert_eq!(
+            fs::read_to_string(source_home.join("sessions/2026/05/17/new.jsonl")).unwrap(),
+            "new\n"
+        );
+    }
+
+    #[test]
+    fn codex_session_fingerprint_uses_metadata_instead_of_full_file_reads() {
+        let source = include_str!("agent.rs");
+        let block = source
+            .split("fn session_file_fingerprint")
+            .nth(1)
+            .and_then(|tail| tail.split("fn jsonl_files_under").next())
+            .expect("session fingerprint helper should be discoverable");
+
+        assert!(block.contains("fs::metadata(path)"));
+        assert!(
+            !block.contains("fs::read(path)"),
+            "启动/退出时会遍历所有 Codex jsonl，会话文件不能整文件读入算指纹"
+        );
     }
 
     #[test]
@@ -3747,6 +4600,20 @@ mod tests {
         assert!(items
             .windows(2)
             .any(|pair| pair == ["-c", "service_tier=\"fast\""]));
+        assert!(items
+            .windows(2)
+            .any(|pair| pair == ["-c", "tui.animations=true"]));
+        assert!(items
+            .windows(2)
+            .any(|pair| pair == ["-c", "tui.raw_output_mode=false"]));
+        assert!(items
+            .windows(2)
+            .any(|pair| pair == ["-c", "tui.show_tooltips=true"]));
+        assert!(items.windows(2).any(|pair| pair
+            == [
+                "-c",
+                "tui.status_line=[\"model-with-reasoning\",\"context-remaining\",\"current-dir\",\"git-branch\",\"context-used\"]"
+            ]));
         assert!(items.iter().any(|item| item == "resume"));
         assert!(items.iter().any(|item| item == "session-1"));
     }
@@ -3788,6 +4655,259 @@ mod tests {
         assert_eq!(items[0], "codex");
         assert!(items.iter().any(|item| item == "resume"));
         assert!(items.iter().any(|item| item == "session-1"));
+    }
+
+    #[test]
+    fn codex_shell_cli_overrides_are_inserted_before_resume_subcommand() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let codex_home = tmp.path().join(".codex");
+        fs::create_dir_all(&codex_home).unwrap();
+        let config_path = codex_home.join("config.toml");
+        fs::write(
+            &config_path,
+            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"old\"\n",
+        )
+        .unwrap();
+        let mut cfg = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Shell("codex resume --no-alt-screen session-1".to_string()),
+            tmp.path().join("state.json"),
+            codex_home.clone(),
+        );
+        cfg.codex_config_path = config_path;
+        let endpoint = endpoint(workdir);
+
+        let command = codex_command_with_cli_overrides(cfg.agent_command.clone(), &endpoint, &cfg);
+
+        let AgentCommand::Args(items) = command else {
+            panic!("expected shell command to be normalized to args command");
+        };
+        let resume_pos = items
+            .iter()
+            .position(|item| item == "resume")
+            .expect("resume subcommand should be preserved");
+        let animation_override_pos = items
+            .windows(2)
+            .position(|pair| pair == ["-c", "tui.animations=true"])
+            .expect("Codex TUI animation override should be present");
+
+        assert_eq!(items[0], "codex");
+        assert!(animation_override_pos < resume_pos);
+        assert!(items.iter().any(|item| item == "--no-alt-screen"));
+        assert!(items.iter().any(|item| item == "session-1"));
+    }
+
+    #[test]
+    fn codex_shell_cli_overrides_preserve_single_quoted_arguments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let codex_home = tmp.path().join(".codex");
+        fs::create_dir_all(&codex_home).unwrap();
+        let config_path = codex_home.join("config.toml");
+        fs::write(
+            &config_path,
+            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"old\"\n",
+        )
+        .unwrap();
+        let mut cfg = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Shell("codex --profile 'team space' resume session-1".to_string()),
+            tmp.path().join("state.json"),
+            codex_home.clone(),
+        );
+        cfg.codex_config_path = config_path;
+        let endpoint = endpoint(workdir);
+
+        let command = codex_command_with_cli_overrides(cfg.agent_command.clone(), &endpoint, &cfg);
+
+        let AgentCommand::Args(items) = command else {
+            panic!("expected shell command to be normalized to args command");
+        };
+        assert_eq!(items[0], "codex");
+        assert!(items
+            .windows(2)
+            .any(|pair| pair == ["-c", "tui.show_tooltips=true"]));
+        assert!(items
+            .windows(2)
+            .any(|pair| pair == ["--profile", "team space"]));
+        assert!(!items.iter().any(|item| item == "'team" || item == "space'"));
+    }
+
+    #[test]
+    fn codex_shell_cli_overrides_target_codex_inside_cmd_wrapper() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let codex_home = tmp.path().join(".codex");
+        fs::create_dir_all(&codex_home).unwrap();
+        let config_path = codex_home.join("config.toml");
+        fs::write(
+            &config_path,
+            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"old\"\n",
+        )
+        .unwrap();
+        let mut cfg = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Shell("cmd /d /c codex resume session-1".to_string()),
+            tmp.path().join("state.json"),
+            codex_home.clone(),
+        );
+        cfg.codex_config_path = config_path;
+        let endpoint = endpoint(workdir);
+
+        let command = codex_command_with_cli_overrides(cfg.agent_command.clone(), &endpoint, &cfg);
+
+        let AgentCommand::Args(items) = command else {
+            panic!("expected shell command to be normalized to args command");
+        };
+        let cmd_switch_pos = items.iter().position(|item| item == "/c").unwrap();
+        let codex_pos = items.iter().position(|item| item == "codex").unwrap();
+        let override_pos = items
+            .windows(2)
+            .position(|pair| pair == ["-c", "tui.animations=true"])
+            .unwrap();
+        let resume_pos = items.iter().position(|item| item == "resume").unwrap();
+
+        assert!(cmd_switch_pos < codex_pos);
+        assert!(codex_pos < override_pos);
+        assert!(override_pos < resume_pos);
+        assert_eq!(items[0], "cmd");
+        assert!(items.iter().any(|item| item == "session-1"));
+    }
+
+    #[test]
+    fn codex_shell_cli_overrides_expand_quoted_cmd_script() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let codex_home = tmp.path().join(".codex");
+        fs::create_dir_all(&codex_home).unwrap();
+        let config_path = codex_home.join("config.toml");
+        fs::write(
+            &config_path,
+            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"old\"\n",
+        )
+        .unwrap();
+        let mut cfg = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Shell(r#"cmd /d /c "codex resume session-1""#.to_string()),
+            tmp.path().join("state.json"),
+            codex_home.clone(),
+        );
+        cfg.codex_config_path = config_path;
+        let endpoint = endpoint(workdir);
+
+        let command = codex_command_with_cli_overrides(cfg.agent_command.clone(), &endpoint, &cfg);
+
+        let AgentCommand::Args(items) = command else {
+            panic!("expected shell command to be normalized to args command");
+        };
+        let codex_pos = items.iter().position(|item| item == "codex").unwrap();
+        let override_pos = items
+            .windows(2)
+            .position(|pair| pair == ["-c", "tui.raw_output_mode=false"])
+            .unwrap();
+        let resume_pos = items.iter().position(|item| item == "resume").unwrap();
+
+        assert!(codex_pos < override_pos);
+        assert!(override_pos < resume_pos);
+        assert!(!items.iter().any(|item| item == "codex resume session-1"));
+    }
+
+    #[test]
+    fn codex_shell_cli_overrides_target_codex_inside_powershell_wrapper() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let codex_home = tmp.path().join(".codex");
+        fs::create_dir_all(&codex_home).unwrap();
+        let config_path = codex_home.join("config.toml");
+        fs::write(
+            &config_path,
+            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"old\"\n",
+        )
+        .unwrap();
+        let mut cfg = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Shell(
+                r#"powershell -NoProfile -Command "codex resume session-1""#.to_string(),
+            ),
+            tmp.path().join("state.json"),
+            codex_home.clone(),
+        );
+        cfg.codex_config_path = config_path;
+        let endpoint = endpoint(workdir);
+
+        let command = codex_command_with_cli_overrides(cfg.agent_command.clone(), &endpoint, &cfg);
+
+        let AgentCommand::Args(items) = command else {
+            panic!("expected shell command to be normalized to args command");
+        };
+        let command_pos = items.iter().position(|item| item == "-Command").unwrap();
+        let codex_pos = items.iter().position(|item| item == "codex").unwrap();
+        let override_pos = items
+            .windows(2)
+            .position(|pair| pair == ["-c", "tui.show_tooltips=true"])
+            .unwrap();
+        let resume_pos = items.iter().position(|item| item == "resume").unwrap();
+
+        assert!(command_pos < codex_pos);
+        assert!(codex_pos < override_pos);
+        assert!(override_pos < resume_pos);
+        assert_eq!(items[0], "powershell");
+        assert!(items.iter().any(|item| item == "session-1"));
+    }
+
+    #[test]
+    fn codex_shell_cli_overrides_target_codex_inside_bash_login_wrapper() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let codex_home = tmp.path().join(".codex");
+        fs::create_dir_all(&codex_home).unwrap();
+        let config_path = codex_home.join("config.toml");
+        fs::write(
+            &config_path,
+            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"old\"\n",
+        )
+        .unwrap();
+        let mut cfg = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Shell(r#"bash -lc "codex resume session-1""#.to_string()),
+            tmp.path().join("state.json"),
+            codex_home.clone(),
+        );
+        cfg.codex_config_path = config_path;
+        let endpoint = endpoint(workdir);
+
+        let command = codex_command_with_cli_overrides(cfg.agent_command.clone(), &endpoint, &cfg);
+
+        let AgentCommand::Args(items) = command else {
+            panic!("expected shell command to be normalized to args command");
+        };
+        let shell_option_pos = items.iter().position(|item| item == "-lc").unwrap();
+        let codex_pos = items.iter().position(|item| item == "codex").unwrap();
+        let override_pos = items
+            .windows(2)
+            .position(|pair| pair == ["-c", "tui.animations=true"])
+            .unwrap();
+        let resume_pos = items.iter().position(|item| item == "resume").unwrap();
+
+        assert!(shell_option_pos < codex_pos);
+        assert!(codex_pos < override_pos);
+        assert!(override_pos < resume_pos);
+        assert_eq!(items[0], "bash");
+        assert!(items.iter().any(|item| item == "session-1"));
+        assert!(!items.iter().any(|item| item == "codex resume session-1"));
     }
 
     #[test]

@@ -4,6 +4,13 @@ use std::sync::Arc;
 
 #[cfg(windows)]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::HWND;
+#[cfg(windows)]
+use windows_sys::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWMSBT_NONE, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR,
+    DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
+};
 
 mod app;
 mod gui_support;
@@ -43,7 +50,40 @@ fn register_main_window_handle(cc: &eframe::CreationContext<'_>) {
     if let Ok(handle) = cc.window_handle() {
         if let RawWindowHandle::Win32(handle) = handle.as_raw() {
             tray::set_main_window_handle(handle.hwnd.get());
+            apply_github_dark_window_decorations(handle.hwnd.get());
         }
+    }
+}
+
+#[cfg(windows)]
+fn apply_github_dark_window_decorations(hwnd: isize) {
+    let dark_mode: i32 = 1;
+    set_dwm_window_attribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark_mode);
+
+    let caption = github_dark_colorref(13, 17, 23);
+    let text = github_dark_colorref(230, 237, 243);
+    set_dwm_window_attribute(hwnd, DWMWA_CAPTION_COLOR, &caption);
+    set_dwm_window_attribute(hwnd, DWMWA_BORDER_COLOR, &caption);
+    set_dwm_window_attribute(hwnd, DWMWA_TEXT_COLOR, &text);
+
+    let backdrop = DWMSBT_NONE;
+    set_dwm_window_attribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop);
+}
+
+#[cfg(windows)]
+fn github_dark_colorref(r: u8, g: u8, b: u8) -> u32 {
+    (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
+}
+
+#[cfg(windows)]
+fn set_dwm_window_attribute<T>(hwnd: isize, attribute: i32, value: &T) {
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd as HWND,
+            attribute as u32,
+            value as *const T as *const core::ffi::c_void,
+            std::mem::size_of::<T>() as u32,
+        );
     }
 }
 
@@ -118,4 +158,26 @@ fn app_root() -> std::path::PathBuf {
         .unwrap_or_else(|| {
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn main_window_handle_applies_github_dark_native_decorations() {
+        let source = include_str!("main.rs");
+        let register_block = source
+            .split("fn register_main_window_handle")
+            .nth(1)
+            .and_then(|tail| tail.split("fn configure_chinese_fonts").next())
+            .expect("main window handle registration block should be discoverable");
+
+        assert!(
+            register_block.contains("apply_github_dark_window_decorations(handle.hwnd.get());"),
+            "Windows native title bar and resize border must be themed after the HWND is available"
+        );
+        assert!(source.contains("DWMWA_USE_IMMERSIVE_DARK_MODE"));
+        assert!(source.contains("DWMWA_CAPTION_COLOR"));
+        assert!(source.contains("DWMWA_BORDER_COLOR"));
+        assert!(source.contains("DWMWA_SYSTEMBACKDROP_TYPE"));
+    }
 }

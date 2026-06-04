@@ -32,6 +32,7 @@ const SMART_PROXY_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SMART_PROXY_UPSTREAM_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const LOCAL_HTTP_REQUEST_MAX_BYTES: usize = 16 * 1024 * 1024;
 const SMART_PROXY_MAX_ACTIVE_CLIENTS: usize = 128;
+const UNSUPPORTED_TRANSFER_ENCODING_ERROR: &str = "unsupported transfer encoding: chunked";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ProxyRegistry {
@@ -320,11 +321,14 @@ struct QualityWrite {
     quality: PersistedKeyQuality,
 }
 
+const QUALITY_FLUSH_ATTEMPTS: usize = 40;
+const QUALITY_FAST_FLUSH_ATTEMPTS: usize = 2;
+const QUALITY_FAST_FLUSH_TIMEOUT: Duration = Duration::from_millis(150);
+
 #[derive(Debug)]
 enum QualityWriteCommand {
     Write(QualityWrite),
-    #[allow(dead_code)]
-    Flush(Sender<()>),
+    Flush { done: Sender<()>, attempts: usize },
 }
 
 #[derive(Debug)]
@@ -904,8 +908,14 @@ impl QualityWriteHandle {
                         store.keys.insert(write.quality_key, write.quality);
                         pending += 1;
                     }
-                    QualityWriteCommand::Flush(done) => {
-                        flush_quality_pending(&store, &path, &mut pending, &mut last_flush, 40);
+                    QualityWriteCommand::Flush { done, attempts } => {
+                        flush_quality_pending(
+                            &store,
+                            &path,
+                            &mut pending,
+                            &mut last_flush,
+                            attempts,
+                        );
                         let _ = done.send(());
                         continue;
                     }
@@ -916,8 +926,14 @@ impl QualityWriteHandle {
                             store.keys.insert(write.quality_key, write.quality);
                             pending += 1;
                         }
-                        QualityWriteCommand::Flush(done) => {
-                            flush_quality_pending(&store, &path, &mut pending, &mut last_flush, 40);
+                        QualityWriteCommand::Flush { done, attempts } => {
+                            flush_quality_pending(
+                                &store,
+                                &path,
+                                &mut pending,
+                                &mut last_flush,
+                                attempts,
+                            );
                             let _ = done.send(());
                         }
                     }
@@ -948,9 +964,20 @@ impl QualityWriteHandle {
 
     #[allow(dead_code)]
     fn flush(&self) {
+        self.flush_with_timeout(Duration::from_secs(2), QUALITY_FLUSH_ATTEMPTS);
+    }
+
+    fn flush_with_timeout(&self, timeout: Duration, attempts: usize) {
         let (tx, rx) = mpsc::channel();
-        if self.tx.send(QualityWriteCommand::Flush(tx)).is_ok() {
-            let _ = rx.recv_timeout(Duration::from_secs(2));
+        if self
+            .tx
+            .send(QualityWriteCommand::Flush {
+                done: tx,
+                attempts: attempts.max(1),
+            })
+            .is_ok()
+        {
+            let _ = rx.recv_timeout(timeout);
         }
     }
 }
@@ -1330,12 +1357,11 @@ impl SmartProxyServer {
         Ok(())
     }
 
-    pub fn stop(&mut self) {
-        self.quality_writer.flush();
-        if let Some(runtime) = &self.aggregate_runtime {
-            runtime.flush_quality();
+    fn stop_with_quality_flush(&mut self, timeout: Duration, attempts: usize) {
+        let was_running = self.running.swap(false, Ordering::SeqCst);
+        if !was_running && self.handle.is_none() {
+            return;
         }
-        self.running.store(false, Ordering::SeqCst);
         unregister_runtime(&self.endpoint_base_url());
         if let Some(handle) = self.handle.take() {
             if let Some(port) = self.bound_port {
@@ -1343,6 +1369,18 @@ impl SmartProxyServer {
             }
             let _ = handle.join();
         }
+        self.quality_writer.flush_with_timeout(timeout, attempts);
+        if let Some(runtime) = &self.aggregate_runtime {
+            runtime.flush_quality_with_timeout(timeout, attempts);
+        }
+    }
+
+    pub fn stop(&mut self) {
+        self.stop_with_quality_flush(Duration::from_secs(2), QUALITY_FLUSH_ATTEMPTS);
+    }
+
+    pub fn stop_fast(&mut self) {
+        self.stop_with_quality_flush(QUALITY_FAST_FLUSH_TIMEOUT, QUALITY_FAST_FLUSH_ATTEMPTS);
     }
 
     pub fn snapshot(&self) -> SmartProxySnapshot {
@@ -1639,7 +1677,17 @@ fn handle_smart_proxy_client(
     cooldown_seconds: u32,
     retry_count: u32,
 ) -> Result<()> {
-    let raw = read_http_request(stream)?;
+    let raw = match read_http_request(stream) {
+        Ok(raw) => raw,
+        Err(err) if is_unsupported_transfer_encoding_error(&err) => {
+            return write_json(
+                stream,
+                400,
+                r#"{"error":"unsupported transfer encoding: chunked"}"#,
+            );
+        }
+        Err(err) => return Err(err),
+    };
     if raw.is_empty() {
         return Ok(());
     }
@@ -1667,20 +1715,57 @@ fn handle_smart_proxy_client(
             write_sse_stream_response_head(stream)?;
             stream.write_all(b": watchapi upstream pending\n\n")?;
             stream.flush()?;
-            return match runtime.forward_stream_with_failover(
+            let aggregate_body = request_body.body_with_options(false);
+            let result = match runtime.forward_stream_with_failover(
                 stream,
                 &raw,
-                &request_body.body,
+                &aggregate_body,
                 method,
                 path,
                 attempts,
             ) {
                 Ok(()) => Ok(()),
+                Err(err)
+                    if smart_should_retry_without_encrypted_content_error(
+                        &request_body,
+                        false,
+                        &err.to_string(),
+                    ) =>
+                {
+                    let stripped_body = request_body.body_with_options(true);
+                    runtime.forward_stream_with_failover(
+                        stream,
+                        &raw,
+                        &stripped_body,
+                        method,
+                        path,
+                        attempts,
+                    )
+                }
+                Err(err) => Err(err),
+            };
+            return match result {
+                Ok(()) => Ok(()),
                 Err(err) => write_sse_error_event(stream, &err.to_string()),
             };
         }
-        return match runtime.forward_with_failover(&raw, &request_body.body, method, path, attempts)
-        {
+        let aggregate_body = request_body.body_with_options(false);
+        let response = runtime.forward_with_failover(&raw, &aggregate_body, method, path, attempts);
+        let response = match response {
+            Ok(response)
+                if smart_should_retry_without_encrypted_content_status(
+                    &request_body,
+                    false,
+                    response.status,
+                    &String::from_utf8_lossy(&response.payload),
+                ) =>
+            {
+                let stripped_body = request_body.body_with_options(true);
+                runtime.forward_with_failover(&raw, &stripped_body, method, path, attempts)
+            }
+            other => other,
+        };
+        return match response {
             Ok(response) => write_raw_response(
                 stream,
                 response.status,
@@ -1696,6 +1781,7 @@ fn handle_smart_proxy_client(
         stream.write_all(b": watchapi upstream pending\n\n")?;
         stream.flush()?;
         let mut last_error = None;
+        let mut strip_encrypted_content = false;
         for attempt in 0..attempts {
             let Some((index, deployment)) =
                 select_deployment(&deployments, &upstreams, &request_body.requested_model)
@@ -1704,9 +1790,11 @@ fn handle_smart_proxy_client(
                     .unwrap_or_else(|| "no available key for requested model".to_string());
                 return write_sse_error_event(stream, &detail);
             };
-            mark_upstream_request_started(&upstreams, &deployment.base_url);
+            let upstream_request_started_at =
+                mark_upstream_request_started(&upstreams, &deployment.base_url);
             record_deployment_request_egress(&deployments, clash_verge.as_deref(), index);
-            let forwarded_body = request_body.rewrite_model(&deployment.actual_model);
+            let forwarded_body = request_body
+                .rewrite_model_with_options(&deployment.actual_model, strip_encrypted_content);
             let started_at = Instant::now();
             let result = forward_smart_stream_request(
                 stream,
@@ -1736,6 +1824,23 @@ fn handle_smart_proxy_client(
                 }
                 Ok(SmartStreamResult::UpstreamFailure { status, payload }) => {
                     let payload_text = String::from_utf8_lossy(&payload);
+                    if smart_should_retry_without_encrypted_content_status(
+                        &request_body,
+                        strip_encrypted_content,
+                        status,
+                        &payload_text,
+                    ) && attempt + 1 < attempts
+                    {
+                        forget_upstream_recent_request(
+                            &upstreams,
+                            &deployment.base_url,
+                            upstream_request_started_at,
+                        );
+                        strip_encrypted_content = true;
+                        last_error =
+                            Some("smart upstream rejected encrypted_content; retrying without encrypted_content".to_string());
+                        continue;
+                    }
                     update_deployment_result(
                         &deployments,
                         &upstreams,
@@ -1756,6 +1861,20 @@ fn handle_smart_proxy_client(
                                 .unwrap_or("smart proxy upstream unavailable"),
                         );
                     }
+                }
+                Ok(SmartStreamResult::Incomplete { detail }) => {
+                    update_deployment_result(
+                        &deployments,
+                        &upstreams,
+                        clash_verge.as_deref(),
+                        &quality_writer,
+                        index,
+                        502,
+                        &detail,
+                        latency,
+                        cooldown_seconds,
+                    );
+                    return write_sse_error_event(stream, &detail);
                 }
                 Err(err) => {
                     if should_suppress_local_failure_response(&err) {
@@ -1784,6 +1903,7 @@ fn handle_smart_proxy_client(
     }
     let mut last_response: Option<(u16, String, HeaderMap, Vec<u8>)> = None;
     let mut last_error: Option<String> = None;
+    let mut strip_encrypted_content = false;
     for attempt in 0..attempts {
         let Some((index, deployment)) =
             select_deployment(&deployments, &upstreams, &request_body.requested_model)
@@ -1800,9 +1920,11 @@ fn handle_smart_proxy_client(
                 r#"{"error":"no available key for requested model"}"#,
             );
         };
-        mark_upstream_request_started(&upstreams, &deployment.base_url);
+        let upstream_request_started_at =
+            mark_upstream_request_started(&upstreams, &deployment.base_url);
         record_deployment_request_egress(&deployments, clash_verge.as_deref(), index);
-        let forwarded_body = request_body.rewrite_model(&deployment.actual_model);
+        let forwarded_body = request_body
+            .rewrite_model_with_options(&deployment.actual_model, strip_encrypted_content);
         let started_at = Instant::now();
         let response = forward_smart_request(
             &http_client,
@@ -1816,6 +1938,24 @@ fn handle_smart_proxy_client(
         mark_upstream_request_finished(&upstreams, &deployment.base_url);
         match response {
             Ok((status, reason, headers, payload)) => {
+                let payload_text = String::from_utf8_lossy(&payload);
+                if smart_should_retry_without_encrypted_content_status(
+                    &request_body,
+                    strip_encrypted_content,
+                    status,
+                    &payload_text,
+                ) && attempt + 1 < attempts
+                {
+                    forget_upstream_recent_request(
+                        &upstreams,
+                        &deployment.base_url,
+                        upstream_request_started_at,
+                    );
+                    strip_encrypted_content = true;
+                    last_error =
+                        Some("smart upstream rejected encrypted_content; retrying without encrypted_content".to_string());
+                    continue;
+                }
                 update_deployment_result(
                     &deployments,
                     &upstreams,
@@ -1823,7 +1963,7 @@ fn handle_smart_proxy_client(
                     &quality_writer,
                     index,
                     status,
-                    &String::from_utf8_lossy(&payload),
+                    &payload_text,
                     latency,
                     cooldown_seconds,
                 );
@@ -1886,8 +2026,28 @@ impl SmartRequestBody {
         }
     }
 
-    fn rewrite_model(&self, model: &str) -> Vec<u8> {
-        rewrite_model_in_parsed_body(&self.body, self.parsed.as_ref(), model)
+    fn rewrite_model_with_options(&self, model: &str, strip_encrypted_content: bool) -> Vec<u8> {
+        rewrite_body_with_options(
+            &self.body,
+            self.parsed.as_ref(),
+            Some(model),
+            strip_encrypted_content,
+        )
+    }
+
+    fn body_with_options(&self, strip_encrypted_content: bool) -> Vec<u8> {
+        rewrite_body_with_options(
+            &self.body,
+            self.parsed.as_ref(),
+            None,
+            strip_encrypted_content,
+        )
+    }
+
+    fn has_encrypted_content(&self) -> bool {
+        self.parsed
+            .as_ref()
+            .is_some_and(value_has_encrypted_content)
     }
 }
 
@@ -1983,7 +2143,14 @@ fn write_sse_stream_response_head(stream: &mut TcpStream) -> Result<()> {
 }
 
 fn write_sse_error_event(stream: &mut TcpStream, detail: &str) -> Result<()> {
-    let payload = json!({"type":"error","error":{"message":detail}}).to_string();
+    let payload = json!({
+        "type": "error",
+        "code": "watchapi_smart_proxy_error",
+        "message": detail,
+        "param": null,
+        "sequence_number": 0
+    })
+    .to_string();
     write!(stream, "event: error\ndata: {payload}\n\n")?;
     stream.flush()?;
     Ok(())
@@ -2008,6 +2175,30 @@ fn smart_proxy_attempt_budget(configured_retries: u32) -> u32 {
     configured_retries
         .saturating_add(1)
         .max(SMART_PROXY_RETRYABLE_MIN_ATTEMPTS)
+}
+
+fn smart_should_retry_without_encrypted_content_status(
+    request_body: &SmartRequestBody,
+    already_stripped: bool,
+    status: u16,
+    detail: &str,
+) -> bool {
+    status == 400
+        && smart_should_retry_without_encrypted_content_error(
+            request_body,
+            already_stripped,
+            detail,
+        )
+}
+
+fn smart_should_retry_without_encrypted_content_error(
+    request_body: &SmartRequestBody,
+    already_stripped: bool,
+    detail: &str,
+) -> bool {
+    !already_stripped
+        && request_body.has_encrypted_content()
+        && is_invalid_encrypted_content_text(detail)
 }
 
 fn smart_proxy_retryable_status(status: u16) -> bool {
@@ -2158,11 +2349,11 @@ fn upstream_available(
 fn mark_upstream_request_started(
     upstreams: &Arc<Mutex<HashMap<String, SmartUpstreamRuntime>>>,
     base_url: &str,
-) {
-    let Ok(mut upstreams) = upstreams.lock() else {
-        return;
-    };
+) -> Instant {
     let now = Instant::now();
+    let Ok(mut upstreams) = upstreams.lock() else {
+        return now;
+    };
     let state = upstreams
         .entry(base_url.to_string())
         .or_insert_with(|| SmartUpstreamRuntime {
@@ -2175,6 +2366,7 @@ fn mark_upstream_request_started(
     state
         .recent_request_times
         .retain(|at| now.duration_since(*at) < Duration::from_secs(60));
+    now
 }
 
 fn mark_upstream_request_finished(
@@ -2186,6 +2378,25 @@ fn mark_upstream_request_finished(
     };
     if let Some(state) = upstreams.get_mut(base_url) {
         state.in_flight = state.in_flight.saturating_sub(1);
+    }
+}
+
+fn forget_upstream_recent_request(
+    upstreams: &Arc<Mutex<HashMap<String, SmartUpstreamRuntime>>>,
+    base_url: &str,
+    started_at: Instant,
+) {
+    let Ok(mut upstreams) = upstreams.lock() else {
+        return;
+    };
+    if let Some(state) = upstreams.get_mut(base_url) {
+        if let Some(index) = state
+            .recent_request_times
+            .iter()
+            .rposition(|at| *at == started_at)
+        {
+            state.recent_request_times.remove(index);
+        }
     }
 }
 
@@ -2234,9 +2445,11 @@ fn forward_smart_request(
     Ok((status.as_u16(), reason, headers, payload))
 }
 
+#[derive(Debug)]
 enum SmartStreamResult {
     Success { status: u16 },
     UpstreamFailure { status: u16, payload: Vec<u8> },
+    Incomplete { detail: String },
 }
 
 fn forward_smart_stream_request<W: Write>(
@@ -2266,15 +2479,223 @@ fn forward_smart_stream_request<W: Write>(
     }
 
     let mut buffer = [0_u8; 8192];
+    let mut terminal_tracker =
+        SseTerminalTracker::new(responses_api_stream_requires_completed(path));
+    let mut forwarded_bytes = 0_usize;
     loop {
-        let size = response.read(&mut buffer)?;
+        let size = match response.read(&mut buffer) {
+            Ok(size) => size,
+            Err(err) if forwarded_bytes > 0 => {
+                return Ok(SmartStreamResult::Incomplete {
+                    detail: format!("stream upstream interrupted after partial response: {err}"),
+                });
+            }
+            Err(err) => return Err(err.into()),
+        };
         if size == 0 {
             break;
         }
+        terminal_tracker.observe(&buffer[..size]);
         writer.write_all(&buffer[..size])?;
         writer.flush()?;
+        forwarded_bytes += size;
+    }
+    terminal_tracker.finish();
+    match terminal_tracker.terminal {
+        SseTerminalOutcome::Pending => {
+            return Ok(SmartStreamResult::Incomplete {
+                detail: "stream upstream closed before response.completed".to_string(),
+            });
+        }
+        SseTerminalOutcome::Failed(detail) => {
+            return Ok(SmartStreamResult::Incomplete {
+                detail: format!("stream upstream returned terminal error: {detail}"),
+            });
+        }
+        SseTerminalOutcome::Completed => {}
     }
     Ok(SmartStreamResult::Success { status })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SseTerminalOutcome {
+    Pending,
+    Completed,
+    Failed(String),
+}
+
+struct SseTerminalTracker {
+    carry: String,
+    terminal: SseTerminalOutcome,
+    require_response_event: bool,
+    event: Option<String>,
+    data_lines: Vec<String>,
+}
+
+impl SseTerminalTracker {
+    fn new(require_response_event: bool) -> Self {
+        Self {
+            carry: String::new(),
+            terminal: SseTerminalOutcome::Pending,
+            require_response_event,
+            event: None,
+            data_lines: Vec::new(),
+        }
+    }
+
+    fn observe(&mut self, chunk: &[u8]) {
+        self.carry.push_str(&String::from_utf8_lossy(chunk));
+        while let Some(index) = self.carry.find('\n') {
+            let line = self.carry[..index].trim_end_matches('\r').to_string();
+            self.carry.drain(..=index);
+            self.observe_line(&line);
+        }
+    }
+
+    fn finish(&mut self) {
+        if !self.carry.is_empty() {
+            let line = self.carry.trim_end_matches('\r').to_string();
+            self.carry.clear();
+            self.observe_line(&line);
+        }
+        self.dispatch_event();
+    }
+
+    fn observe_line(&mut self, line: &str) {
+        if let Some(event) = line.strip_prefix("event:") {
+            let event = event.trim();
+            self.event = Some(event.to_string());
+            if let Some(outcome) = terminal_sse_event_outcome(event) {
+                self.set_terminal(outcome);
+            }
+            return;
+        }
+        if let Some(data) = line.strip_prefix("data:") {
+            self.data_lines
+                .push(data.strip_prefix(' ').unwrap_or(data).to_string());
+            return;
+        }
+        if line.is_empty() {
+            self.dispatch_event();
+        }
+    }
+
+    fn dispatch_event(&mut self) {
+        if !self.data_lines.is_empty() {
+            let data = self.data_lines.join("\n");
+            if let Some(outcome) = terminal_sse_data_outcome(
+                data.trim(),
+                self.require_response_event,
+                self.event.as_deref(),
+            ) {
+                self.set_terminal(outcome);
+            }
+            self.data_lines.clear();
+        }
+        self.event = None;
+    }
+
+    fn set_terminal(&mut self, outcome: SseTerminalOutcome) {
+        match (&mut self.terminal, outcome) {
+            (SseTerminalOutcome::Failed(current), SseTerminalOutcome::Failed(next)) => {
+                if current.starts_with("stream upstream returned ") && !next.trim().is_empty() {
+                    *current = next;
+                }
+            }
+            (SseTerminalOutcome::Failed(_), _) => {}
+            (_, next) => self.terminal = next,
+        }
+    }
+}
+
+fn terminal_sse_event_outcome(event: &str) -> Option<SseTerminalOutcome> {
+    match event {
+        "response.completed" => Some(SseTerminalOutcome::Completed),
+        "response.failed" | "response.incomplete" | "error" => Some(SseTerminalOutcome::Failed(
+            format!("stream upstream returned {event}"),
+        )),
+        _ => None,
+    }
+}
+
+fn terminal_sse_data_outcome(
+    data: &str,
+    require_response_event: bool,
+    event: Option<&str>,
+) -> Option<SseTerminalOutcome> {
+    if data == "[DONE]" {
+        return (!require_response_event).then_some(SseTerminalOutcome::Completed);
+    }
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return None;
+    };
+    if let Some(event_type) = value.get("type").and_then(Value::as_str) {
+        if let Some(outcome) = terminal_sse_event_outcome(event_type) {
+            return Some(terminal_outcome_with_payload_detail(outcome, &value));
+        }
+    }
+    if let Some(outcome) = event.and_then(terminal_sse_event_outcome) {
+        return Some(terminal_outcome_with_payload_detail(outcome, &value));
+    }
+    (!require_response_event && json_has_terminal_chat_finish_reason(&value))
+        .then_some(SseTerminalOutcome::Completed)
+}
+
+fn terminal_outcome_with_payload_detail(
+    outcome: SseTerminalOutcome,
+    value: &Value,
+) -> SseTerminalOutcome {
+    match outcome {
+        SseTerminalOutcome::Failed(fallback) => {
+            SseTerminalOutcome::Failed(sse_error_detail(value).unwrap_or(fallback))
+        }
+        other => other,
+    }
+}
+
+fn sse_error_detail(value: &Value) -> Option<String> {
+    value
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .pointer("/response/error/message")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_string)
+}
+
+fn json_has_terminal_chat_finish_reason(value: &Value) -> bool {
+    value
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| {
+            choices.iter().any(|choice| {
+                choice
+                    .get("finish_reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reason| !reason.is_empty())
+            })
+        })
+}
+
+fn responses_api_stream_requires_completed(path: &str) -> bool {
+    let trimmed = path.trim();
+    let path = url::Url::parse(trimmed)
+        .ok()
+        .map(|url| url.path().to_string())
+        .unwrap_or_else(|| {
+            trimmed
+                .split(['?', '#'])
+                .next()
+                .unwrap_or(trimmed)
+                .to_string()
+        });
+    let path = path.trim_start_matches('/').trim_end_matches('/');
+    matches!(path, "v1/responses" | "responses")
 }
 
 fn update_deployment_result(
@@ -2526,9 +2947,8 @@ fn snapshot_from_deployments(
                         .as_ref()
                         .and_then(|egress| egress.node.clone())
                         .unwrap_or_default();
-                    let row_clash_egress_ip = row_egress
-                        .and_then(|egress| egress.ip)
-                        .unwrap_or_default();
+                    let row_clash_egress_ip =
+                        row_egress.and_then(|egress| egress.ip).unwrap_or_default();
                     SmartProxyKeyRow {
                         upstream: item.upstream.clone(),
                         base_url: item.base_url.clone(),
@@ -2616,16 +3036,54 @@ fn upstream_limit_status(
     }
 }
 
-fn rewrite_model_in_parsed_body(body: &[u8], parsed: Option<&Value>, model: &str) -> Vec<u8> {
+fn rewrite_body_with_options(
+    body: &[u8],
+    parsed: Option<&Value>,
+    model: Option<&str>,
+    strip_encrypted_content: bool,
+) -> Vec<u8> {
     let Some(mut value) = parsed.cloned() else {
         return body.to_vec();
     };
-    rewrite_model_value(body, &mut value, model)
+    if let Some(model) = model {
+        value["model"] = json!(model);
+    }
+    if strip_encrypted_content {
+        strip_encrypted_content_fields(&mut value);
+    }
+    serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
 }
 
-fn rewrite_model_value(body: &[u8], value: &mut Value, model: &str) -> Vec<u8> {
-    value["model"] = json!(model);
-    serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
+fn value_has_encrypted_content(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(value_has_encrypted_content),
+        Value::Object(map) => {
+            map.contains_key("encrypted_content") || map.values().any(value_has_encrypted_content)
+        }
+        _ => false,
+    }
+}
+
+fn strip_encrypted_content_fields(value: &mut Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter_mut().fold(false, |changed, item| {
+            strip_encrypted_content_fields(item) || changed
+        }),
+        Value::Object(map) => {
+            let mut changed = map.remove("encrypted_content").is_some();
+            for item in map.values_mut() {
+                changed = strip_encrypted_content_fields(item) || changed;
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn is_invalid_encrypted_content_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("invalid_encrypted_content")
+        || (lower.contains("encrypted content") && lower.contains("could not be verified"))
 }
 
 fn authorized(raw: &[u8], master_key: &str) -> bool {
@@ -2672,10 +3130,19 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
             break;
         }
         raw.extend_from_slice(&buffer[..size]);
+        if raw.len() > LOCAL_HTTP_REQUEST_MAX_BYTES {
+            return Err(anyhow!("request too large"));
+        }
         if body_start.is_none() {
             if let Some(index) = find_body(&raw) {
+                if headers_use_chunked_transfer_encoding(&raw[..index]) {
+                    return Err(anyhow!(UNSUPPORTED_TRANSFER_ENCODING_ERROR));
+                }
                 body_start = Some(index);
                 content_length = parse_content_length(&raw[..index]).unwrap_or(0);
+                if index.saturating_add(content_length) > LOCAL_HTTP_REQUEST_MAX_BYTES {
+                    return Err(anyhow!("request too large"));
+                }
             }
         }
         if let Some(index) = body_start {
@@ -2683,11 +3150,12 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
                 break;
             }
         }
-        if raw.len() > LOCAL_HTTP_REQUEST_MAX_BYTES {
-            return Err(anyhow!("request too large"));
-        }
     }
     Ok(raw)
+}
+
+fn is_unsupported_transfer_encoding_error(err: &anyhow::Error) -> bool {
+    err.to_string() == UNSUPPORTED_TRANSFER_ENCODING_ERROR
 }
 
 fn forward_headers(
@@ -2758,20 +3226,20 @@ fn write_raw_response(
 }
 
 fn write_json(stream: &mut TcpStream, status: u16, body: &str) -> Result<()> {
-    let reason = match status {
-        200 => "OK",
-        401 => "Unauthorized",
-        404 => "Not Found",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        _ => "OK",
-    };
+    let reason = http_reason_phrase(status);
     let response = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes())?;
     Ok(())
+}
+
+fn http_reason_phrase(status: u16) -> &'static str {
+    reqwest::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|status| status.canonical_reason())
+        .unwrap_or("OK")
 }
 
 fn upstream_url(upstream: &str, path: &str) -> Result<String> {
@@ -2801,6 +3269,19 @@ fn parse_content_length(headers: &[u8]) -> Option<usize> {
         }
     }
     None
+}
+
+fn headers_use_chunked_transfer_encoding(headers: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(headers);
+    text.lines().any(|line| {
+        let Some((header_name, value)) = line.split_once(':') else {
+            return false;
+        };
+        header_name.trim().eq_ignore_ascii_case("transfer-encoding")
+            && value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+    })
 }
 
 fn mask_key(key: &str) -> String {
@@ -3525,6 +4006,497 @@ mod tests {
     }
 
     #[test]
+    fn smart_stream_reports_missing_completed_as_incomplete() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let _ = read_http_request(&mut socket).unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            socket
+                .write_all(b"event: response.output_text.delta\ndata: {\"delta\":\"partial\"}\n\n")
+                .unwrap();
+        });
+        let body = r#"{"model":"gpt-5.5","input":"hello","stream":true}"#;
+        let raw = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer sk-local\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes();
+        let deployment =
+            smart_test_deployment("dc", &format!("http://127.0.0.1:{port}/v1"), "sk-stream");
+        let mut out = Vec::new();
+
+        let result = forward_smart_stream_request(
+            &mut out,
+            &smart_test_http_client(),
+            &raw,
+            body.as_bytes(),
+            &deployment,
+            "POST",
+            "/v1/responses",
+        )
+        .unwrap();
+        handle.join().unwrap();
+
+        match result {
+            SmartStreamResult::Incomplete { detail } => {
+                assert!(detail.contains("stream upstream closed before response.completed"));
+            }
+            other => panic!("expected incomplete stream, got {other:?}"),
+        }
+        assert!(String::from_utf8(out).unwrap().contains("partial"));
+    }
+
+    #[test]
+    fn smart_stream_reports_done_only_responses_stream_as_incomplete() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let _ = read_http_request(&mut socket).unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            socket.write_all(b"data: [DONE]\n\n").unwrap();
+        });
+        let body = r#"{"model":"gpt-5.5","input":"hello","stream":true}"#;
+        let raw = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer sk-local\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes();
+        let deployment =
+            smart_test_deployment("dc", &format!("http://127.0.0.1:{port}/v1"), "sk-stream");
+        let mut out = Vec::new();
+
+        let result = forward_smart_stream_request(
+            &mut out,
+            &smart_test_http_client(),
+            &raw,
+            body.as_bytes(),
+            &deployment,
+            "POST",
+            "/v1/responses",
+        )
+        .unwrap();
+        handle.join().unwrap();
+
+        match result {
+            SmartStreamResult::Incomplete { detail } => {
+                assert!(detail.contains("stream upstream closed before response.completed"));
+            }
+            other => panic!("expected incomplete stream, got {other:?}"),
+        }
+        assert!(String::from_utf8(out).unwrap().contains("[DONE]"));
+    }
+
+    #[test]
+    fn smart_responses_stream_detection_accepts_normalized_paths() {
+        assert!(responses_api_stream_requires_completed("/v1/responses/"));
+        assert!(responses_api_stream_requires_completed(
+            "https://api.example.test/v1/responses?stream=true"
+        ));
+        assert!(responses_api_stream_requires_completed("/responses/"));
+        assert!(!responses_api_stream_requires_completed(
+            "/v1/chat/completions"
+        ));
+    }
+
+    #[test]
+    fn smart_stream_accepts_chat_finish_reason_without_done_marker() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let _ = read_http_request(&mut socket).unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            socket
+                .write_all(
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+        let body =
+            r#"{"model":"gpt-5.5","messages":[{"role":"user","content":"hello"}],"stream":true}"#;
+        let raw = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer sk-local\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes();
+        let deployment =
+            smart_test_deployment("dc", &format!("http://127.0.0.1:{port}/v1"), "sk-chat");
+        let mut out = Vec::new();
+
+        let result = forward_smart_stream_request(
+            &mut out,
+            &smart_test_http_client(),
+            &raw,
+            body.as_bytes(),
+            &deployment,
+            "POST",
+            "/v1/chat/completions",
+        )
+        .unwrap();
+        handle.join().unwrap();
+
+        match result {
+            SmartStreamResult::Success { status } => assert_eq!(status, 200),
+            other => panic!("expected successful chat stream, got {other:?}"),
+        }
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"finish_reason\":\"stop\""), "{text}");
+    }
+
+    #[test]
+    fn smart_stream_accepts_multiline_chat_finish_reason_without_done_marker() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let _ = read_http_request(&mut socket).unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            socket
+                .write_all(
+                    concat!(
+                        "data: {\"choices\":[\n",
+                        "data: {\"delta\":{},\"finish_reason\":\"stop\"}\n",
+                        "data: ]}\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+        let body =
+            r#"{"model":"gpt-5.5","messages":[{"role":"user","content":"hello"}],"stream":true}"#;
+        let raw = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer sk-local\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes();
+        let deployment =
+            smart_test_deployment("dc", &format!("http://127.0.0.1:{port}/v1"), "sk-chat");
+        let mut out = Vec::new();
+
+        let result = forward_smart_stream_request(
+            &mut out,
+            &smart_test_http_client(),
+            &raw,
+            body.as_bytes(),
+            &deployment,
+            "POST",
+            "/v1/chat/completions",
+        )
+        .unwrap();
+        handle.join().unwrap();
+
+        match result {
+            SmartStreamResult::Success { status } => assert_eq!(status, 200),
+            other => panic!("expected successful chat stream, got {other:?}"),
+        }
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"finish_reason\":\"stop\""), "{text}");
+    }
+
+    #[test]
+    fn smart_stream_counts_sse_failed_event_as_incomplete() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let _ = read_http_request(&mut socket).unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            socket
+                .write_all(
+                    concat!(
+                        "event: response.failed\n",
+                        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"quota exhausted\"}}}\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+        let body = r#"{"model":"gpt-5.5","input":"hello","stream":true}"#;
+        let raw = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer sk-local\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes();
+        let deployment = smart_test_deployment(
+            "dc",
+            &format!("http://127.0.0.1:{port}/v1"),
+            "sk-failed-event",
+        );
+        let mut out = Vec::new();
+
+        let result = forward_smart_stream_request(
+            &mut out,
+            &smart_test_http_client(),
+            &raw,
+            body.as_bytes(),
+            &deployment,
+            "POST",
+            "/v1/responses",
+        )
+        .unwrap();
+        handle.join().unwrap();
+
+        match result {
+            SmartStreamResult::Incomplete { detail } => {
+                assert!(detail.contains("quota exhausted"), "{detail}");
+            }
+            other => panic!("expected incomplete stream, got {other:?}"),
+        }
+        assert!(String::from_utf8(out).unwrap().contains("response.failed"));
+    }
+
+    #[test]
+    fn smart_stream_keeps_failed_terminal_state_when_completed_follows() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let _ = read_http_request(&mut socket).unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            socket
+                .write_all(
+                    concat!(
+                        "event: response.failed\n",
+                        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"quota exhausted\"}}}\n\n",
+                        "event: response.completed\n",
+                        "data: {}\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+        let body = r#"{"model":"gpt-5.5","input":"hello","stream":true}"#;
+        let raw = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer sk-local\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes();
+        let deployment = smart_test_deployment(
+            "dc",
+            &format!("http://127.0.0.1:{port}/v1"),
+            "sk-failed-then-completed",
+        );
+        let mut out = Vec::new();
+
+        let result = forward_smart_stream_request(
+            &mut out,
+            &smart_test_http_client(),
+            &raw,
+            body.as_bytes(),
+            &deployment,
+            "POST",
+            "/v1/responses",
+        )
+        .unwrap();
+        handle.join().unwrap();
+
+        match result {
+            SmartStreamResult::Incomplete { detail } => {
+                assert!(detail.contains("quota exhausted"), "{detail}");
+            }
+            other => panic!("expected incomplete stream, got {other:?}"),
+        }
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("response.failed"), "{text}");
+        assert!(text.contains("response.completed"), "{text}");
+    }
+
+    #[test]
+    fn smart_stream_keeps_failed_terminal_state_when_failed_follows_completed() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let _ = read_http_request(&mut socket).unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            socket
+                .write_all(
+                    concat!(
+                        "event: response.completed\n",
+                        "data: {}\n\n",
+                        "event: response.failed\n",
+                        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"late failure\"}}}\n\n",
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+        let body = r#"{"model":"gpt-5.5","input":"hello","stream":true}"#;
+        let raw = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer sk-local\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes();
+        let deployment = smart_test_deployment(
+            "dc",
+            &format!("http://127.0.0.1:{port}/v1"),
+            "sk-completed-then-failed",
+        );
+        let mut out = Vec::new();
+
+        let result = forward_smart_stream_request(
+            &mut out,
+            &smart_test_http_client(),
+            &raw,
+            body.as_bytes(),
+            &deployment,
+            "POST",
+            "/v1/responses",
+        )
+        .unwrap();
+        handle.join().unwrap();
+
+        match result {
+            SmartStreamResult::Incomplete { detail } => {
+                assert!(detail.contains("late failure"), "{detail}");
+            }
+            other => panic!("expected incomplete stream, got {other:?}"),
+        }
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("response.completed"), "{text}");
+        assert!(text.contains("response.failed"), "{text}");
+    }
+
+    #[test]
+    fn smart_proxy_stream_retries_invalid_encrypted_content_without_bad_blob() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let upstream_handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while requests.len() < 2 && Instant::now() < deadline {
+                match upstream.accept() {
+                    Ok((mut socket, _)) => {
+                        socket.set_nonblocking(false).unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        socket
+                            .set_write_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let raw = read_http_request(&mut socket).unwrap();
+                        requests.push(String::from_utf8_lossy(&raw).to_string());
+                        if requests.len() == 1 {
+                            let body = r#"{"error":{"message":"The encrypted content gAAA... could not be verified. Reason: Encrypted content could not be decrypted or parsed.","type":"invalid_request_error","code":"invalid_encrypted_content"}}"#;
+                            let response = format!(
+                                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            socket.write_all(response.as_bytes()).unwrap();
+                        } else {
+                            socket
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                                )
+                                .unwrap();
+                            socket
+                                .write_all(
+                                    b"event: response.output_text.delta\ndata: {\"delta\":\"STRIPPED_OK\"}\n\n",
+                                )
+                                .unwrap();
+                            socket
+                                .write_all(b"event: response.completed\ndata: {}\n\n")
+                                .unwrap();
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(err) => panic!("accept failed: {err}"),
+                }
+            }
+            requests
+        });
+        let mut deployment =
+            smart_test_deployment("dc", &format!("http://127.0.0.1:{port}/v1"), "sk-stream");
+        deployment.max_qps = Some(1);
+        deployment.max_rpm = Some(1);
+        let deployments = Arc::new(Mutex::new(vec![deployment]));
+        let upstreams = smart_test_upstreams(&deployments);
+        let temp = tempfile::tempdir().unwrap();
+        let quality_writer = QualityWriteHandle::new(temp.path().join("smart-quality.json"));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen_port = listener.local_addr().unwrap().port();
+        let http_client = smart_test_http_client();
+        let server_handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            handle_smart_proxy_client(
+                &mut stream,
+                deployments,
+                upstreams,
+                quality_writer,
+                None,
+                None,
+                http_client,
+                "sk-local",
+                35,
+                1,
+            )
+            .unwrap();
+        });
+
+        let mut client = TcpStream::connect(("127.0.0.1", listen_port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let body = r#"{"model":"gpt-5.5","input":[{"type":"reasoning","encrypted_content":"bad-token"},{"role":"user","content":[{"type":"input_text","text":"hello"}]}],"stream":true}"#;
+        let request = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer sk-local\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        client.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        server_handle.join().unwrap();
+        let requests = upstream_handle.join().unwrap();
+
+        assert_eq!(requests.len(), 2, "{response}");
+        assert!(requests[0].contains("encrypted_content"));
+        assert!(!requests[1].contains("encrypted_content"));
+        assert!(response.contains("STRIPPED_OK"), "{response}");
+        assert!(
+            !response.contains("invalid_encrypted_content"),
+            "{response}"
+        );
+    }
+
+    #[test]
     fn smart_proxy_failure_update_releases_deployments_before_waiting_on_upstreams() {
         let deployments = Arc::new(Mutex::new(vec![smart_test_deployment(
             "dc",
@@ -3996,6 +4968,139 @@ mod tests {
     }
 
     #[test]
+    fn smart_proxy_stream_does_not_mix_retry_after_partial_upstream_body_error() {
+        let first_upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let first_port = first_upstream.local_addr().unwrap().port();
+        let first_handle = thread::spawn(move || {
+            let (mut socket, _) = first_upstream.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let _ = read_http_request(&mut socket).unwrap();
+            let payload =
+                b"event: response.output_text.delta\ndata: {\"delta\":\"FIRST_PARTIAL\"}\n\n";
+            let response_head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+                payload.len()
+            );
+            socket.write_all(response_head.as_bytes()).unwrap();
+            socket.write_all(payload).unwrap();
+            socket.write_all(b"\r\nzz\r\n").unwrap();
+            socket.flush().unwrap();
+        });
+        let second_upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        second_upstream.set_nonblocking(true).unwrap();
+        let second_port = second_upstream.local_addr().unwrap().port();
+        let second_handle = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < deadline {
+                match second_upstream.accept() {
+                    Ok((mut socket, _)) => {
+                        socket.set_nonblocking(false).unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        socket
+                            .set_write_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let _ = read_http_request(&mut socket).unwrap();
+                        socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                            )
+                            .unwrap();
+                        socket
+                            .write_all(
+                                b"event: response.output_text.delta\ndata: {\"delta\":\"SECOND_OK\"}\n\n",
+                            )
+                            .unwrap();
+                        socket
+                            .write_all(b"event: response.completed\ndata: {}\n\n")
+                            .unwrap();
+                        socket.flush().unwrap();
+                        return true;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(err) => panic!("accept failed: {err}"),
+                }
+            }
+            false
+        });
+        let mut second = smart_test_deployment(
+            "second",
+            &format!("http://127.0.0.1:{second_port}/v1"),
+            "sk-second",
+        );
+        second.stats.total_requests = 1;
+        second.stats.success_requests = 1;
+        second.stats.recalculate_score();
+        let deployments = Arc::new(Mutex::new(vec![
+            smart_test_deployment(
+                "first",
+                &format!("http://127.0.0.1:{first_port}/v1"),
+                "sk-first",
+            ),
+            second,
+        ]));
+        let upstreams = smart_test_upstreams(&deployments);
+        let temp = tempfile::tempdir().unwrap();
+        let quality_writer = QualityWriteHandle::new(temp.path().join("smart-quality.json"));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen_port = listener.local_addr().unwrap().port();
+        let http_client = smart_test_http_client();
+        let server_handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            handle_smart_proxy_client(
+                &mut stream,
+                deployments,
+                upstreams,
+                quality_writer,
+                None,
+                None,
+                http_client,
+                "sk-local",
+                35,
+                0,
+            )
+            .unwrap();
+        });
+
+        let mut client = TcpStream::connect(("127.0.0.1", listen_port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let body = r#"{"model":"gpt-5.5","input":"hello","stream":true}"#;
+        let request = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer sk-local\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        client.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        server_handle.join().unwrap();
+        first_handle.join().unwrap();
+        let retried_second = second_handle.join().unwrap();
+
+        assert!(response.contains("FIRST_PARTIAL"), "{response}");
+        assert!(
+            response.contains("event: error"),
+            "partial upstream body errors should terminate the current stream with an SSE error: {response}"
+        );
+        assert!(
+            !retried_second && !response.contains("SECOND_OK"),
+            "retrying after partial bytes corrupts the client stream: {response}"
+        );
+    }
+
+    #[test]
     fn smart_proxy_uses_six_attempt_minimum_for_retryable_failures() {
         assert_eq!(smart_proxy_attempt_budget(0), 6);
         assert_eq!(smart_proxy_attempt_budget(4), 6);
@@ -4040,6 +5145,32 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap()
             .contains("invalid request"));
+    }
+
+    #[test]
+    fn smart_proxy_sse_error_event_is_openai_compatible() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            write_sse_error_event(&mut socket, "upstream closed").unwrap();
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        handle.join().unwrap();
+        let data = response
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("error event should include data line");
+        let value: Value = serde_json::from_str(data).unwrap();
+
+        assert!(response.starts_with("event: error\n"));
+        assert_eq!(value["type"], json!("error"));
+        assert_eq!(value["code"], json!("watchapi_smart_proxy_error"));
+        assert_eq!(value["message"], json!("upstream closed"));
+        assert!(value["param"].is_null());
+        assert!(value.get("error").is_none());
     }
 
     #[test]
@@ -4323,7 +5454,64 @@ mod tests {
         assert!(!block.contains("let _ = store.save"));
         assert!(source.contains("if store.save(path).is_ok()"));
         assert!(source.contains("for _ in 0..attempts.max(1)"));
-        assert!(block.contains("40"));
+        assert!(source.contains("const QUALITY_FLUSH_ATTEMPTS: usize = 40"));
+    }
+
+    #[test]
+    fn smart_proxy_quality_writer_fast_flush_is_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let blocked_parent = temp.path().join("blocked-parent");
+        fs::write(&blocked_parent, "not a directory").unwrap();
+        let writer = QualityWriteHandle::new(blocked_parent.join("quality.json"));
+        writer.persist("key-a".to_string(), PersistedKeyQuality::default());
+
+        let started = Instant::now();
+        writer.flush_with_timeout(Duration::from_millis(80), 1);
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "fast quality flush must not wait for the full retry window"
+        );
+    }
+
+    #[test]
+    fn smart_proxy_has_fast_stop_for_exit_cleanup() {
+        let source = include_str!("litellm_proxy.rs");
+        let stop_block = source
+            .split("fn stop_with_quality_flush")
+            .nth(1)
+            .and_then(|tail| tail.split("pub fn snapshot").next())
+            .expect("smart proxy stop helper should be discoverable");
+
+        assert!(source.contains("pub fn stop_fast(&mut self)"));
+        assert!(source.contains("QUALITY_FAST_FLUSH_ATTEMPTS"));
+        assert!(stop_block.contains("self.running.swap(false"));
+        assert!(stop_block.contains("flush_with_timeout"));
+        assert!(
+            stop_block.find("self.running.swap(false") < stop_block.find("flush_with_timeout"),
+            "exit stop should stop accepting local clients before any quality flush wait"
+        );
+    }
+
+    #[test]
+    fn smart_proxy_stop_is_idempotent_after_fast_stop() {
+        let source = include_str!("litellm_proxy.rs");
+        let stop_block = source
+            .split("fn stop_with_quality_flush")
+            .nth(1)
+            .and_then(|tail| tail.split("pub fn stop").next())
+            .expect("smart proxy stop helper should be discoverable");
+
+        assert!(stop_block.contains("self.running.swap(false"));
+        assert!(
+            stop_block.contains("if !was_running && self.handle.is_none()"),
+            "Drop after stop_fast must not run a second full quality flush"
+        );
+        assert!(
+            stop_block.find("if !was_running && self.handle.is_none()")
+                < stop_block.find("flush_with_timeout"),
+            "idempotent stop guard must run before any quality flush"
+        );
     }
 
     #[test]

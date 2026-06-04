@@ -6,6 +6,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const CODEX_UNATTENDED_MODEL_UPGRADES: &[&str] = &["gpt-5.4"];
+const CODEX_DEFAULT_STATUS_LINE: &str = "true";
+const CODEX_DEFAULT_STATUS_LINE_USE_COLORS: &str = "true";
+const CODEX_DEFAULT_TUI_STATUS_LINE_ITEMS: &str =
+    "[\"model-with-reasoning\", \"context-remaining\", \"current-dir\", \"git-branch\", \"context-used\"]";
+const CODEX_DEFAULT_TUI_SHOW_TOOLTIPS: &str = "true";
+const CODEX_DEFAULT_TUI_ANIMATIONS: &str = "true";
+const CODEX_DEFAULT_TUI_RAW_OUTPUT_MODE: &str = "false";
 
 pub struct CodexConfigBackup {
     state_path: PathBuf,
@@ -177,6 +184,7 @@ pub fn apply_codex_endpoint(
         &effective_provider_name,
         CodexConfigValues {
             base_url: &endpoint.base_url,
+            api_key: &endpoint.api_key,
             model: Some(&endpoint.model),
             reasoning_effort: Some(&endpoint.reasoning_effort),
             service_tier: endpoint.service_tier.as_deref(),
@@ -236,6 +244,7 @@ pub fn set_top_level_codex_config_values(
 
 pub struct CodexConfigValues<'a> {
     pub base_url: &'a str,
+    pub api_key: &'a str,
     pub model: Option<&'a str>,
     pub reasoning_effort: Option<&'a str>,
     pub service_tier: Option<&'a str>,
@@ -262,21 +271,112 @@ pub fn set_codex_config_values(
     if let Some(value) = values.approval_policy {
         set_top_level_assignment(&mut lines, "approval_policy", value);
     }
+    force_codex_tui_status_values(&mut lines);
 
     let header = format!("[model_providers.{provider_name}]");
-    let section_start =
-        find_section(&lines, &header).ok_or_else(|| anyhow!("missing {header} section"))?;
+    let section_start = find_or_insert_section(&mut lines, &header);
     set_section_assignment(
         &mut lines,
         section_start,
         "base_url",
         &format!("\"{}\"", toml_string(values.base_url)),
     );
+    set_section_assignment(
+        &mut lines,
+        section_start,
+        "experimental_bearer_token",
+        &format!("\"{}\"", toml_string(values.api_key)),
+    );
     set_section_assignment(&mut lines, section_start, "wire_api", "\"responses\"");
     set_section_assignment(&mut lines, section_start, "requires_openai_auth", "false");
     Ok(lines.concat())
 }
 
+fn force_codex_tui_status_values(lines: &mut Vec<String>) {
+    set_top_level_raw_assignment(lines, "status_line", CODEX_DEFAULT_STATUS_LINE);
+    set_top_level_raw_assignment(
+        lines,
+        "status_line_use_colors",
+        CODEX_DEFAULT_STATUS_LINE_USE_COLORS,
+    );
+
+    let section_start = find_or_insert_section(lines, "[tui]");
+    set_section_assignment(
+        lines,
+        section_start,
+        "status_line",
+        CODEX_DEFAULT_TUI_STATUS_LINE_ITEMS,
+    );
+    set_section_assignment(
+        lines,
+        section_start,
+        "show_tooltips",
+        CODEX_DEFAULT_TUI_SHOW_TOOLTIPS,
+    );
+    set_section_assignment(
+        lines,
+        section_start,
+        "animations",
+        CODEX_DEFAULT_TUI_ANIMATIONS,
+    );
+    set_section_assignment(
+        lines,
+        section_start,
+        "raw_output_mode",
+        CODEX_DEFAULT_TUI_RAW_OUTPUT_MODE,
+    );
+}
+
+fn set_top_level_raw_assignment(lines: &mut Vec<String>, name: &str, value: &str) {
+    let search_end = find_first_section(lines).unwrap_or(lines.len());
+    for line in lines.iter_mut().take(search_end) {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(name) && trimmed[name.len()..].trim_start().starts_with('=') {
+            let indent_len = line.len() - trimmed.len();
+            let indent = &line[..indent_len];
+            let newline = if line.ends_with('\n') { "\n" } else { "" };
+            *line = format!("{indent}{name} = {value}{newline}");
+            return;
+        }
+    }
+    lines.insert(search_end, format!("{name} = {value}\n"));
+}
+
+fn find_or_insert_section(lines: &mut Vec<String>, header: &str) -> usize {
+    if let Some(index) = find_section(lines, header) {
+        return index;
+    }
+    if let Some(prefix) = nested_section_prefix(header) {
+        if let Some(index) = find_first_nested_section(lines, &prefix) {
+            lines.insert(index, format!("{header}\n"));
+            return index;
+        }
+    }
+    if lines.last().is_some_and(|line| !line.ends_with('\n')) {
+        lines.push("\n".to_string());
+    }
+    if lines.last().is_some_and(|line| !line.trim().is_empty()) {
+        lines.push("\n".to_string());
+    }
+    let index = lines.len();
+    lines.push(format!("{header}\n"));
+    index
+}
+
+fn nested_section_prefix(header: &str) -> Option<String> {
+    header
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("[{value}."))
+}
+
+fn find_first_nested_section(lines: &[String], prefix: &str) -> Option<usize> {
+    lines.iter().position(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with(prefix) && trimmed.ends_with(']')
+    })
+}
 fn set_top_level_assignment(lines: &mut Vec<String>, key: &str, value: &str) {
     let search_end = find_first_section(lines).unwrap_or(lines.len());
     for line in lines.iter_mut().take(search_end) {
@@ -451,6 +551,166 @@ mod tests {
         assert!(config_text.contains("approval_policy = \"never\""));
         assert_eq!(auth["OPENAI_API_KEY"], "new-key");
         assert_eq!(auth["OTHER"], "keep");
+    }
+
+    #[test]
+    fn apply_codex_endpoint_adds_codex_tui_status_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let auth_path = tmp.path().join("auth.json");
+        fs::write(
+            &config_path,
+            [
+                "model_provider = \"custom\"",
+                "[model_providers.custom]",
+                "base_url = \"https://old.example.test\"",
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        apply_codex_endpoint(&endpoint(), &config_path, &auth_path, "custom").unwrap();
+
+        let config_text = fs::read_to_string(config_path).unwrap();
+        assert!(config_text.contains("status_line = true"));
+        assert!(config_text.contains("status_line_use_colors = true"));
+        assert!(config_text.contains("[tui]"));
+        assert!(config_text.contains(
+            "status_line = [\"model-with-reasoning\", \"context-remaining\", \"current-dir\", \"git-branch\", \"context-used\"]"
+        ));
+        assert!(config_text.contains("show_tooltips = true"));
+        assert!(config_text.contains("animations = true"));
+        assert!(config_text.contains("raw_output_mode = false"));
+    }
+
+    #[test]
+    fn apply_codex_endpoint_forces_codex_tui_status_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let auth_path = tmp.path().join("auth.json");
+        fs::write(
+            &config_path,
+            [
+                "status_line = false",
+                "status_line_use_colors = false",
+                "model_provider = \"custom\"",
+                "[tui]",
+                "show_tooltips = false",
+                "animations = false",
+                "raw_output_mode = true",
+                "status_line = [\"current-dir\"]",
+                "",
+                "[model_providers.custom]",
+                "base_url = \"https://old.example.test\"",
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        apply_codex_endpoint(&endpoint(), &config_path, &auth_path, "custom").unwrap();
+
+        let config_text = fs::read_to_string(config_path).unwrap();
+        assert!(config_text.contains("status_line = true"));
+        assert!(config_text.contains("status_line_use_colors = true"));
+        assert!(config_text.contains(
+            "status_line = [\"model-with-reasoning\", \"context-remaining\", \"current-dir\", \"git-branch\", \"context-used\"]"
+        ));
+        assert!(config_text.contains("show_tooltips = true"));
+        assert!(config_text.contains("animations = true"));
+        assert!(config_text.contains("raw_output_mode = false"));
+        assert!(!config_text.contains("status_line = false"));
+        assert!(!config_text.contains("status_line_use_colors = false"));
+        assert!(!config_text.contains("show_tooltips = false"));
+        assert!(!config_text.contains("animations = false"));
+        assert!(!config_text.contains("raw_output_mode = true"));
+        assert!(!config_text.contains("status_line = [\"current-dir\"]"));
+    }
+
+    #[test]
+    fn apply_codex_endpoint_inserts_tui_parent_before_nested_tui_sections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let auth_path = tmp.path().join("auth.json");
+        fs::write(
+            &config_path,
+            [
+                "model_provider = \"custom\"",
+                "[tui.model_availability_nux]",
+                "\"gpt-5.5\" = 4",
+                "",
+                "[model_providers.custom]",
+                "base_url = \"old\"",
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        apply_codex_endpoint(&endpoint(), &config_path, &auth_path, "custom").unwrap();
+
+        let config_text = fs::read_to_string(config_path).unwrap();
+        let tui_pos = config_text.find("[tui]\n").unwrap();
+        let nested_pos = config_text.find("[tui.model_availability_nux]").unwrap();
+        assert!(tui_pos < nested_pos);
+        assert!(config_text.contains(
+            "status_line = [\"model-with-reasoning\", \"context-remaining\", \"current-dir\", \"git-branch\", \"context-used\"]"
+        ));
+        assert!(config_text.contains("\"gpt-5.5\" = 4"));
+    }
+
+    #[test]
+    fn apply_codex_endpoint_replaces_current_provider_bearer_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let auth_path = tmp.path().join("auth.json");
+        fs::write(
+            &config_path,
+            [
+                "model_provider = \"custom\"",
+                "[model_providers.custom]",
+                "base_url = \"https://old.example.test\"",
+                "experimental_bearer_token = \"old-key\"",
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        apply_codex_endpoint(&endpoint(), &config_path, &auth_path, "custom").unwrap();
+
+        let config_text = fs::read_to_string(config_path).unwrap();
+        assert!(config_text.contains("experimental_bearer_token = \"new-key\""));
+        assert!(!config_text.contains("experimental_bearer_token = \"old-key\""));
+    }
+
+    #[test]
+    fn apply_codex_endpoint_creates_missing_current_provider_section() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let auth_path = tmp.path().join("auth.json");
+        let endpoint = endpoint();
+        fs::write(
+            &config_path,
+            [
+                "model_provider = \"stale\"",
+                "[model_providers.custom]",
+                "base_url = \"old-base\"",
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        apply_codex_endpoint(&endpoint, &config_path, &auth_path, "custom").unwrap();
+
+        let config_text = fs::read_to_string(config_path).unwrap();
+        assert!(config_text.contains("[model_providers.stale]"));
+        assert!(config_text.contains(&format!("base_url = \"{}\"", endpoint.base_url)));
+        assert!(config_text.contains("experimental_bearer_token = \"new-key\""));
+        assert!(config_text.contains("wire_api = \"responses\""));
+        assert!(config_text.contains("requires_openai_auth = false"));
     }
 
     #[test]

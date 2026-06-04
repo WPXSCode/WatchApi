@@ -20,7 +20,7 @@ pub mod tokens;
 
 pub use config::{
     AgentCommand, AgentDriver, AppConfig, EndpointConfig, EndpointProviderConfig,
-    EndpointProviderLibrary, PROVIDER_LIBRARY_FILENAME,
+    EndpointProviderLibrary, GuardDetectionMode, PROVIDER_LIBRARY_FILENAME,
 };
 pub use health::{EndpointHealth, EndpointHealthTracker};
 pub use http_probe::{
@@ -29,12 +29,16 @@ pub use http_probe::{
 };
 pub use pollution::{is_polluted_text, pollution_ratio};
 pub use probe::ProbeResult;
-pub use runtime::{EndpointRow, RuntimeCore, RuntimeEvent, RuntimeSnapshot, RuntimeState};
+pub use runtime::{
+    EndpointRow, RuntimeCore, RuntimeEvent, RuntimeEventWakeup, RuntimeSnapshot, RuntimeState,
+};
 pub use selector::choose_best_endpoint;
 pub use sessions::{
-    binding_key_text, latest_codex_session_goal, latest_codex_session_goal_record,
-    recent_session_detail_summary, ClaudeSessionIndex, CodexSessionGoalRecord, CodexSessionIndex,
-    SessionBindingKey, SessionCandidate, SessionStore,
+    binding_key_text, discover_codex_session_homes, latest_codex_session_goal,
+    latest_codex_session_goal_record, recent_session_detail_summary, ClaudeSessionIndex,
+    CodexSessionGoalRecord, CodexSessionIndex, SessionBindingKey, SessionCandidate, SessionStore,
 };
-pub use terminal::{InputSource, TerminalEvent, TerminalSession, TerminalSnapshot};
+pub use terminal::{
+    InputSource, TerminalActivityWakeup, TerminalEvent, TerminalSession, TerminalSnapshot,
+};
 pub use tokens::{format_token_cost, TokenUsage};

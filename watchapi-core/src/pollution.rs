@@ -18,6 +18,22 @@ pub fn is_polluted_text(
     analyze_pollution(text, keywords, threshold, context_window, max_chars).polluted
 }
 
+pub fn is_keyword_polluted_text(
+    text: &str,
+    keywords: &[String],
+    threshold: f64,
+    context_window: usize,
+    max_chars: usize,
+) -> bool {
+    let keyword_ratio = pollution_ratio(text, keywords, context_window, max_chars);
+    let contains_keyword = contains_pollution_keyword(text, keywords);
+    if threshold <= 0.0 {
+        contains_keyword
+    } else {
+        keyword_ratio >= threshold
+    }
+}
+
 pub fn pollution_detection_configured(keywords: &[String]) -> bool {
     keywords.iter().any(|keyword| !keyword.trim().is_empty())
 }

@@ -89,6 +89,10 @@ impl EndpointHealthTracker {
             .unwrap_or(false)
     }
 
+    pub fn reset(&mut self, endpoint_name: &str) {
+        self.states.remove(endpoint_name);
+    }
+
     pub fn status_label(&self, endpoint_name: &str) -> String {
         let Some(state) = self.states.get(endpoint_name) else {
             return "未知".to_string();

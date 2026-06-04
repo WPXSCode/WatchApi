@@ -9,7 +9,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT"
-version = "0.1.0"
+version = "0.3.0"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -42,6 +42,7 @@ wreq-util = { version = "3.0.0-rc.11", default-features = false, features = ["em
 wry = "0.54.4"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Storage_FileSystem",

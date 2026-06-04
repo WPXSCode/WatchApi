@@ -700,7 +700,7 @@ pub fn add_manual_prompt_history(history: &[String], prompt: &str, limit: usize)
         return history.iter().take(limit).cloned().collect();
     }
     let mut updated = vec![text.to_string()];
-    for item in history.iter().rev() {
+    for item in history {
         let value = item.trim();
         if !value.is_empty() && value != text && !updated.iter().any(|existing| existing == value) {
             updated.push(value.to_string());
@@ -1353,6 +1353,24 @@ mod tests {
         assert_eq!(
             add_manual_prompt_history(&["old".to_string(), "x".to_string()], " old ", 20),
             vec!["old".to_string(), "x".to_string()]
+        );
+        assert_eq!(
+            add_manual_prompt_history(
+                &[
+                    "third".to_string(),
+                    "second".to_string(),
+                    "first".to_string()
+                ],
+                "new",
+                20
+            ),
+            vec![
+                "new".to_string(),
+                "third".to_string(),
+                "second".to_string(),
+                "first".to_string()
+            ],
+            "历史提示词下拉应保持最近使用优先，不能在新增后把旧历史倒序"
         );
         assert_eq!(
             format_config_status_label("A", "running", "", "", "3s", "err"),
