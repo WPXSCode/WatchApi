@@ -15406,20 +15406,21 @@ struct SystemOpenCommand {
 }
 
 fn system_open_command_for_path(path: &Path) -> SystemOpenCommand {
-    let is_dir = path.is_dir();
+    let open_path = system_open_target_path(path);
+    let is_dir = open_path.is_dir();
     let success_status = if is_dir {
-        format!("已打开目录：{}", path.display())
+        format!("已打开目录：{}", open_path.display())
     } else {
-        format!("已打开文件位置：{}", path.display())
+        format!("已打开文件位置：{}", open_path.display())
     };
 
     #[cfg(target_os = "windows")]
     {
         let args = if is_dir {
-            vec![path.as_os_str().to_os_string()]
+            vec![open_path.as_os_str().to_os_string()]
         } else {
             let mut select_arg = OsString::from("/select,");
-            select_arg.push(path.as_os_str());
+            select_arg.push(open_path.as_os_str());
             vec![select_arg]
         };
         SystemOpenCommand {
@@ -15432,9 +15433,9 @@ fn system_open_command_for_path(path: &Path) -> SystemOpenCommand {
     #[cfg(target_os = "macos")]
     {
         let args = if is_dir {
-            vec![path.as_os_str().to_os_string()]
+            vec![open_path.as_os_str().to_os_string()]
         } else {
-            vec![OsString::from("-R"), path.as_os_str().to_os_string()]
+            vec![OsString::from("-R"), open_path.as_os_str().to_os_string()]
         };
         SystemOpenCommand {
             program: "open",
@@ -15446,11 +15447,12 @@ fn system_open_command_for_path(path: &Path) -> SystemOpenCommand {
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
         let open_target = if is_dir {
-            path
+            open_path.as_path()
         } else {
-            path.parent()
+            open_path
+                .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or(path)
+                .unwrap_or(open_path.as_path())
         };
         SystemOpenCommand {
             program: "xdg-open",
@@ -15458,6 +15460,28 @@ fn system_open_command_for_path(path: &Path) -> SystemOpenCommand {
             success_status,
         }
     }
+}
+
+fn system_open_target_path(path: &Path) -> PathBuf {
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    strip_system_open_path_prefix(resolved)
+}
+
+#[cfg(target_os = "windows")]
+fn strip_system_open_path_prefix(path: PathBuf) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy().to_string();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path
+}
+
+#[cfg(not(target_os = "windows"))]
+fn strip_system_open_path_prefix(path: PathBuf) -> PathBuf {
+    path
 }
 
 fn historical_codex_session_homes() -> Vec<PathBuf> {
@@ -24979,32 +25003,95 @@ mod tests {
         std::fs::write(&session_file, "{}\n").unwrap();
 
         let command = system_open_command_for_path(&session_file);
+        let open_file = system_open_target_path(&session_file);
 
         assert!(command.success_status.contains("已打开文件位置"));
+        assert!(command
+            .success_status
+            .contains(&open_file.display().to_string()));
         #[cfg(target_os = "windows")]
         {
             assert_eq!(command.program, "explorer");
             assert_eq!(command.args.len(), 1);
             let select_arg = command.args[0].to_string_lossy();
             assert!(select_arg.starts_with("/select,"));
-            assert!(select_arg.contains("session.jsonl"));
+            assert!(select_arg.contains(&open_file.display().to_string()));
         }
         #[cfg(target_os = "macos")]
         {
             assert_eq!(command.program, "open");
             assert_eq!(
                 command.args,
+                vec![OsString::from("-R"), open_file.as_os_str().to_os_string()]
+            );
+        }
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+        {
+            let open_dir = system_open_target_path(temp.path());
+            assert_eq!(command.program, "xdg-open");
+            assert_eq!(command.args, vec![open_dir.as_os_str().to_os_string()]);
+        }
+    }
+
+    #[test]
+    fn open_path_command_canonicalizes_targets_before_opening() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let session_file = temp.path().join("session.jsonl");
+        std::fs::write(&session_file, "{}\n").unwrap();
+        let redundant_path = nested.join("..").join("session.jsonl");
+        assert!(redundant_path.exists());
+
+        let command = system_open_command_for_path(&redundant_path);
+        let canonical_file = system_open_target_path(&session_file);
+
+        assert!(command
+            .success_status
+            .contains(&canonical_file.display().to_string()));
+        #[cfg(target_os = "windows")]
+        {
+            let select_arg = command.args[0].to_string_lossy();
+            assert!(select_arg.contains(&canonical_file.display().to_string()));
+            assert!(!select_arg.contains(".."));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                command.args,
                 vec![
                     OsString::from("-R"),
-                    session_file.as_os_str().to_os_string()
+                    canonical_file.as_os_str().to_os_string()
                 ]
             );
         }
         #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
         {
-            assert_eq!(command.program, "xdg-open");
-            assert_eq!(command.args, vec![temp.path().as_os_str().to_os_string()]);
+            assert_eq!(
+                command.args,
+                vec![temp
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .as_os_str()
+                    .to_os_string()]
+            );
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn open_path_command_strips_windows_verbatim_prefix_for_explorer() {
+        assert_eq!(
+            strip_system_open_path_prefix(PathBuf::from(r"\\?\C:\Users\WPX\session.jsonl")),
+            PathBuf::from(r"C:\Users\WPX\session.jsonl")
+        );
+        assert_eq!(
+            strip_system_open_path_prefix(PathBuf::from(
+                r"\\?\UNC\server\share\sessions\session.jsonl"
+            )),
+            PathBuf::from(r"\\server\share\sessions\session.jsonl")
+        );
     }
 
     #[test]
@@ -25012,22 +25099,23 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
 
         let command = system_open_command_for_path(temp.path());
+        let open_dir = system_open_target_path(temp.path());
 
         assert!(command.success_status.contains("已打开目录"));
         #[cfg(target_os = "windows")]
         {
             assert_eq!(command.program, "explorer");
-            assert_eq!(command.args, vec![temp.path().as_os_str().to_os_string()]);
+            assert_eq!(command.args, vec![open_dir.as_os_str().to_os_string()]);
         }
         #[cfg(target_os = "macos")]
         {
             assert_eq!(command.program, "open");
-            assert_eq!(command.args, vec![temp.path().as_os_str().to_os_string()]);
+            assert_eq!(command.args, vec![open_dir.as_os_str().to_os_string()]);
         }
         #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
         {
             assert_eq!(command.program, "xdg-open");
-            assert_eq!(command.args, vec![temp.path().as_os_str().to_os_string()]);
+            assert_eq!(command.args, vec![open_dir.as_os_str().to_os_string()]);
         }
     }
 

@@ -2,6 +2,7 @@ use crate::atomic_write::write_text_atomic;
 use crate::config::EndpointConfig;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -329,21 +330,15 @@ fn force_codex_tui_status_values(lines: &mut Vec<String>) {
 
 fn set_top_level_raw_assignment(lines: &mut Vec<String>, name: &str, value: &str) {
     let search_end = find_first_section(lines).unwrap_or(lines.len());
-    for line in lines.iter_mut().take(search_end) {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with(name) && trimmed[name.len()..].trim_start().starts_with('=') {
-            let indent_len = line.len() - trimmed.len();
-            let indent = &line[..indent_len];
-            let newline = if line.ends_with('\n') { "\n" } else { "" };
-            *line = format!("{indent}{name} = {value}{newline}");
-            return;
-        }
+    if set_assignment_in_range(lines, 0, search_end, name, value) {
+        return;
     }
     lines.insert(search_end, format!("{name} = {value}\n"));
 }
 
 fn find_or_insert_section(lines: &mut Vec<String>, header: &str) -> usize {
     if let Some(index) = find_section(lines, header) {
+        merge_duplicate_sections(lines, header, index);
         return index;
     }
     if let Some(prefix) = nested_section_prefix(header) {
@@ -363,6 +358,69 @@ fn find_or_insert_section(lines: &mut Vec<String>, header: &str) -> usize {
     index
 }
 
+fn merge_duplicate_sections(lines: &mut Vec<String>, header: &str, keep_start: usize) {
+    let duplicate_ranges = duplicate_section_ranges(lines, header, keep_start);
+    if duplicate_ranges.is_empty() {
+        return;
+    }
+    let duplicate_bodies = duplicate_ranges
+        .iter()
+        .map(|(start, end)| lines[start + 1..*end].to_vec())
+        .collect::<Vec<_>>();
+    for (start, end) in duplicate_ranges.into_iter().rev() {
+        lines.drain(start..end);
+    }
+
+    let mut seen_keys = section_assignment_keys(lines, keep_start);
+    for body in duplicate_bodies {
+        for mut line in body {
+            let Some(key) = assignment_key(&line) else {
+                continue;
+            };
+            if !seen_keys.insert(key) {
+                continue;
+            }
+            if !line.ends_with('\n') {
+                line.push('\n');
+            }
+            let insert_at = find_section_end(lines, keep_start + 1);
+            lines.insert(insert_at, line);
+        }
+    }
+}
+
+fn duplicate_section_ranges(
+    lines: &[String],
+    header: &str,
+    keep_start: usize,
+) -> Vec<(usize, usize)> {
+    lines
+        .iter()
+        .enumerate()
+        .skip(keep_start + 1)
+        .filter(|(_, line)| line.trim() == header)
+        .map(|(index, _)| (index, find_section_end(lines, index + 1)))
+        .collect()
+}
+
+fn section_assignment_keys(lines: &[String], section_start: usize) -> HashSet<String> {
+    let section_end = find_section_end(lines, section_start + 1);
+    lines[section_start + 1..section_end]
+        .iter()
+        .filter_map(|line| assignment_key(line))
+        .collect()
+}
+
+fn assignment_key(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') {
+        return None;
+    }
+    let (key, _) = trimmed.split_once('=')?;
+    let key = key.trim();
+    (!key.is_empty() && !key.starts_with('[')).then(|| key.to_string())
+}
+
 fn nested_section_prefix(header: &str) -> Option<String> {
     header
         .strip_prefix('[')
@@ -379,17 +437,11 @@ fn find_first_nested_section(lines: &[String], prefix: &str) -> Option<usize> {
 }
 fn set_top_level_assignment(lines: &mut Vec<String>, key: &str, value: &str) {
     let search_end = find_first_section(lines).unwrap_or(lines.len());
-    for line in lines.iter_mut().take(search_end) {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with(key) && trimmed[key.len()..].trim_start().starts_with('=') {
-            let indent_len = line.len() - trimmed.len();
-            let indent = &line[..indent_len];
-            let newline = if line.ends_with('\n') { "\n" } else { "" };
-            *line = format!("{indent}{key} = \"{}\"{newline}", toml_string(value));
-            return;
-        }
+    let value = format!("\"{}\"", toml_string(value));
+    if set_assignment_in_range(lines, 0, search_end, key, &value) {
+        return;
     }
-    lines.insert(search_end, format!("{key} = \"{}\"\n", toml_string(value)));
+    lines.insert(search_end, format!("{key} = {value}\n"));
 }
 
 fn set_optional_top_level_assignment(lines: &mut Vec<String>, key: &str, value: Option<&str>) {
@@ -402,27 +454,66 @@ fn set_optional_top_level_assignment(lines: &mut Vec<String>, key: &str, value: 
 
 fn remove_top_level_assignment(lines: &mut Vec<String>, key: &str) {
     let search_end = find_first_section(lines).unwrap_or(lines.len());
-    if let Some(index) = lines.iter().take(search_end).position(|line| {
-        let trimmed = line.trim_start();
-        trimmed.starts_with(key) && trimmed[key.len()..].trim_start().starts_with('=')
-    }) {
+    for index in matching_assignment_indexes(lines, 0, search_end, key)
+        .into_iter()
+        .rev()
+    {
         lines.remove(index);
     }
 }
 
 fn set_section_assignment(lines: &mut Vec<String>, section_start: usize, key: &str, value: &str) {
     let section_end = find_section_end(lines, section_start + 1);
-    for line in lines.iter_mut().take(section_end).skip(section_start + 1) {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with(key) && trimmed[key.len()..].trim_start().starts_with('=') {
-            let indent_len = line.len() - trimmed.len();
-            let indent = &line[..indent_len];
-            let newline = if line.ends_with('\n') { "\n" } else { "" };
-            *line = format!("{indent}{key} = {value}{newline}");
-            return;
-        }
+    if set_assignment_in_range(lines, section_start + 1, section_end, key, value) {
+        return;
     }
     lines.insert(section_end, format!("{key} = {value}\n"));
+}
+
+fn set_assignment_in_range(
+    lines: &mut Vec<String>,
+    start: usize,
+    end: usize,
+    key: &str,
+    value: &str,
+) -> bool {
+    let matches = matching_assignment_indexes(lines, start, end, key);
+    let Some(first) = matches.first().copied() else {
+        return false;
+    };
+    lines[first] = format_assignment_like(&lines[first], key, value);
+    for index in matches.into_iter().skip(1).rev() {
+        lines.remove(index);
+    }
+    true
+}
+
+fn matching_assignment_indexes(
+    lines: &[String],
+    start: usize,
+    end: usize,
+    key: &str,
+) -> Vec<usize> {
+    lines
+        .iter()
+        .enumerate()
+        .take(end)
+        .skip(start)
+        .filter_map(|(index, line)| assignment_matches(line, key).then_some(index))
+        .collect()
+}
+
+fn assignment_matches(line: &str, key: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with(key) && trimmed[key.len()..].trim_start().starts_with('=')
+}
+
+fn format_assignment_like(line: &str, key: &str, value: &str) -> String {
+    let trimmed = line.trim_start();
+    let indent_len = line.len() - trimmed.len();
+    let indent = &line[..indent_len];
+    let newline = if line.ends_with('\n') { "\n" } else { "" };
+    format!("{indent}{key} = {value}{newline}")
 }
 
 fn split_keep_newlines(text: &str) -> Vec<String> {
@@ -626,6 +717,137 @@ mod tests {
         assert!(!config_text.contains("animations = false"));
         assert!(!config_text.contains("raw_output_mode = true"));
         assert!(!config_text.contains("status_line = [\"current-dir\"]"));
+    }
+
+    #[test]
+    fn apply_codex_endpoint_deduplicates_codex_tui_status_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let auth_path = tmp.path().join("auth.json");
+        fs::write(
+            &config_path,
+            [
+                "status_line = false",
+                "status_line = false",
+                "status_line_use_colors = false",
+                "status_line_use_colors = false",
+                "model_provider = \"custom\"",
+                "[tui]",
+                "status_line = [\"current-dir\"]",
+                "show_tooltips = false",
+                "animations = false",
+                "raw_output_mode = true",
+                "status_line = [\"git-branch\"]",
+                "show_tooltips = false",
+                "animations = false",
+                "raw_output_mode = true",
+                "",
+                "[model_providers.custom]",
+                "base_url = \"https://old.example.test\"",
+                "base_url = \"https://stale.example.test\"",
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        apply_codex_endpoint(&endpoint(), &config_path, &auth_path, "custom").unwrap();
+
+        let config_text = fs::read_to_string(config_path).unwrap();
+        assert_eq!(config_text.matches("status_line = true").count(), 1);
+        assert_eq!(
+            config_text.matches("status_line_use_colors = true").count(),
+            1
+        );
+        assert_eq!(
+            config_text
+                .matches("status_line = [\"model-with-reasoning\", \"context-remaining\", \"current-dir\", \"git-branch\", \"context-used\"]")
+                .count(),
+            1
+        );
+        assert_eq!(config_text.matches("show_tooltips = true").count(), 1);
+        assert_eq!(config_text.matches("animations = true").count(), 1);
+        assert_eq!(config_text.matches("raw_output_mode = false").count(), 1);
+        assert_eq!(
+            config_text
+                .matches("base_url = \"https://new.example.test\"")
+                .count(),
+            1
+        );
+        assert!(!config_text.contains("status_line = false"));
+        assert!(!config_text.contains("status_line_use_colors = false"));
+        assert!(!config_text.contains("status_line = [\"current-dir\"]"));
+        assert!(!config_text.contains("status_line = [\"git-branch\"]"));
+        assert!(!config_text.contains("show_tooltips = false"));
+        assert!(!config_text.contains("animations = false"));
+        assert!(!config_text.contains("raw_output_mode = true"));
+        assert!(!config_text.contains("https://old.example.test"));
+        assert!(!config_text.contains("https://stale.example.test"));
+    }
+
+    #[test]
+    fn apply_codex_endpoint_merges_duplicate_sections_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let auth_path = tmp.path().join("auth.json");
+        fs::write(
+            &config_path,
+            [
+                "model_provider = \"custom\"",
+                "[tui]",
+                "show_tooltips = false",
+                "",
+                "[tui]",
+                "theme = \"compact\"",
+                "status_line = [\"stale\"]",
+                "",
+                "[model_providers.custom]",
+                "base_url = \"https://old.example.test\"",
+                "extra_first = \"keep\"",
+                "",
+                "[model_providers.custom]",
+                "base_url = \"https://stale.example.test\"",
+                "extra_second = \"keep\"",
+                "",
+                "[model_providers.other]",
+                "base_url = \"https://other.example.test\"",
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        apply_codex_endpoint(&endpoint(), &config_path, &auth_path, "custom").unwrap();
+
+        let config_text = fs::read_to_string(config_path).unwrap();
+        assert_eq!(
+            config_text
+                .lines()
+                .filter(|line| line.trim() == "[tui]")
+                .count(),
+            1
+        );
+        assert_eq!(
+            config_text
+                .lines()
+                .filter(|line| line.trim() == "[model_providers.custom]")
+                .count(),
+            1
+        );
+        assert!(config_text.contains("theme = \"compact\""));
+        assert!(config_text.contains("extra_first = \"keep\""));
+        assert!(config_text.contains("extra_second = \"keep\""));
+        assert!(config_text.contains("[model_providers.other]"));
+        assert!(config_text.contains("base_url = \"https://other.example.test\""));
+        assert_eq!(
+            config_text
+                .matches("base_url = \"https://new.example.test\"")
+                .count(),
+            1
+        );
+        assert!(!config_text.contains("https://old.example.test"));
+        assert!(!config_text.contains("https://stale.example.test"));
+        assert!(!config_text.contains("status_line = [\"stale\"]"));
     }
 
     #[test]
