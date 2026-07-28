@@ -146,6 +146,7 @@ mod tests {
             base_url: "https://example.test/v1".to_string(),
             api_key: "key".to_string(),
             model: "gpt-test".to_string(),
+            probe_model: None,
             reasoning_effort: "high".to_string(),
             service_tier: None,
             initial_prompt: "init".to_string(),

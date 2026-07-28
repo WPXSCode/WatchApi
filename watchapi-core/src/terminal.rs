@@ -778,10 +778,18 @@ fn has_path_part(program: &str) -> bool {
 
 fn find_in_path(program: &str) -> Option<String> {
     let path = std::env::var_os("PATH")?;
+    let pathext = std::env::var("PATHEXT").ok();
+    find_in_path_with_path(program, path.as_os_str(), pathext.as_deref())
+}
+
+fn find_in_path_with_path(
+    program: &str,
+    path: &std::ffi::OsStr,
+    pathext: Option<&str>,
+) -> Option<String> {
     let suffixes: Vec<String> = if cfg!(windows) {
-        let pathext =
-            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
         pathext
+            .unwrap_or(".COM;.EXE;.BAT;.CMD")
             .split(';')
             .filter(|suffix| !suffix.trim().is_empty())
             .map(str::to_string)
@@ -791,7 +799,7 @@ fn find_in_path(program: &str) -> Option<String> {
     } else {
         vec![String::new()]
     };
-    for dir in std::env::split_paths(&path) {
+    for dir in std::env::split_paths(path) {
         for suffix in &suffixes {
             let candidate = dir.join(format!("{program}{suffix}"));
             if candidate.exists() {
@@ -1406,13 +1414,10 @@ mod tests {
                 "",
             )
             .unwrap();
-            let old_path = std::env::var_os("PATH");
-            let old_pathext = std::env::var_os("PATHEXT");
-            std::env::set_var("PATH", root.to_string_lossy().to_string());
-            std::env::set_var("PATHEXT", ".COM;.EXE;.BAT;.CMD");
-
-            let (program, args) =
-                resolved_command_parts(&AgentCommand::Args(vec!["codex".to_string()])).unwrap();
+            let resolved =
+                find_in_path_with_path("codex", root.as_os_str(), Some(".COM;.EXE;.BAT;.CMD"))
+                    .unwrap();
+            let (program, args) = adapt_windows_wrapper(resolved, Vec::new());
 
             let expected = root
                 .join("node_modules")
@@ -1432,16 +1437,6 @@ mod tests {
                 "codex shim should resolve directly to the native TUI binary"
             );
 
-            if let Some(path) = old_path {
-                std::env::set_var("PATH", path);
-            } else {
-                std::env::remove_var("PATH");
-            }
-            if let Some(pathext) = old_pathext {
-                std::env::set_var("PATHEXT", pathext);
-            } else {
-                std::env::remove_var("PATHEXT");
-            }
             let _ = std::fs::remove_dir_all(&root);
         }
     }

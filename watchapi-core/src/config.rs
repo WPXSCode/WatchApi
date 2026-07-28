@@ -1,3 +1,4 @@
+use regex::Regex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -61,6 +62,7 @@ pub struct AppConfig {
     pub session_state_path: PathBuf,
     pub restore_sessions: bool,
     pub codex_provider_name: String,
+    pub codex_model_context_window: Option<usize>,
     pub probe_expected_text: String,
     pub probe_path: String,
     pub polluted_response_keywords: Vec<String>,
@@ -68,6 +70,14 @@ pub struct AppConfig {
     pub polluted_context_window: usize,
     pub polluted_check_max_chars: usize,
     pub completion_pause_keywords: Vec<String>,
+    pub continuation_trigger_rules: Vec<ContinuationTriggerRule>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContinuationTriggerRule {
+    pub keywords: Vec<String>,
+    pub threshold: f64,
+    pub prompt: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +130,7 @@ pub struct EndpointConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    pub probe_model: Option<String>,
     pub reasoning_effort: String,
     pub service_tier: Option<String>,
     pub initial_prompt: String,
@@ -142,6 +153,7 @@ pub struct EndpointProviderConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    pub probe_model: Option<String>,
     pub reasoning_effort: String,
     pub service_tier: Option<String>,
     pub weight: i64,
@@ -163,6 +175,7 @@ pub struct GuardProxyConfig {
     pub fallback_models: Vec<String>,
     pub remove_keywords: Vec<String>,
     pub fail_keywords: Vec<String>,
+    pub builtin_high_risk_rules: Vec<String>,
     pub redact_phone: bool,
     pub redact_email: bool,
     pub redact_url: bool,
@@ -240,6 +253,7 @@ struct RawConfig {
     session_state_path: Option<String>,
     restore_sessions: Option<bool>,
     codex_provider_name: Option<String>,
+    codex_model_context_window: Option<usize>,
     probe_expected_text: Option<String>,
     probe_path: Option<String>,
     polluted_response_keywords: Option<Vec<String>>,
@@ -247,6 +261,14 @@ struct RawConfig {
     polluted_context_window: Option<usize>,
     polluted_check_max_chars: Option<usize>,
     completion_pause_keywords: Option<Vec<String>>,
+    continuation_trigger_rules: Option<Vec<RawContinuationTriggerRule>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawContinuationTriggerRule {
+    keywords: Option<Vec<String>>,
+    threshold: Option<f64>,
+    prompt: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,6 +306,7 @@ struct RawEndpointProvider {
     base_url: Option<String>,
     api_key: Option<String>,
     model: Option<String>,
+    probe_model: Option<String>,
     reasoning_effort: Option<String>,
     service_tier: Option<String>,
     weight: Option<i64>,
@@ -305,6 +328,7 @@ struct RawGuardProxy {
     fallback_models: Option<Vec<String>>,
     remove_keywords: Option<Vec<String>>,
     fail_keywords: Option<Vec<String>>,
+    builtin_high_risk_rules: Option<Vec<String>>,
     redact_phone: Option<bool>,
     redact_email: Option<bool>,
     redact_url: Option<bool>,
@@ -487,6 +511,10 @@ impl AppConfig {
                 .unwrap_or_else(|| PathBuf::from(".watchapi-state.json")),
             restore_sessions: raw.restore_sessions.unwrap_or(true),
             codex_provider_name: non_empty_or_default(raw.codex_provider_name, "custom"),
+            codex_model_context_window: optional_positive_usize(
+                raw.codex_model_context_window,
+                "codex_model_context_window",
+            )?,
             probe_expected_text: non_empty_or_default(raw.probe_expected_text, "WATCHAPI_OK"),
             probe_path: non_empty_or_default(raw.probe_path, "/v1/responses"),
             polluted_response_keywords: string_list(raw.polluted_response_keywords),
@@ -502,8 +530,51 @@ impl AppConfig {
                 "polluted_check_max_chars",
             )?,
             completion_pause_keywords: string_list(raw.completion_pause_keywords),
+            continuation_trigger_rules: parse_continuation_trigger_rules(
+                raw.continuation_trigger_rules,
+            )?,
         })
     }
+}
+
+fn parse_continuation_trigger_rules(
+    raw_rules: Option<Vec<RawContinuationTriggerRule>>,
+) -> Result<Vec<ContinuationTriggerRule>, ConfigError> {
+    let mut rules = Vec::new();
+    for (index, raw) in raw_rules.unwrap_or_default().into_iter().enumerate() {
+        let keywords = string_list(raw.keywords);
+        let prompt = raw.prompt.unwrap_or_default().trim().to_string();
+        if keywords.is_empty() && prompt.is_empty() {
+            continue;
+        }
+        if keywords.is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "continuation_trigger_rules[{index}].keywords cannot be empty"
+            )));
+        }
+        if prompt.is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "continuation_trigger_rules[{index}].prompt cannot be empty"
+            )));
+        }
+        for pattern in &keywords {
+            Regex::new(pattern).map_err(|err| {
+                ConfigError::Validation(format!(
+                    "continuation_trigger_rules[{index}].keywords invalid regex `{pattern}`: {err}"
+                ))
+            })?;
+        }
+        rules.push(ContinuationTriggerRule {
+            keywords,
+            threshold: ratio_float(
+                raw.threshold,
+                0.35,
+                &format!("continuation_trigger_rules[{index}].threshold"),
+            )?,
+            prompt,
+        });
+    }
+    Ok(rules)
 }
 
 pub fn provider_library_path_for_config(config_path: &Path) -> PathBuf {
@@ -611,6 +682,7 @@ fn load_provider(raw: RawEndpointProvider) -> Result<EndpointProviderConfig, Con
         base_url,
         api_key,
         model,
+        probe_model: raw.probe_model.and_then(trim_non_empty),
         reasoning_effort,
         service_tier: raw.service_tier.and_then(trim_non_empty),
         weight,
@@ -654,6 +726,7 @@ fn resolve_endpoint_refs(
             base_url: provider.base_url.clone(),
             api_key: provider.api_key.clone(),
             model: provider.model.clone(),
+            probe_model: provider.probe_model.clone(),
             reasoning_effort: provider.reasoning_effort.clone(),
             service_tier: provider.service_tier.clone(),
             initial_prompt: initial_prompt.clone(),
@@ -690,6 +763,7 @@ fn empty_raw_guard_proxy() -> RawGuardProxy {
         fallback_models: None,
         remove_keywords: None,
         fail_keywords: None,
+        builtin_high_risk_rules: None,
         redact_phone: None,
         redact_email: None,
         redact_url: None,
@@ -745,6 +819,9 @@ fn apply_guard_proxy_override(
     }
     if let Some(value) = raw.fail_keywords {
         config.fail_keywords = string_list(Some(value));
+    }
+    if let Some(value) = raw.builtin_high_risk_rules {
+        config.builtin_high_risk_rules = string_list(Some(value));
     }
     config.redact_phone = raw.redact_phone.unwrap_or(config.redact_phone);
     config.redact_email = raw.redact_email.unwrap_or(config.redact_email);
@@ -811,6 +888,7 @@ fn guard_rule_group_defaults(rule_group: GuardRuleGroup) -> GuardProxyConfig {
             "quota exceeded".to_string(),
             "insufficient quota".to_string(),
         ],
+        builtin_high_risk_rules: crate::pollution::default_high_risk_rules(),
         redact_phone: false,
         redact_email: false,
         redact_url: false,
@@ -967,6 +1045,13 @@ fn positive_usize(value: Option<usize>, default: usize, key: &str) -> Result<usi
         )));
     }
     Ok(value)
+}
+
+fn optional_positive_usize(value: Option<usize>, key: &str) -> Result<Option<usize>, ConfigError> {
+    match value {
+        None | Some(0) => Ok(None),
+        Some(value) => positive_usize(Some(value), value, key).map(Some),
+    }
 }
 
 fn submit_sequence(value: Option<&str>) -> Result<String, ConfigError> {
@@ -1274,12 +1359,13 @@ mod tests {
             r#"{
                 "providers": [{
                     "name": "dc",
-                    "base_url": "http://127.0.0.1:4000/v1",
-                    "api_key": "provider-key",
-                    "model": "gpt-5.4",
-                    "reasoning_effort": "high",
-                    "service_tier": "fast",
-                    "weight": 100,
+                "base_url": "http://127.0.0.1:4000/v1",
+                "api_key": "provider-key",
+                "model": "gpt-5.4",
+                "probe_model": "gpt-4.1-mini",
+                "reasoning_effort": "high",
+                "service_tier": "fast",
+                "weight": 100,
                     "guard_proxy": { "enabled": true }
                 }]
             }"#,
@@ -1293,6 +1379,10 @@ mod tests {
         assert_eq!(config.endpoints[0].base_url, "http://127.0.0.1:4000/v1");
         assert_eq!(config.endpoints[0].service_tier.as_deref(), Some("fast"));
         assert_eq!(config.endpoints[0].api_key, "provider-key");
+        assert_eq!(
+            config.endpoints[0].probe_model.as_deref(),
+            Some("gpt-4.1-mini")
+        );
         assert_eq!(config.endpoints[0].initial_prompt, "init");
         assert_eq!(config.endpoints[0].auto_prompt, "auto");
         assert_eq!(
@@ -1534,6 +1624,32 @@ mod tests {
     }
 
     #[test]
+    fn loads_optional_codex_model_context_window() {
+        let text = sample_config().replace(
+            r#""auto_prompt": "auto","#,
+            r#""auto_prompt": "auto",
+            "codex_model_context_window": 128000,"#,
+        );
+
+        let config = AppConfig::from_json_str(&text).unwrap();
+
+        assert_eq!(config.codex_model_context_window, Some(128000));
+    }
+
+    #[test]
+    fn zero_codex_model_context_window_is_treated_as_unset() {
+        let text = sample_config().replace(
+            r#""auto_prompt": "auto","#,
+            r#""auto_prompt": "auto",
+            "codex_model_context_window": 0,"#,
+        );
+
+        let config = AppConfig::from_json_str(&text).unwrap();
+
+        assert_eq!(config.codex_model_context_window, None);
+    }
+
+    #[test]
     fn missing_guard_proxy_defaults_to_disabled() {
         let config = AppConfig::from_json_str(&sample_config()).unwrap();
 
@@ -1640,11 +1756,35 @@ mod tests {
 
         assert!(guard.enabled);
         assert!(guard.remove_keywords.is_empty());
+        assert_eq!(
+            guard.builtin_high_risk_rules,
+            crate::pollution::default_high_risk_rules()
+        );
         assert!(!guard.redact_phone);
         assert!(!guard.redact_email);
         assert!(!guard.redact_url);
         assert!(!guard.redact_group_number);
     }
+
+    #[test]
+    fn guard_builtin_high_risk_rules_can_be_cleared() {
+        let text = sample_config().replace(
+            r#""weight": 100"#,
+            r#""weight": 100,
+                "guard_proxy": {
+                    "enabled": true,
+                    "builtin_high_risk_rules": []
+                }"#,
+        );
+
+        let config = AppConfig::from_json_str(&text).unwrap();
+
+        assert!(config.endpoints[0]
+            .guard_proxy
+            .builtin_high_risk_rules
+            .is_empty());
+    }
+
     #[test]
     fn infers_opencode_driver_from_command_when_missing() {
         let text = sample_config().replace(r#"["codex", "--no-alt-screen"]"#, r#"["opencode"]"#);
@@ -1746,5 +1886,62 @@ mod tests {
             error,
             ConfigError::Validation("config missing required fields: auto_prompt".to_string())
         );
+    }
+
+    #[test]
+    fn loads_continuation_trigger_rules_with_regex_keywords() {
+        let mut value: serde_json::Value = serde_json::from_str(&sample_config()).unwrap();
+        value["continuation_trigger_rules"] = serde_json::json!([
+            {
+                "keywords": ["(?i)todo\\b", "FIXME"],
+                "threshold": 0.5,
+                "prompt": "先处理待办项。"
+            },
+            {
+                "keywords": ["(?s)```.*?```"],
+                "prompt": "检查代码块后继续。"
+            }
+        ]);
+
+        let config = AppConfig::from_json_str(&value.to_string()).unwrap();
+
+        assert_eq!(config.continuation_trigger_rules.len(), 2);
+        assert_eq!(config.continuation_trigger_rules[0].threshold, 0.5);
+        assert_eq!(
+            config.continuation_trigger_rules[0].keywords,
+            ["(?i)todo\\b", "FIXME"]
+        );
+        assert_eq!(
+            config.continuation_trigger_rules[0].prompt,
+            "先处理待办项。"
+        );
+        assert_eq!(config.continuation_trigger_rules[1].threshold, 0.35);
+    }
+
+    #[test]
+    fn rejects_incomplete_or_invalid_continuation_trigger_rules() {
+        let mut incomplete: serde_json::Value = serde_json::from_str(&sample_config()).unwrap();
+        incomplete["continuation_trigger_rules"] = serde_json::json!([{
+            "keywords": ["TODO"]
+        }]);
+        let incomplete_error = AppConfig::from_json_str(&incomplete.to_string()).unwrap_err();
+        assert_eq!(
+            incomplete_error,
+            ConfigError::Validation(
+                "continuation_trigger_rules[0].prompt cannot be empty".to_string()
+            )
+        );
+
+        let mut invalid: serde_json::Value = serde_json::from_str(&sample_config()).unwrap();
+        invalid["continuation_trigger_rules"] = serde_json::json!([{
+            "keywords": ["("],
+            "prompt": "继续"
+        }]);
+        let invalid_error = AppConfig::from_json_str(&invalid.to_string()).unwrap_err();
+        assert!(matches!(
+            invalid_error,
+            ConfigError::Validation(message)
+                if message.contains("continuation_trigger_rules[0].keywords invalid regex `(`")
+        ));
     }
 }

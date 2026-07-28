@@ -141,6 +141,7 @@ pub struct RuntimeCore {
     last_event_signature: Mutex<Option<RuntimeEventSignature>>,
     pending_initial_prompt: Option<String>,
     pending_goal_prompt: Option<String>,
+    pending_continuation_trigger_prompt: Option<String>,
     last_prompt_at: Option<Instant>,
     last_auto_prompt_signature: Option<(String, String)>,
     waiting_for_assistant_progress: bool,
@@ -218,6 +219,7 @@ impl RuntimeCore {
             last_event_signature: Mutex::new(None),
             pending_initial_prompt: None,
             pending_goal_prompt: None,
+            pending_continuation_trigger_prompt: None,
             last_prompt_at: None,
             last_auto_prompt_signature: None,
             waiting_for_assistant_progress: false,
@@ -324,6 +326,10 @@ impl RuntimeCore {
             }
             if let Some(agent) = self.agent.as_mut() {
                 agent.poll_monitor();
+                if self.pending_continuation_trigger_prompt.is_none() {
+                    self.pending_continuation_trigger_prompt =
+                        agent.take_continuation_trigger_prompt();
+                }
                 let direct_polluted = agent.pollution_detected;
                 if direct_polluted {
                     agent.pollution_detected = false;
@@ -375,7 +381,6 @@ impl RuntimeCore {
                         hold_current_on_no_alternative = true;
                     }
                 } else {
-                    self.transient_failures_by_endpoint.remove(&current);
                     self.stall_failures_by_endpoint.remove(&current);
                 }
             }
@@ -447,7 +452,14 @@ impl RuntimeCore {
         self.health.update(&self.config.endpoints, &availability);
 
         let Some(selected) = selected else {
-            if hold_current_on_no_alternative || (force_full_probe && !current_failed) {
+            // A terminal that has returned repeated endpoint errors should be released even when
+            // it is the only configured endpoint. Keeping the stale session alive makes every
+            // subsequent automatic prompt continue to hit the same broken connection.
+            let keep_running_single_endpoint = hold_current_on_no_alternative
+                && !self.endpoint_request_failure_threshold_reached(
+                    self.current_endpoint.as_deref().unwrap_or_default(),
+                );
+            if keep_running_single_endpoint || (force_full_probe && !current_failed) {
                 if let Some(endpoint) =
                     self.running_single_current_endpoint_without_cooldown(&availability)
                 {
@@ -569,6 +581,38 @@ impl RuntimeCore {
         self.state = RuntimeState::WaitingAvailable;
         self.probing_endpoint = None;
         self.counted_probe_inflight.clear();
+        self.publish_snapshot_event();
+    }
+
+    pub fn replace_config_snapshot(&mut self, config: AppConfig) {
+        let valid_names = config
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.name.clone())
+            .collect::<std::collections::HashSet<_>>();
+        self.config = config;
+        if self
+            .current_endpoint
+            .as_ref()
+            .is_some_and(|name| !valid_names.contains(name))
+        {
+            self.current_endpoint = None;
+            self.state = RuntimeState::WaitingAvailable;
+        }
+        if self
+            .fixed_endpoint
+            .as_ref()
+            .is_some_and(|name| !valid_names.contains(name))
+        {
+            self.fixed_endpoint = None;
+        }
+        if self
+            .force_probe_endpoint
+            .as_ref()
+            .is_some_and(|name| !valid_names.contains(name))
+        {
+            self.force_probe_endpoint = None;
+        }
         self.publish_snapshot_event();
     }
 
@@ -1587,6 +1631,7 @@ impl RuntimeCore {
         };
         if session_assistant_confirmed {
             self.clear_endpoint_request_failures(&endpoint.name);
+            self.clear_transient_failures(&endpoint.name);
             self.endpoint_auto_prompt_blocked_until
                 .remove(&endpoint.name);
             if self.goal_turn_active {
@@ -1657,7 +1702,10 @@ impl RuntimeCore {
         });
         let automatic_requested = trigger_now_requested
             || (goal_enabled && self.pending_goal_prompt.is_some())
-            || (!auto_paused && (self.pending_initial_prompt.is_some() || can_send_by_interval));
+            || (!auto_paused
+                && (self.pending_continuation_trigger_prompt.is_some()
+                    || self.pending_initial_prompt.is_some()
+                    || can_send_by_interval));
         if !can_send_prompt {
             if let Some(prompt) = manual_prompt.as_ref() {
                 self.requeue_manual_prompt(prompt);
@@ -1685,12 +1733,16 @@ impl RuntimeCore {
         }
         let is_manual = manual_prompt.is_some();
         let mut restore_goal_prompt = false;
+        let mut restore_continuation_trigger_prompt = false;
         let mut restore_initial_prompt = false;
         let (prompt, is_goal_command) = if let Some(prompt) = manual_prompt {
             (prompt, false)
         } else if let Some(prompt) = self.pending_goal_prompt.take() {
             restore_goal_prompt = true;
             (prompt, true)
+        } else if let Some(prompt) = self.pending_continuation_trigger_prompt.take() {
+            restore_continuation_trigger_prompt = true;
+            (prompt, false)
         } else if let Some(prompt) = self.pending_initial_prompt.take() {
             restore_initial_prompt = true;
             (prompt, false)
@@ -1708,6 +1760,8 @@ impl RuntimeCore {
                 self.requeue_manual_prompt(&prompt);
             } else if restore_goal_prompt {
                 self.pending_goal_prompt = Some(prompt);
+            } else if restore_continuation_trigger_prompt {
+                self.pending_continuation_trigger_prompt = Some(prompt);
             } else if restore_initial_prompt {
                 self.pending_initial_prompt = Some(prompt);
             }
@@ -1750,6 +1804,8 @@ impl RuntimeCore {
             self.requeue_manual_prompt(&prompt);
         } else if restore_goal_prompt {
             self.pending_goal_prompt = Some(prompt);
+        } else if restore_continuation_trigger_prompt {
+            self.pending_continuation_trigger_prompt = Some(prompt);
         } else if restore_initial_prompt {
             self.pending_initial_prompt = Some(prompt);
         }
@@ -2132,6 +2188,7 @@ impl RuntimeCore {
         }
         if result.request_made && result.available {
             self.clear_endpoint_request_failures(&endpoint.name);
+            self.clear_transient_failures(&endpoint.name);
             self.endpoint_auto_prompt_blocked_until
                 .remove(&endpoint.name);
             self.record_pollution_recovery_success(&endpoint.name, now);
@@ -2655,6 +2712,10 @@ impl RuntimeCore {
     fn clear_endpoint_request_failures(&mut self, endpoint_name: &str) {
         self.endpoint_request_failures_by_endpoint
             .remove(endpoint_name);
+    }
+
+    fn clear_transient_failures(&mut self, endpoint_name: &str) {
+        self.transient_failures_by_endpoint.remove(endpoint_name);
     }
 
     fn latest_auto_prompt(&self, endpoint: &EndpointConfig) -> String {
@@ -3301,6 +3362,7 @@ mod tests {
             base_url: format!("https://{name}.example.test/v1"),
             api_key: "key".to_string(),
             model: "gpt-5.5".to_string(),
+            probe_model: None,
             reasoning_effort: "high".to_string(),
             service_tier: None,
             initial_prompt: "init".to_string(),
@@ -3344,6 +3406,7 @@ mod tests {
             session_state_path: PathBuf::from(".watchapi-state.json"),
             restore_sessions: true,
             codex_provider_name: "custom".to_string(),
+            codex_model_context_window: None,
             probe_expected_text: "WATCHAPI_OK".to_string(),
             probe_path: "/v1/responses".to_string(),
             polluted_response_keywords: vec![],
@@ -3351,6 +3414,7 @@ mod tests {
             polluted_context_window: 12,
             polluted_check_max_chars: 300,
             completion_pause_keywords: vec![],
+            continuation_trigger_rules: vec![],
         }
     }
 
@@ -3675,8 +3739,18 @@ mod tests {
     #[test]
     fn guard_proxy_pollution_signal_skips_polluted_fallback_and_switches_clean() {
         let (port, handle) = start_test_json_upstream(r#"{"output_text":"余额不足"}"#);
+        let temp = tempfile::tempdir().unwrap();
+        let workdir = temp.path().join("workspace");
+        fs::create_dir_all(&workdir).unwrap();
         let mut cfg = config();
+        cfg.agent_driver = crate::config::AgentDriver::Generic;
+        cfg.agent_command = long_running_test_command();
+        cfg.workdir = workdir.clone();
+        cfg.session_state_path = temp.path().join("session-state.json");
         cfg.endpoints.push(endpoint("clean", 1));
+        for endpoint in &mut cfg.endpoints {
+            endpoint.workdir = workdir.clone();
+        }
         cfg.endpoints[0].base_url = format!("http://127.0.0.1:{port}/v1");
         cfg.endpoints[0].guard_proxy.enabled = true;
         cfg.endpoints[0].guard_proxy.fail_keywords = vec!["余额不足".to_string()];
@@ -3717,7 +3791,15 @@ mod tests {
             .unwrap();
         let selected = tokio.block_on(runtime.tick(&probe));
 
-        assert_eq!(selected.unwrap().name, clean.name);
+        assert_eq!(
+            selected.as_ref().map(|endpoint| endpoint.name.as_str()),
+            Some(clean.name.as_str()),
+            "state={:?}, current={:?}, startup_failures={:?}, availability={:?}",
+            runtime.state,
+            runtime.current_endpoint,
+            runtime.startup_failure_error,
+            runtime.last_availability
+        );
         assert!(runtime.last_availability[&high.name].polluted);
         assert!(runtime.polluted_until.contains_key(&high.name));
         assert!(runtime.guard_polluted_until.contains_key(&high.name));
@@ -5712,6 +5794,36 @@ mod tests {
     }
 
     #[test]
+    fn continuation_trigger_prompt_is_prioritized_once_and_respects_auto_pause() {
+        let source = include_str!("runtime.rs");
+        let block = source
+            .split("fn maybe_drive_prompt")
+            .nth(1)
+            .and_then(|tail| tail.split("fn requeue_manual_prompt").next())
+            .expect("maybe_drive_prompt block should be discoverable");
+
+        let manual_pos = block
+            .find("if let Some(prompt) = manual_prompt")
+            .expect("manual prompt branch should exist");
+        let goal_pos = block
+            .find("self.pending_goal_prompt.take()")
+            .expect("goal prompt branch should exist");
+        let trigger_pos = block
+            .find("self.pending_continuation_trigger_prompt.take()")
+            .expect("continuation trigger branch should exist");
+        let initial_pos = block
+            .find("self.pending_initial_prompt.take()")
+            .expect("initial prompt branch should exist");
+
+        assert!(manual_pos < goal_pos && goal_pos < trigger_pos && trigger_pos < initial_pos);
+        assert!(block.contains(
+            "!auto_paused\n                && (self.pending_continuation_trigger_prompt.is_some()"
+        ));
+        assert!(block.contains("restore_continuation_trigger_prompt = true;"));
+        assert!(block.contains("self.pending_continuation_trigger_prompt = Some(prompt);"));
+    }
+
+    #[test]
     fn completion_pause_detection_does_not_disable_auto_continuation() {
         let source = include_str!("runtime.rs");
         let tick_block = source
@@ -6614,7 +6726,7 @@ mod tests {
     }
 
     #[test]
-    fn single_running_endpoint_soft_failure_does_not_stop_and_restart_agent() {
+    fn single_running_endpoint_repeated_failure_stops_terminal() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.json");
         crate::control::update_control_state(&config_path, &[("auto_paused", json!(false))])
@@ -6638,16 +6750,11 @@ mod tests {
 
         let selected = runtime.tick_blocking(&HttpProbe::new(0.1).unwrap());
 
-        assert_eq!(selected.unwrap().name, endpoint.name);
-        assert_eq!(
-            runtime.current_endpoint.as_deref(),
-            Some(endpoint.name.as_str())
-        );
-        assert_eq!(runtime.terminal_process_id(), first_pid);
+        assert!(selected.is_none());
+        assert!(runtime.current_endpoint.is_none());
+        assert!(runtime.terminal_process_id().is_none());
         assert_eq!(runtime.state_label(), "异常：请求失败 1/1");
-        let selected = runtime.tick_blocking(&HttpProbe::new(0.1).unwrap());
-        assert_eq!(selected.unwrap().name, endpoint.name);
-        assert_eq!(runtime.terminal_process_id(), first_pid);
+        assert!(first_pid.is_some());
         runtime.stop();
     }
 
@@ -6949,6 +7056,64 @@ mod tests {
     }
 
     #[test]
+    fn transient_network_failures_survive_normal_ticks_until_success_evidence() {
+        let mut cfg = config();
+        cfg.agent_driver = crate::config::AgentDriver::Generic;
+        cfg.agent_command = long_running_test_command();
+        cfg.transient_network_failure_threshold = 2;
+        let mut runtime = RuntimeCore::new(cfg);
+        let high = runtime.config.endpoints[0].clone();
+        let low = runtime.config.endpoints[1].clone();
+        runtime.switch_to(high.clone()).unwrap();
+        runtime.remember_single_probe_result(&high, &ProbeResult::available(), Instant::now());
+        runtime.remember_single_probe_result(&low, &ProbeResult::available(), Instant::now());
+
+        if let Some(agent) = runtime.agent.as_mut() {
+            agent.transient_endpoint_failure_detected = true;
+        }
+        let selected = runtime.tick_blocking(&HttpProbe::new(0.1).unwrap());
+        assert_eq!(selected.unwrap().name, high.name);
+        assert_eq!(
+            runtime
+                .transient_failures_by_endpoint
+                .get(&high.name)
+                .copied(),
+            Some(1)
+        );
+        assert_eq!(
+            runtime.current_endpoint.as_deref(),
+            Some(high.name.as_str())
+        );
+
+        let selected = runtime.tick_blocking(&HttpProbe::new(0.1).unwrap());
+        assert_eq!(selected.unwrap().name, high.name);
+        assert_eq!(
+            runtime
+                .transient_failures_by_endpoint
+                .get(&high.name)
+                .copied(),
+            Some(1),
+            "没有新错误的普通 tick 不能把网络波动容错计数清零"
+        );
+
+        if let Some(agent) = runtime.agent.as_mut() {
+            agent.transient_endpoint_failure_detected = true;
+        }
+        let selected = runtime.tick_blocking(&HttpProbe::new(0.1).unwrap());
+        assert_eq!(selected.unwrap().name, low.name);
+        assert_eq!(runtime.current_endpoint.as_deref(), Some(low.name.as_str()));
+
+        runtime.remember_single_probe_result(&high, &ProbeResult::available(), Instant::now());
+        assert!(
+            !runtime
+                .transient_failures_by_endpoint
+                .contains_key(&high.name),
+            "真实探测成功才是清零网络波动计数的成功证据"
+        );
+        runtime.stop();
+    }
+
+    #[test]
     fn endpoint_failure_branch_releases_auto_wait_before_retry() {
         let source = include_str!("runtime.rs");
         let failure_branch = source
@@ -7028,14 +7193,21 @@ mod tests {
             "普通 tick 不能清请求失败计数，否则连续错误码会一直停在 1/3"
         );
         assert!(
+            !normal_agent_branch.contains("clear_transient_failures(&current)")
+                && !normal_agent_branch.contains("transient_failures_by_endpoint.remove(&current)"),
+            "普通 tick 不能清网络波动计数，否则连续断流永远达不到切换阈值"
+        );
+        assert!(
             prompt_block.contains("agent.has_session_assistant_message_since_prompt()")
-                && prompt_block.contains("self.clear_endpoint_request_failures(&endpoint.name)"),
-            "会话文件里的 assistant 回复才是清请求失败计数的回复成功证据"
+                && prompt_block.contains("self.clear_endpoint_request_failures(&endpoint.name)")
+                && prompt_block.contains("self.clear_transient_failures(&endpoint.name)"),
+            "会话文件里的 assistant 回复才是清请求失败/网络波动计数的回复成功证据"
         );
         assert!(
             probe_block.contains("result.request_made && result.available")
-                && probe_block.contains("self.clear_endpoint_request_failures(&endpoint.name)"),
-            "真实探测成功才是清请求失败计数的探测成功证据"
+                && probe_block.contains("self.clear_endpoint_request_failures(&endpoint.name)")
+                && probe_block.contains("self.clear_transient_failures(&endpoint.name)"),
+            "真实探测成功才是清请求失败/网络波动计数的探测成功证据"
         );
     }
 

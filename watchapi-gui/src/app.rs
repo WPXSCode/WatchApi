@@ -3,7 +3,8 @@
 use crate::gui_support::{
     add_config_initial_dir, append_session_log, close_action_prompt_text,
     default_agent_command_for_driver, default_agent_home_for_driver, format_pause_state_label,
-    normalize_config_path, tray_status_label, GuiConfigRegistry, GuiWorkspace,
+    normalize_config_path, tray_status_label, GuiConfigRegistry, GuiExternalApplication, GuiTheme,
+    GuiWorkspace,
 };
 use crate::litellm_proxy::SmartProxyKeyRow;
 use crate::litellm_proxy::{
@@ -21,6 +22,7 @@ use egui::{
 use egui_extras::{Column, TableBuilder};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::OpenOptions;
@@ -35,6 +37,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use url::Url;
 use watchapi_core::aggregate_egress::AggregateFingerprint;
 use watchapi_core::control::{read_control_state, update_control_state};
 use watchapi_core::terminal::TerminalControl;
@@ -44,8 +47,8 @@ use watchapi_core::terminal_emulator::{
 use watchapi_core::{
     discover_codex_session_homes, latest_codex_session_goal_record, recent_session_detail_summary,
     AppConfig, ClaudeSessionIndex, CodexSessionGoalRecord, CodexSessionIndex, EndpointConfig,
-    EndpointRow, HttpProbe, RuntimeCore, RuntimeEvent, RuntimeEventWakeup, SessionBindingKey,
-    SessionCandidate, SessionStore,
+    EndpointRow, HttpProbe, ProbeResult, RuntimeCore, RuntimeEvent, RuntimeEventWakeup,
+    SessionBindingKey, SessionCandidate, SessionStore,
 };
 
 pub struct WatchApiApp {
@@ -96,6 +99,12 @@ pub struct WatchApiApp {
     prompt_library_name: String,
     prompt_library_text: String,
     prompt_target: PromptTarget,
+    system_settings_open: bool,
+    system_settings_theme: GuiTheme,
+    system_settings_external_apps: Vec<GuiExternalApplication>,
+    system_settings_new_name: String,
+    system_settings_new_path: String,
+    system_settings_status: String,
     sessions: HashMap<String, GuiRuntimeSession>,
     close_dialog_open: bool,
     allow_exit: bool,
@@ -123,6 +132,12 @@ pub struct WatchApiApp {
     delete_confirm_dialog: Option<DeleteConfirmDialog>,
     session_candidate_rx: Option<Receiver<SessionCandidateResult>>,
     session_candidate_loading: bool,
+    connection_test_rx: Option<Receiver<ConnectionTestResult>>,
+    connection_test_loading: bool,
+    connection_test_is_provider: bool,
+    provider_connection_test_status: String,
+    provider_import_dialog_open: bool,
+    provider_import_text: String,
     terminal_diag: String,
     endpoint_connection_tab: EndpointConnectionTab,
     endpoint_key_visible: bool,
@@ -144,6 +159,7 @@ pub struct WatchApiApp {
     last_background_terminal_refresh_at: Instant,
     control_state_cache: Mutex<HashMap<String, CachedControlState>>,
     control_state_cache_enabled: AtomicBool,
+    applied_native_theme: Option<GuiTheme>,
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +195,11 @@ struct SessionCandidateResult {
     config_path: PathBuf,
     candidates: Vec<SessionCandidate>,
     source: SessionBindSource,
+}
+
+#[derive(Debug)]
+struct ConnectionTestResult {
+    message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,6 +376,12 @@ enum MainPage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TopNavSegment {
+    label: &'static str,
+    page: MainPage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EndpointConnectionTab {
     Manual,
     Proxy,
@@ -389,6 +416,7 @@ fn endpoint_table_row_weight(row: &EndpointTableRow) -> i64 {
 enum RuntimeCommand {
     Stop,
     RestartAgent,
+    ReplaceConfigSnapshot(AppConfig),
     SetEndpointEnabled { name: String, enabled: bool },
     SetEndpointGuardProxyEnabled { name: String, enabled: bool },
     SetForceProbeEndpoint(Option<String>),
@@ -424,6 +452,10 @@ fn handle_runtime_worker_command(
         RuntimeCommand::RestartAgent => {
             Arc::as_ref(runtime).lock().restart_agent();
             RuntimeWorkerCommandAction::TickNow
+        }
+        RuntimeCommand::ReplaceConfigSnapshot(config) => {
+            Arc::as_ref(runtime).lock().replace_config_snapshot(config);
+            RuntimeWorkerCommandAction::Continue
         }
         RuntimeCommand::ForceCurrentProbe => {
             Arc::as_ref(runtime).lock().force_current_probe_next_tick();
@@ -610,6 +642,7 @@ struct TerminalCellPos {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TerminalSelection {
+    // Selection rows are scrollback-absolute, not current TerminalView row indexes.
     anchor: TerminalCellPos,
     focus: TerminalCellPos,
 }
@@ -821,11 +854,13 @@ struct TerminalFallbackKey {
 const CONFIG_EDITOR_VIEWPORT: &str = "watchapi_config_editor";
 const WORKSPACE_DEFAULTS_EDITOR_VIEWPORT: &str = "watchapi_workspace_defaults_editor";
 const PROMPT_LIBRARY_VIEWPORT: &str = "watchapi_prompt_library";
+const PROVIDER_IMPORT_VIEWPORT: &str = "watchapi_provider_import";
 const ADD_ENDPOINT_VIEWPORT: &str = "watchapi_add_endpoint";
 const ENDPOINT_EDIT_VIEWPORT: &str = "watchapi_endpoint_edit";
 const RENAME_VIEWPORT: &str = "watchapi_rename";
 const SESSION_SUMMARY_VIEWPORT: &str = "watchapi_session_summary";
 const SESSION_BIND_VIEWPORT: &str = "watchapi_session_bind";
+const SYSTEM_SETTINGS_VIEWPORT: &str = "watchapi_system_settings";
 const ENDPOINT_EDIT_DIALOG_DEFAULT_SIZE: egui::Vec2 = vec2(760.0, 640.0);
 const ENDPOINT_EDIT_DIALOG_MARGIN: f32 = 32.0;
 
@@ -847,7 +882,19 @@ const INNER_SCROLLBAR_GUTTER: f32 = 8.0;
 const RUN_PAGE_RIGHT_GUTTER: f32 = 7.0;
 const TERMINAL_SCROLLBAR_WIDTH: f32 = 10.0;
 const TERMINAL_SCROLLBAR_RIGHT_INSET: f32 = 3.0;
+const TOP_BAR_HEIGHT: f32 = 48.0;
+const TOP_BAR_CONTENT_HEIGHT: f32 = 36.0;
 const TOP_NAV_BUTTON_W: f32 = 78.0;
+const TOP_NAV_BUTTON_H: f32 = 28.0;
+const MD3_BUTTON_RADIUS: u8 = 8;
+const TABLE_STATUS_CHIP_HEIGHT: f32 = 20.0;
+const TABLE_STATUS_CHIP_RADIUS: u8 = 6;
+const TABLE_STATUS_CHIP_PADDING_X: f32 = 9.0;
+const TABLE_STATUS_CHIP_MIN_WIDTH: f32 = 24.0;
+const TABLE_STATUS_CHIP_TEXT_LEFT_PADDING: f32 = 8.0;
+const RUN_STATE_CHIP_HEIGHT: f32 = 20.0;
+const RUN_STATE_CHIP_RADIUS: u8 = 6;
+const RUN_STATE_CHIP_PADDING_X: f32 = 8.0;
 const CONFIG_SIDEBAR_DEFAULT_WIDTH: f32 = 220.0;
 const CONFIG_SIDEBAR_MIN_WIDTH: f32 = 220.0;
 const CONFIG_SIDEBAR_MAX_WIDTH: f32 = 380.0;
@@ -859,6 +906,9 @@ const CONFIG_TREE_BRANCH_END_X: f32 = 16.0;
 const CONFIG_TREE_WORKSPACE_TOGGLE_X: f32 = 8.0;
 const CONFIG_TREE_WORKSPACE_LABEL_X: f32 = 20.0;
 const CONFIG_TREE_LABEL_X: f32 = 34.0;
+const CONFIG_STATUS_BADGE_W: f32 = 58.0;
+const CONFIG_STATUS_BADGE_H: f32 = 18.0;
+const CONFIG_STATUS_BADGE_PADDING_X: f32 = 6.0;
 const CIRCULAR_ADD_BUTTON_SIZE: f32 = 20.0;
 const RUN_ENDPOINT_TABLE_DEFAULT_HEIGHT: f32 = 126.0;
 const RUN_ENDPOINT_TABLE_MIN_HEIGHT: f32 = 96.0;
@@ -1034,6 +1084,8 @@ impl WatchApiApp {
     pub fn new(config_path: Option<String>) -> Self {
         let mut registry = GuiConfigRegistry::new(app_root().join(".watchapi-gui.json"));
         registry.load();
+        let system_settings_theme = registry.theme;
+        let system_settings_external_apps = registry.external_apps.clone();
         let initial_config_path = config_path
             .or_else(|| {
                 registry
@@ -1090,6 +1142,12 @@ impl WatchApiApp {
             prompt_library_name: String::new(),
             prompt_library_text: String::new(),
             prompt_target: PromptTarget::Auto,
+            system_settings_open: false,
+            system_settings_theme,
+            system_settings_external_apps,
+            system_settings_new_name: String::new(),
+            system_settings_new_path: String::new(),
+            system_settings_status: String::new(),
             sessions: HashMap::new(),
             close_dialog_open: false,
             allow_exit: false,
@@ -1117,6 +1175,12 @@ impl WatchApiApp {
             delete_confirm_dialog: None,
             session_candidate_rx: None,
             session_candidate_loading: false,
+            connection_test_rx: None,
+            connection_test_loading: false,
+            connection_test_is_provider: false,
+            provider_connection_test_status: String::new(),
+            provider_import_dialog_open: false,
+            provider_import_text: String::new(),
             terminal_diag: "未初始化".to_string(),
             endpoint_connection_tab: EndpointConnectionTab::Manual,
             endpoint_key_visible: false,
@@ -1138,6 +1202,7 @@ impl WatchApiApp {
             last_background_terminal_refresh_at: Instant::now(),
             control_state_cache: Mutex::new(HashMap::new()),
             control_state_cache_enabled: AtomicBool::new(false),
+            applied_native_theme: None,
         };
         if !app.config_path.is_empty() {
             app.load_config();
@@ -1164,8 +1229,11 @@ impl eframe::App for WatchApiApp {
         self.terminal_surface_painted_this_frame = false;
         self.handle_window_lifecycle(ctx);
         self.poll_session_candidate_result();
+        self.poll_connection_test_result();
         self.flush_terminal_log_buffer_if_due();
         self.ensure_runtime_event_wakeup(ctx);
+        set_gui_theme(self.registry.theme);
+        self.apply_native_theme_if_changed();
         configure_visuals(ctx);
         paint_app_background(ctx);
         self.refresh_runtime_snapshot();
@@ -1194,57 +1262,10 @@ impl eframe::App for WatchApiApp {
         );
 
         egui::TopBottomPanel::top("top_bar")
+            .exact_height(TOP_BAR_HEIGHT)
             .show_separator_line(false)
             .show(ctx, |ui| {
-                elevated_frame().show(ui, |ui| {
-                    menu::bar(ui, |ui| {
-                        ui.label(RichText::new("WatchApi").heading().color(accent()).strong());
-                        ui.add_space(8.0);
-                        self.render_top_menu(ui, ctx);
-                        ui.separator();
-                        let previous_page = self.main_page;
-                        if ui
-                            .add_sized(
-                                [TOP_NAV_BUTTON_W, ui.spacing().interact_size.y],
-                                top_nav_button("代理", self.main_page == MainPage::Proxy),
-                            )
-                            .clicked()
-                        {
-                            self.main_page = MainPage::Proxy;
-                            self.handle_main_page_changed(previous_page);
-                        }
-                        let previous_page = self.main_page;
-                        if ui
-                            .add_sized(
-                                [TOP_NAV_BUTTON_W, ui.spacing().interact_size.y],
-                                top_nav_button("供应商", self.main_page == MainPage::Provider),
-                            )
-                            .clicked()
-                        {
-                            self.open_provider_page_from_current();
-                            self.handle_main_page_changed(previous_page);
-                        }
-                        ui.separator();
-                        let previous_page = self.main_page;
-                        if ui
-                            .add_sized(
-                                [TOP_NAV_BUTTON_W, ui.spacing().interact_size.y],
-                                top_nav_button("工作台", self.main_page == MainPage::Watch),
-                            )
-                            .clicked()
-                        {
-                            self.main_page = MainPage::Watch;
-                            self.handle_main_page_changed(previous_page);
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(RichText::new(self.status.as_str()).small().color(muted()));
-                            if self.hidden_to_tray {
-                                ui.add_space(10.0);
-                                ui.label(RichText::new("后台运行").color(md_success()));
-                            }
-                        });
-                    });
-                });
+                self.render_top_bar(ui, ctx);
             });
 
         egui::CentralPanel::default()
@@ -1261,10 +1282,12 @@ impl eframe::App for WatchApiApp {
         self.render_prompt_library_window(ctx);
         self.render_add_endpoint_dialog(ctx);
         self.render_endpoint_edit_dialog(ctx);
+        self.render_provider_import_dialog(ctx);
         self.render_delete_confirm_dialog(ctx);
         self.render_rename_dialog(ctx);
         self.render_session_summary_dialog(ctx);
         self.render_session_bind_dialog(ctx);
+        self.render_system_settings_window(ctx);
         self.render_close_dialog(ctx);
         self.update_terminal_repaint_ticker();
         let repaint_interval_ms = self.repaint_interval_ms();
@@ -1325,6 +1348,36 @@ impl WatchApiApp {
             });
     }
 
+    fn render_top_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        elevated_frame().show(ui, |ui| {
+            ui.set_height(TOP_BAR_HEIGHT);
+            let toolbar_width = ui.available_width();
+            let toolbar_height = TOP_BAR_CONTENT_HEIGHT.min(ui.available_height());
+            ui.allocate_ui_with_layout(
+                vec2(toolbar_width, toolbar_height),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    self.render_top_menu(ui, ctx);
+                    ui.add_space(8.0);
+                    self.render_main_nav_segment(ui);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if circular_tool_button(ui, "系统设置", ToolButtonIcon::Settings, true)
+                            .clicked()
+                        {
+                            self.open_system_settings();
+                        }
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(self.status.as_str()).small().color(muted()));
+                        if self.hidden_to_tray {
+                            ui.add_space(10.0);
+                            ui.label(RichText::new("后台运行").color(md_success()));
+                        }
+                    });
+                },
+            );
+        });
+    }
+
     fn render_top_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         menu::menu_custom_button(ui, top_nav_button("操作", false), |ui| {
             debug_assert_eq!(RUN_MENU_GROUPS.len(), 2);
@@ -1350,6 +1403,58 @@ impl WatchApiApp {
                 ui.close_menu();
             }
         });
+    }
+
+    fn apply_native_theme_if_changed(&mut self) {
+        if self.applied_native_theme == Some(self.registry.theme) {
+            return;
+        }
+        crate::apply_native_window_theme(self.registry.theme);
+        self.applied_native_theme = Some(self.registry.theme);
+    }
+
+    fn open_system_settings(&mut self) {
+        self.system_settings_theme = self.registry.theme;
+        self.system_settings_external_apps = self.registry.external_apps.clone();
+        self.system_settings_new_name.clear();
+        self.system_settings_new_path.clear();
+        self.system_settings_status.clear();
+        self.system_settings_open = true;
+    }
+
+    fn render_main_nav_segment(&mut self, ui: &mut egui::Ui) {
+        let selected = match self.main_page {
+            MainPage::Proxy => 0,
+            MainPage::Provider => 1,
+            MainPage::Watch => 2,
+        };
+        if let Some(clicked) = render_top_nav_segmented(
+            ui,
+            "main_page_segmented",
+            &[
+                TopNavSegment {
+                    label: "代理",
+                    page: MainPage::Proxy,
+                },
+                TopNavSegment {
+                    label: "供应商",
+                    page: MainPage::Provider,
+                },
+                TopNavSegment {
+                    label: "工作台",
+                    page: MainPage::Watch,
+                },
+            ],
+            selected,
+        ) {
+            let previous_page = self.main_page;
+            match clicked {
+                MainPage::Proxy => self.main_page = MainPage::Proxy,
+                MainPage::Provider => self.open_provider_page_from_current(),
+                MainPage::Watch => self.main_page = MainPage::Watch,
+            }
+            self.handle_main_page_changed(previous_page);
+        }
     }
 
     fn render_run_page(&mut self, ui: &mut egui::Ui) {
@@ -1406,7 +1511,7 @@ impl WatchApiApp {
 
     fn render_proxy_page(&mut self, ui: &mut egui::Ui) {
         self.collect_finished_proxy_processes();
-        let content_width = ui.available_width().max(320.0);
+        let content_width = (ui.available_width() - RUN_PAGE_RIGHT_GUTTER).max(320.0);
         ui.set_width(content_width);
         ui.set_max_width(content_width);
         card_frame().show(ui, |ui| {
@@ -2469,7 +2574,7 @@ impl WatchApiApp {
             }
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
-                let status_width = 64.0;
+                let status_width = CONFIG_STATUS_BADGE_W;
                 let row_width = (ui.available_width() - INNER_SCROLLBAR_GUTTER).max(96.0);
                 for workspace in workspaces {
                     self.render_workspace_row(ui, &workspace, row_width);
@@ -2622,13 +2727,7 @@ impl WatchApiApp {
         let selected = self.config_path_path().as_deref() == Some(path);
         let status = self.session_status_for_path(path);
         let status_is_error = config_status_label_is_error(&status);
-        let status_color = if self.session_terminal_running(path) {
-            md_success()
-        } else if status_is_error {
-            md_error()
-        } else {
-            muted()
-        };
+        let terminal_running = self.session_terminal_running(path);
         let name = self.registry.display_name(path.to_path_buf());
         let key = normalize_config_path(path.to_path_buf())
             .to_string_lossy()
@@ -2657,7 +2756,7 @@ impl WatchApiApp {
                 let painter = ui.painter().with_clip_rect(content_rect);
                 paint_config_tree_connector(ui, content_rect, is_last_config);
                 let label_x = content_rect.left() + CONFIG_TREE_LABEL_X;
-                let status_x = (content_rect.right() - status_width - 6.0).max(label_x + 48.0);
+                let badge_left = (content_rect.right() - status_width - 4.0).max(label_x + 48.0);
                 let text_y =
                     content_rect.center().y - ui.text_style_height(&egui::TextStyle::Body) * 0.5;
                 let pin = if pinned { "★ " } else { "" };
@@ -2665,21 +2764,21 @@ impl WatchApiApp {
                 let font_id = egui::TextStyle::Body.resolve(ui.style());
                 let name_galley =
                     ui.fonts(|fonts| fonts.layout_no_wrap(name_text, font_id.clone(), md_text()));
-                let status_galley =
-                    ui.fonts(|fonts| fonts.layout_no_wrap(status, font_id, status_color));
                 let name_clip = Rect::from_min_max(
                     pos2(label_x, content_rect.top()),
-                    pos2((status_x - 6.0).max(label_x), content_rect.bottom()),
+                    pos2((badge_left - 6.0).max(label_x), content_rect.bottom()),
                 );
                 painter.with_clip_rect(name_clip).galley(
                     pos2(label_x, text_y),
                     name_galley,
                     md_text(),
                 );
-                painter.with_clip_rect(content_rect).galley(
-                    pos2(status_x, text_y),
-                    status_galley,
-                    status_color,
+                paint_config_status_badge(
+                    ui,
+                    content_rect,
+                    &status,
+                    terminal_running,
+                    status_is_error,
                 );
             })
             .response
@@ -2750,7 +2849,7 @@ impl WatchApiApp {
         let control_state = self.current_control_state();
 
         card_frame().show(ui, |ui| {
-            ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
+            ui.spacing_mut().item_spacing = vec2(8.0, 4.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("当前配置").color(accent()).strong());
                 if circular_edit_button(ui, "编辑配置").clicked() {
@@ -2761,11 +2860,23 @@ impl WatchApiApp {
                     self.render_runtime_elapsed_label(ui);
                 });
             });
-            ui.label(
-                RichText::new(self.run_state_label_with_control_state(control_state.as_ref()))
-                    .color(self.run_state_color()),
-            );
+            self.render_run_state_chips(ui, control_state.as_ref());
             self.render_prompt_row(ui, "续航提示词", PromptTarget::AutoEditor);
+        });
+    }
+
+    fn render_run_state_chips(&self, ui: &mut egui::Ui, control_state: Option<&Value>) {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
+            for chip in self.run_state_chips_with_control_state(control_state) {
+                render_compact_status_chip(
+                    ui,
+                    &chip,
+                    RUN_STATE_CHIP_HEIGHT,
+                    RUN_STATE_CHIP_RADIUS,
+                    RUN_STATE_CHIP_PADDING_X,
+                );
+            }
         });
     }
 
@@ -3045,6 +3156,9 @@ impl WatchApiApp {
                 }
                 self.render_global_prompt_fields(ui);
                 self.render_global_keyword_fields(ui);
+                editor_section_frame(ui, "一次性续航规则", |ui| {
+                    render_continuation_trigger_rules(ui, &mut self.editor_json);
+                });
             });
     }
 
@@ -3326,6 +3440,9 @@ impl WatchApiApp {
                             ui.horizontal_wrapped(|ui| {
                                 if ui.button("保存供应商库").clicked() {
                                     self.save_provider_library();
+                                }
+                                if ui.button("从文本导入").clicked() {
+                                    self.provider_import_dialog_open = true;
                                 }
                                 if let Some(provider_name) = selected_provider_name.as_deref() {
                                     if ui.button("加入所有配置").clicked() {
@@ -3705,6 +3822,23 @@ impl WatchApiApp {
             "codex_config_path" | "codex_auth_path" | "codex_home" => {
                 self.render_global_path_row(ui, key, label, label_w, browse_w);
             }
+            "codex_model_context_window" => {
+                let mut value = self.string_field(key);
+                ui.horizontal(|ui| {
+                    let current_label_w = label_w.min(ui.available_width());
+                    ui.add_sized(
+                        [current_label_w, 24.0],
+                        egui::Label::new(RichText::new(label).strong()),
+                    );
+                    ui.add_sized(
+                        [ui.available_width().max(80.0), 28.0],
+                        centered_singleline(&mut value),
+                    );
+                });
+                if value != self.string_field(key) {
+                    set_optional_json_scalar(&mut self.editor_json, key, &value);
+                }
+            }
             _ => {
                 let mut value = self.string_field(key);
                 ui.horizontal(|ui| {
@@ -3830,12 +3964,13 @@ impl WatchApiApp {
         match key {
             "api_key" => {
                 let mut value = current_value.clone();
+                let mut test_clicked = false;
                 ui.horizontal(|ui| {
                     ui.add_sized(
                         [label_w, 24.0],
                         egui::Label::new(RichText::new(label).strong()),
                     );
-                    let button_w = CIRCULAR_ADD_BUTTON_SIZE;
+                    let button_w = CIRCULAR_ADD_BUTTON_SIZE * 2.0 + ui.spacing().item_spacing.x;
                     let spacing = ui.spacing().item_spacing.x;
                     let edit_w = (ui.available_width() - button_w - spacing).max(160.0);
                     ui.add_sized(
@@ -3863,11 +3998,24 @@ impl WatchApiApp {
                     {
                         self.endpoint_key_visible = !self.endpoint_key_visible;
                     }
+                    if circular_tool_button(
+                        ui,
+                        "测试连接",
+                        ToolButtonIcon::Probe,
+                        !self.connection_test_loading,
+                    )
+                    .clicked()
+                    {
+                        test_clicked = true;
+                    }
                 });
                 if value != current_value {
                     if let Some(endpoint) = self.selected_endpoint_value_mut() {
                         endpoint[key] = json!(value);
                     }
+                }
+                if test_clicked {
+                    self.start_connection_test_for_selected_endpoint();
                 }
             }
             "model" => {
@@ -3983,12 +4131,13 @@ impl WatchApiApp {
         match key {
             "api_key" => {
                 let mut value = current_value.clone();
+                let mut test_clicked = false;
                 ui.horizontal(|ui| {
                     ui.add_sized(
                         [label_w, 24.0],
                         egui::Label::new(RichText::new(label).strong()),
                     );
-                    let button_w = CIRCULAR_ADD_BUTTON_SIZE;
+                    let button_w = CIRCULAR_ADD_BUTTON_SIZE * 2.0 + ui.spacing().item_spacing.x;
                     let spacing = ui.spacing().item_spacing.x;
                     let edit_w = (ui.available_width() - button_w - spacing).max(160.0);
                     ui.add_sized(
@@ -4016,12 +4165,29 @@ impl WatchApiApp {
                     {
                         self.endpoint_key_visible = !self.endpoint_key_visible;
                     }
+                    if circular_tool_button(
+                        ui,
+                        "测试连接",
+                        ToolButtonIcon::Probe,
+                        !self.connection_test_loading,
+                    )
+                    .clicked()
+                    {
+                        test_clicked = true;
+                    }
                 });
                 if value != current_value {
-                    if let Some(provider) = self.selected_provider_value_mut() {
-                        provider[key] = json!(value);
-                    }
+                    self.commit_selected_provider_library_update(
+                        "供应商库已同步",
+                        |provider| {
+                            provider[key] = json!(value);
+                        },
+                    );
                 }
+                if test_clicked {
+                    self.start_connection_test_for_selected_provider();
+                }
+                self.render_provider_connection_test_status(ui, label_w);
             }
             "model" => {
                 let mut value = current_value.clone();
@@ -4042,9 +4208,12 @@ impl WatchApiApp {
                         });
                 });
                 if value != current_value {
-                    if let Some(provider) = self.selected_provider_value_mut() {
-                        provider[key] = json!(value);
-                    }
+                    self.commit_selected_provider_library_update(
+                        "供应商库已同步",
+                        |provider| {
+                            provider[key] = json!(value);
+                        },
+                    );
                 }
             }
             "reasoning_effort" => {
@@ -4066,9 +4235,12 @@ impl WatchApiApp {
                         });
                 });
                 if value != current_value {
-                    if let Some(provider) = self.selected_provider_value_mut() {
-                        provider[key] = json!(value);
-                    }
+                    self.commit_selected_provider_library_update(
+                        "供应商库已同步",
+                        |provider| {
+                            provider[key] = json!(value);
+                        },
+                    );
                 }
             }
             "service_tier" => {
@@ -4096,9 +4268,12 @@ impl WatchApiApp {
                         });
                 });
                 if value != current_value {
-                    if let Some(provider) = self.selected_provider_value_mut() {
-                        provider[key] = json!(value);
-                    }
+                    self.commit_selected_provider_library_update(
+                        "供应商库已同步",
+                        |provider| {
+                            provider[key] = json!(value);
+                        },
+                    );
                 }
             }
             _ => {
@@ -4114,13 +4289,44 @@ impl WatchApiApp {
                     );
                 });
                 if value != current_value {
-                    if let Some(provider) = self.selected_provider_value_mut() {
-                        set_object_scalar(provider, key, &value);
-                    }
+                    self.commit_selected_provider_library_update(
+                        "供应商库已同步",
+                        |provider| {
+                            set_object_scalar(provider, key, &value);
+                        },
+                    );
                 }
             }
         }
         ui.add_space(6.0);
+    }
+
+    fn render_provider_connection_test_status(&self, ui: &mut egui::Ui, label_w: f32) {
+        let status = if self.connection_test_loading && self.connection_test_is_provider {
+            "正在测试连接..."
+        } else if self.provider_connection_test_status.is_empty() {
+            "尚未测试连接"
+        } else {
+            &self.provider_connection_test_status
+        };
+        let color = if status.starts_with("连接测试成功") {
+            md_success()
+        } else if status.starts_with("连接测试失败") {
+            md_error()
+        } else {
+            muted()
+        };
+        ui.horizontal_top(|ui| {
+            ui.add_sized(
+                [label_w, 22.0],
+                egui::Label::new(RichText::new("测活结果").strong()),
+            );
+            ui.add_sized(
+                [ui.available_width(), 22.0],
+                egui::Label::new(RichText::new(status).color(color)).truncate(),
+            )
+            .on_hover_text(status);
+        });
     }
 
     fn render_provider_connection_block(&mut self, ui: &mut egui::Ui, label_w: f32) {
@@ -4154,6 +4360,7 @@ impl WatchApiApp {
             }
             EndpointConnectionTab::Proxy => self.render_provider_proxy_picker_inline(ui, label_w),
         }
+        self.render_provider_field_row(ui, "probe_model", label_w);
     }
 
     fn render_endpoint_connection_block(&mut self, ui: &mut egui::Ui, label_w: f32) {
@@ -4187,6 +4394,7 @@ impl WatchApiApp {
             }
             EndpointConnectionTab::Proxy => self.render_endpoint_proxy_picker_inline(ui, label_w),
         }
+        self.render_endpoint_field_row(ui, "probe_model", label_w);
     }
 
     fn render_endpoint_prompt_block(
@@ -4425,7 +4633,10 @@ impl WatchApiApp {
                 .small()
                 .color(md_error()),
         );
-        let Some(provider) = self.selected_provider_value_mut() else {
+        let mut next_provider_json = self.provider_json.clone();
+        let Some(provider) =
+            Self::selected_provider_value_mut_in(&mut next_provider_json, self.selected_provider)
+        else {
             return;
         };
         if !provider.get("guard_proxy").is_some_and(Value::is_object) {
@@ -4438,6 +4649,9 @@ impl WatchApiApp {
             return;
         };
         render_guard_proxy_fields(ui, guard, "默认启用保护层");
+        if next_provider_json != self.provider_json {
+            self.commit_provider_library_change(next_provider_json, "供应商库已同步");
+        }
     }
 
     fn render_config_editor_window(&mut self, ctx: &egui::Context) {
@@ -4589,6 +4803,9 @@ impl WatchApiApp {
                         4,
                     );
                 });
+                editor_section_frame(ui, "一次性续航规则", |ui| {
+                    render_continuation_trigger_rules(ui, &mut self.workspace_editor_json);
+                });
             });
     }
 
@@ -4614,6 +4831,364 @@ impl WatchApiApp {
         );
         self.prompt_library_open =
             editor_open_after_viewport_close(self.prompt_library_open, close_requested);
+    }
+
+    fn render_system_settings_window(&mut self, ctx: &egui::Context) {
+        if !self.system_settings_open {
+            return;
+        }
+        let mut close_requested = false;
+        ctx.show_viewport_immediate(
+            ViewportId::from_hash_of(SYSTEM_SETTINGS_VIEWPORT),
+            child_viewport_builder("系统设置", [800.0, 560.0], [560.0, 400.0]),
+            |child_ctx, _class| {
+                configure_visuals(child_ctx);
+                if child_ctx.input(|input| input.viewport().close_requested()) {
+                    close_requested = true;
+                }
+                egui::TopBottomPanel::bottom("system_settings_footer")
+                    .exact_height(50.0)
+                    .show_separator_line(true)
+                    .frame(
+                        Frame::default()
+                            .fill(md_surface_dim())
+                            .inner_margin(Margin::symmetric(8, 6)),
+                    )
+                    .show(child_ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.button("保存设置").clicked() {
+                                self.save_system_settings();
+                            }
+                            if ui.button("取消").clicked() {
+                                close_requested = true;
+                                child_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                        });
+                    });
+                egui::CentralPanel::default()
+                    .frame(card_frame())
+                    .show(child_ctx, |ui| {
+                        self.render_system_settings(ui);
+                    });
+            },
+        );
+        self.system_settings_open =
+            editor_open_after_viewport_close(self.system_settings_open, close_requested);
+    }
+
+    fn render_system_settings(&mut self, ui: &mut egui::Ui) {
+        editor_section_frame(ui, "主题", |ui| {
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut self.system_settings_theme, GuiTheme::Dark, "深色");
+                ui.radio_value(&mut self.system_settings_theme, GuiTheme::Light, "浅色");
+            });
+        });
+
+        editor_section_frame(ui, "外部应用", |ui| {
+            let spacing = ui.spacing().item_spacing.x;
+            let actions_width = CIRCULAR_ADD_BUTTON_SIZE * 2.0 + spacing;
+            let name_width = (ui.available_width() * 0.25).clamp(110.0, 180.0);
+            let path_width =
+                (ui.available_width() - name_width - actions_width - spacing * 3.0).max(140.0);
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [name_width, 28.0],
+                    centered_singleline(&mut self.system_settings_new_name).hint_text("名称"),
+                );
+                ui.add_sized(
+                    [path_width, 28.0],
+                    centered_singleline(&mut self.system_settings_new_path).hint_text("应用路径"),
+                );
+                if circular_tool_button(ui, "选择应用", ToolButtonIcon::Folder, true).clicked()
+                {
+                    let mut dialog = rfd::FileDialog::new();
+                    let current = PathBuf::from(self.system_settings_new_path.trim());
+                    if current.exists() {
+                        if current.is_dir() {
+                            dialog = dialog.set_directory(current);
+                        } else if let Some(parent) = current.parent() {
+                            dialog = dialog.set_directory(parent);
+                        }
+                    }
+                    if let Some(path) = dialog.pick_file() {
+                        if self.system_settings_new_name.trim().is_empty() {
+                            self.system_settings_new_name = external_application_name(&path);
+                        }
+                        self.system_settings_new_path = path.to_string_lossy().to_string();
+                    }
+                }
+                let can_add = !self.system_settings_new_path.trim().is_empty();
+                if circular_tool_button(ui, "添加外部应用", ToolButtonIcon::Add, can_add).clicked()
+                {
+                    self.system_settings_external_apps
+                        .push(GuiExternalApplication {
+                            name: std::mem::take(&mut self.system_settings_new_name),
+                            path: PathBuf::from(
+                                self.system_settings_new_path
+                                    .trim()
+                                    .trim_matches('"')
+                                    .trim(),
+                            ),
+                        });
+                    self.system_settings_new_path.clear();
+                    self.system_settings_status.clear();
+                }
+            });
+            ui.add_space(8.0);
+
+            let mut browse_index = None;
+            let mut remove_index = None;
+            let mut launch = None;
+            egui::ScrollArea::vertical()
+                .id_salt("system_settings_external_app_list")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let width = (ui.available_width() - INNER_SCROLLBAR_GUTTER).max(320.0);
+                    ui.set_width(width);
+                    ui.set_max_width(width);
+                    if self.system_settings_external_apps.is_empty() {
+                        ui.label(RichText::new("暂无外部应用").color(muted()));
+                    }
+                    for (index, app) in self.system_settings_external_apps.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            let spacing = ui.spacing().item_spacing.x;
+                            let actions_width = CIRCULAR_ADD_BUTTON_SIZE * 3.0 + spacing * 2.0;
+                            let name_width = (ui.available_width() * 0.25).clamp(110.0, 180.0);
+                            let path_width =
+                                (ui.available_width() - name_width - actions_width - spacing)
+                                    .max(140.0);
+                            ui.add_sized([name_width, 28.0], centered_singleline(&mut app.name));
+                            let mut path_text = app.path.to_string_lossy().to_string();
+                            if ui
+                                .add_sized([path_width, 28.0], centered_singleline(&mut path_text))
+                                .changed()
+                            {
+                                app.path = PathBuf::from(path_text.trim().trim_matches('"').trim());
+                            }
+                            if circular_tool_button(
+                                ui,
+                                "选择应用路径",
+                                ToolButtonIcon::Folder,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                browse_index = Some(index);
+                            }
+                            if circular_tool_button(
+                                ui,
+                                "启动此应用",
+                                ToolButtonIcon::Play,
+                                !app.path.as_os_str().is_empty(),
+                            )
+                            .clicked()
+                            {
+                                launch = Some((app.name.clone(), app.path.clone()));
+                            }
+                            if circular_tool_button(ui, "移除此应用", ToolButtonIcon::Delete, true)
+                                .clicked()
+                            {
+                                remove_index = Some(index);
+                            }
+                        });
+                        ui.add_space(4.0);
+                    }
+                });
+
+            if let Some(index) = browse_index {
+                let current = self.system_settings_external_apps[index].path.clone();
+                let mut dialog = rfd::FileDialog::new();
+                if current.exists() {
+                    if current.is_dir() {
+                        dialog = dialog.set_directory(current);
+                    } else if let Some(parent) = current.parent() {
+                        dialog = dialog.set_directory(parent);
+                    }
+                }
+                if let Some(path) = dialog.pick_file() {
+                    let app = &mut self.system_settings_external_apps[index];
+                    if app.name.trim().is_empty() {
+                        app.name = external_application_name(&path);
+                    }
+                    app.path = path;
+                }
+            }
+            if let Some(index) = remove_index {
+                self.system_settings_external_apps.remove(index);
+            }
+            if let Some((name, path)) = launch {
+                self.launch_external_application(&name, &path);
+            }
+            if !self.system_settings_status.is_empty() {
+                ui.add_space(4.0);
+                let color = if self.system_settings_status.contains("失败")
+                    || self.system_settings_status.contains("不存在")
+                {
+                    md_error()
+                } else {
+                    md_success()
+                };
+                ui.label(
+                    RichText::new(self.system_settings_status.as_str())
+                        .small()
+                        .color(color),
+                );
+            }
+        });
+    }
+
+    fn save_system_settings(&mut self) {
+        let previous_theme = self.registry.theme;
+        let previous_apps = self.registry.external_apps.clone();
+        self.registry.set_system_settings(
+            self.system_settings_theme,
+            self.system_settings_external_apps.clone(),
+        );
+        match self.registry.save() {
+            Ok(()) => {
+                self.system_settings_theme = self.registry.theme;
+                self.system_settings_external_apps = self.registry.external_apps.clone();
+                self.system_settings_status = "设置已保存".to_string();
+                self.status = "系统设置已保存".to_string();
+            }
+            Err(err) => {
+                self.registry
+                    .set_system_settings(previous_theme, previous_apps);
+                self.system_settings_status = format!("保存设置失败：{err}");
+                self.status = self.system_settings_status.clone();
+            }
+        }
+    }
+
+    fn launch_external_application(&mut self, name: &str, path: &Path) {
+        if path.as_os_str().is_empty() || !path.is_file() {
+            let message = format!("应用路径不存在：{}", path.display());
+            self.system_settings_status = message.clone();
+            self.status = message;
+            return;
+        }
+        let is_command_script = external_application_is_command_script(path);
+        let mut command = if is_command_script {
+            let mut command = Command::new("cmd.exe");
+            command.args(["/d", "/c"]).arg(path);
+            command
+        } else {
+            Command::new(path)
+        };
+        if let Some(parent) = path.parent() {
+            command.current_dir(parent);
+        }
+        if !is_command_script {
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+        }
+        #[cfg(windows)]
+        {
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            let flags = if is_command_script {
+                CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP
+            } else {
+                DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+            };
+            command.creation_flags(flags);
+        }
+        match command.spawn() {
+            Ok(_) => {
+                let label = if name.trim().is_empty() {
+                    external_application_name(path)
+                } else {
+                    name.trim().to_string()
+                };
+                let message = format!("已启动：{label}");
+                self.system_settings_status = message.clone();
+                self.status = message;
+            }
+            Err(err) => {
+                let message = format!("启动应用失败：{err}");
+                self.system_settings_status = message.clone();
+                self.status = message;
+            }
+        }
+    }
+
+    fn render_provider_import_dialog(&mut self, ctx: &egui::Context) {
+        if !self.provider_import_dialog_open {
+            return;
+        }
+        let (url, key) = parse_provider_connection_text(&self.provider_import_text);
+        let mut close_requested = false;
+        ctx.show_viewport_immediate(
+            ViewportId::from_hash_of(PROVIDER_IMPORT_VIEWPORT),
+            child_viewport_builder("从文本导入 URL / Key", [680.0, 430.0], [460.0, 330.0]),
+            |child_ctx, _class| {
+                configure_visuals(child_ctx);
+                if child_ctx.input(|input| input.viewport().close_requested()) {
+                    close_requested = true;
+                }
+                egui::CentralPanel::default()
+                    .frame(card_frame())
+                    .show(child_ctx, |ui| {
+                        ui.label(
+                            RichText::new("粘贴任意文本，自动识别接口 URL 和 API Key。")
+                                .color(muted()),
+                        );
+                        ui.add_space(6.0);
+                        ui.add_sized(
+                            [ui.available_width(), 220.0],
+                            TextEdit::multiline(&mut self.provider_import_text)
+                                .hint_text(
+                                    "支持 URL、API_KEY=...、Authorization: Bearer ... 和 JSON 配置",
+                                )
+                                .desired_rows(10),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(format!(
+                            "识别结果：URL {}  Key {}",
+                            url.as_deref().unwrap_or("未找到"),
+                            key.as_deref()
+                                .map(mask_api_key)
+                                .as_deref()
+                                .unwrap_or("未找到")
+                        ));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            let can_apply = url.is_some() || key.is_some();
+                            if ui
+                                .add_enabled(can_apply, egui::Button::new("应用到当前供应商"))
+                                .clicked()
+                            {
+                                self.commit_selected_provider_library_update(
+                                    "供应商库已同步",
+                                    |provider| {
+                                        if let Some(url) = &url {
+                                            provider["base_url"] = json!(url);
+                                        }
+                                        if let Some(key) = &key {
+                                            provider["api_key"] = json!(key);
+                                        }
+                                    },
+                                );
+                                self.provider_connection_test_status.clear();
+                                close_requested = true;
+                                child_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                            if ui.button("取消").clicked() {
+                                close_requested = true;
+                                child_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                        });
+                    });
+            },
+        );
+        self.provider_import_dialog_open =
+            editor_open_after_viewport_close(self.provider_import_dialog_open, close_requested);
+        if !self.provider_import_dialog_open {
+            self.provider_import_text.clear();
+        }
     }
 
     fn render_add_endpoint_dialog(&mut self, ctx: &egui::Context) {
@@ -4873,12 +5448,14 @@ impl WatchApiApp {
                 .show_ui(ui, |ui| {
                     for choice in choices {
                         if ui.selectable_label(false, &choice.label).clicked() {
-                            if let Some(provider) = self.selected_provider_value_mut() {
-                                provider["base_url"] = json!(choice.base_url);
-                                provider["api_key"] = json!(choice.api_key);
-                                provider["model"] = json!(choice.model);
-                            }
-                            self.status = "已写入聚合代理到当前供应商".to_string();
+                            self.commit_selected_provider_library_update(
+                                "已写入聚合代理到当前供应商",
+                                |provider| {
+                                    provider["base_url"] = json!(choice.base_url);
+                                    provider["api_key"] = json!(choice.api_key);
+                                    provider["model"] = json!(choice.model);
+                                },
+                            );
                         }
                     }
                 });
@@ -5043,13 +5620,15 @@ impl WatchApiApp {
                                 .auto_shrink([false, false])
                                 .max_height(table_scroll_height)
                                 .show(ui, |ui| {
-                                    let table_width = endpoint_table_columns()
+                                    let table_columns =
+                                        endpoint_table_columns_for_rows(ui, &rows[start..end]);
+                                    let table_width = table_columns
                                         .iter()
                                         .map(|column| column.initial_width)
                                         .sum::<f32>();
                                     ui.set_min_width(table_width);
 
-                                    let table = endpoint_table_columns().iter().fold(
+                                    let table = table_columns.iter().fold(
                                         TableBuilder::new(ui)
                                             .striped(true)
                                             .resizable(true)
@@ -5069,7 +5648,7 @@ impl WatchApiApp {
 
                                     table
                                         .header(RUN_ENDPOINT_TABLE_HEADER_HEIGHT, |mut header| {
-                                            for column in endpoint_table_columns() {
+                                            for column in &table_columns {
                                                 header.col(|ui| {
                                                     ui.label(
                                                         RichText::new(column.heading)
@@ -5584,6 +6163,24 @@ impl WatchApiApp {
         }
     }
 
+    fn update_last_rows_from_config_snapshot(&mut self, config: &AppConfig) {
+        for row in &mut self.last_rows {
+            let Some(endpoint) = config
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.name == row.name)
+            else {
+                continue;
+            };
+            row.enabled = endpoint.enabled;
+            row.guard_proxy_enabled = endpoint.guard_proxy.enabled;
+            row.url = endpoint.base_url.clone();
+            row.weight = endpoint.weight;
+        }
+        self.last_rows
+            .sort_by_key(|row| std::cmp::Reverse(row.weight));
+    }
+
     fn set_all_editor_endpoints_enabled_in_json(editor_json: &mut Value, enabled: bool) {
         let Some(items) = editor_json
             .get_mut("endpoint_refs")
@@ -5607,10 +6204,7 @@ impl WatchApiApp {
             endpoint_table_cell(ui, "");
         });
         row.col(|ui| {
-            endpoint_table_cell(ui, "");
-        });
-        row.col(|ui| {
-            endpoint_table_cell(ui, "未加载");
+            render_table_status_badge(ui, "未加载");
         });
         for _ in 0..13 {
             row.col(|ui| {
@@ -5674,9 +6268,6 @@ impl WatchApiApp {
             endpoint_table_cell(ui, " ");
         });
         row.col(|ui| {
-            endpoint_table_cell(ui, " ");
-        });
-        row.col(|ui| {
             if ui.checkbox(&mut guard_proxy_enabled, "").changed() {
                 self.set_endpoint_guard_proxy_enabled(&endpoint_name, guard_proxy_enabled);
             }
@@ -5691,7 +6282,7 @@ impl WatchApiApp {
             endpoint_table_cell(ui, endpoint.weight.to_string());
         });
         row.col(|ui| {
-            endpoint_table_cell(
+            render_table_status_badge(
                 ui,
                 if endpoint.enabled {
                     "待探测"
@@ -5730,9 +6321,6 @@ impl WatchApiApp {
             endpoint_table_cell(ui, " ");
         });
         row.col(|ui| {
-            endpoint_table_cell(ui, " ");
-        });
-        row.col(|ui| {
             endpoint_table_cell(
                 ui,
                 if endpoint.guard_proxy.enabled {
@@ -5752,13 +6340,13 @@ impl WatchApiApp {
             endpoint_table_cell(ui, endpoint.weight.to_string());
         });
         row.col(|ui| {
-            endpoint_table_cell(ui, "需重启生效");
+            render_table_status_badge(ui, "需重启生效");
         });
         row.col(|ui| {
             endpoint_table_cell(ui, "");
         });
         row.col(|ui| {
-            endpoint_table_cell(ui, "未加载");
+            render_table_status_badge(ui, "未加载");
         });
         for _ in 0..7 {
             row.col(|ui| {
@@ -5785,18 +6373,12 @@ impl WatchApiApp {
         row: EndpointRow,
     ) {
         let mut enabled = row.enabled;
-        let mut force = row.force_probe;
         let mut fixed = row.fixed;
         let mut guard_proxy_enabled = row.guard_proxy_enabled;
         let endpoint_name = row.name.clone();
         row_ui.col(|ui| {
             if ui.checkbox(&mut enabled, "").changed() {
                 self.set_endpoint_enabled(&row.name, enabled);
-            }
-        });
-        row_ui.col(|ui| {
-            if ui.checkbox(&mut force, "").clicked() {
-                self.set_force_probe_endpoint(force.then_some(row.name.clone()));
             }
         });
         row_ui.col(|ui| {
@@ -5819,13 +6401,17 @@ impl WatchApiApp {
             endpoint_table_cell(ui, row.weight.to_string());
         });
         row_ui.col(|ui| {
-            endpoint_table_cell(ui, row.request_status);
+            render_table_status_badge(ui, row.request_status);
         });
         row_ui.col(|ui| {
-            endpoint_table_cell(ui, if row.selected { "是" } else { "" });
+            if row.selected {
+                render_table_status_badge(ui, "选中");
+            } else {
+                endpoint_table_cell(ui, "");
+            }
         });
         row_ui.col(|ui| {
-            endpoint_table_cell(ui, row.runtime_state);
+            render_table_status_badge(ui, row.runtime_state);
         });
         row_ui.col(|ui| {
             endpoint_table_cell(ui, row.agent_runtime);
@@ -5846,7 +6432,7 @@ impl WatchApiApp {
             endpoint_table_cell(ui, row.last_request_at);
         });
         row_ui.col(|ui| {
-            endpoint_table_cell(ui, row.last_status_code);
+            render_table_status_badge(ui, row.last_status_code);
         });
         row_ui.col(|ui| {
             ui.horizontal(|ui| {
@@ -6489,6 +7075,7 @@ impl WatchApiApp {
         if terminal_surface_should_request_focus(response.clicked(), response.drag_started()) {
             ui.memory_mut(|memory| memory.request_focus(terminal_id));
         }
+        self.process_terminal_file_drop(ui.ctx(), rect, terminal_id);
         let terminal_diag = if self.running {
             "PTY/ConPTY"
         } else {
@@ -6505,7 +7092,7 @@ impl WatchApiApp {
             terminal_view_cell_size(ui, &font_id, &mut self.terminal_render_cache);
         self.sync_terminal_size(rect, char_width, line_height);
         let origin = rect.left_top() + vec2(10.0, 8.0);
-        if let Some((visible_rows, visible_cols, row_offset)) =
+        if let Some((visible_rows, visible_cols, row_offset, absolute_row_start)) =
             self.terminal_view.as_ref().map(|view| {
                 let visible_rows = view
                     .rows
@@ -6514,7 +7101,8 @@ impl WatchApiApp {
                     .cols
                     .min(terminal_visible_cols(rect, origin, char_width));
                 let row_offset = terminal_visible_row_start(view, visible_rows);
-                (visible_rows, visible_cols, row_offset)
+                let absolute_row_start = terminal_view_absolute_row_start(view);
+                (visible_rows, visible_cols, row_offset, absolute_row_start)
             })
         {
             let captures_pointer = self
@@ -6544,6 +7132,7 @@ impl WatchApiApp {
                     visible_rows,
                     visible_cols,
                     row_offset,
+                    absolute_row_start,
                 );
             }
         } else if response.hovered() || response.has_focus() {
@@ -6698,6 +7287,45 @@ impl WatchApiApp {
             self.process_terminal_keyboard_input(ui.ctx());
         }
         self.sync_terminal_user_input_active();
+    }
+
+    fn process_terminal_file_drop(
+        &mut self,
+        ctx: &egui::Context,
+        terminal_rect: Rect,
+        terminal_id: egui::Id,
+    ) {
+        let paths = ctx.input(|input| {
+            let pointer_is_over_terminal = input
+                .pointer
+                .hover_pos()
+                .is_some_and(|position| terminal_rect.contains(position));
+            if !pointer_is_over_terminal {
+                return Vec::new();
+            }
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .collect::<Vec<_>>()
+        });
+        if paths.is_empty() {
+            return;
+        }
+
+        ctx.memory_mut(|memory| memory.request_focus(terminal_id));
+        if !self.terminal_input_available() {
+            self.status = "终端未启动，未输入拖入的文件".to_string();
+            return;
+        }
+
+        let text = terminal_dropped_paths_text(&paths);
+        self.terminal_selection = None;
+        if self.write_terminal_paste(&text) {
+            self.capture_terminal_manual_input_action(&TerminalInputAction::Paste(text));
+            self.status = format!("已输入 {} 个文件路径", paths.len());
+        }
     }
 
     fn update_terminal_ime_output(
@@ -7091,6 +7719,7 @@ impl WatchApiApp {
         rows: usize,
         cols: usize,
         row_offset: usize,
+        absolute_row_start: usize,
     ) {
         if response.clicked_by(egui::PointerButton::Primary)
             && !response.dragged_by(egui::PointerButton::Primary)
@@ -7116,19 +7745,21 @@ impl WatchApiApp {
         };
 
         if response.drag_started_by(egui::PointerButton::Primary) {
+            let selection_cell = terminal_selection_cell_from_view_cell(cell, absolute_row_start);
             self.terminal_selection = Some(TerminalSelection {
-                anchor: cell,
-                focus: cell,
+                anchor: selection_cell,
+                focus: selection_cell,
             });
         } else if response.double_clicked_by(egui::PointerButton::Primary) {
             self.select_terminal_word(cell);
         } else if response.dragged_by(egui::PointerButton::Primary) {
+            let selection_cell = terminal_selection_cell_from_view_cell(cell, absolute_row_start);
             if let Some(selection) = self.terminal_selection.as_mut() {
-                selection.focus = cell;
+                selection.focus = selection_cell;
             } else {
                 self.terminal_selection = Some(TerminalSelection {
-                    anchor: cell,
-                    focus: cell,
+                    anchor: selection_cell,
+                    focus: selection_cell,
                 });
             }
         }
@@ -7623,6 +8254,136 @@ impl WatchApiApp {
                 self.status = "扫描会话候选失败".to_string();
             }
         }
+    }
+
+    fn poll_connection_test_result(&mut self) {
+        let Some(rx) = &self.connection_test_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.connection_test_rx = None;
+                self.connection_test_loading = false;
+                if self.connection_test_is_provider {
+                    self.provider_connection_test_status = result.message.clone();
+                }
+                self.status = result.message;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.connection_test_rx = None;
+                self.connection_test_loading = false;
+                let message = "连接测试失败：后台任务已退出".to_string();
+                if self.connection_test_is_provider {
+                    self.provider_connection_test_status = message.clone();
+                }
+                self.status = message;
+            }
+        }
+    }
+
+    fn start_connection_test_for_selected_provider(&mut self) {
+        let Some(provider) = self.selected_provider_value().cloned() else {
+            self.status = "请先选择供应商".to_string();
+            return;
+        };
+        self.connection_test_is_provider = true;
+        self.provider_connection_test_status.clear();
+        self.start_connection_test(provider);
+    }
+
+    fn start_connection_test_for_selected_endpoint(&mut self) {
+        let Some(provider) = self.selected_endpoint_value().cloned() else {
+            self.status = "请先选择接口组".to_string();
+            return;
+        };
+        self.connection_test_is_provider = false;
+        self.start_connection_test(provider);
+    }
+
+    fn start_connection_test(&mut self, provider: Value) {
+        if self.connection_test_loading {
+            return;
+        }
+        let (endpoint, config) = match self.connection_test_config_for_provider(provider) {
+            Ok(value) => value,
+            Err(err) => {
+                let message = format!("连接测试失败：{err}");
+                if self.connection_test_is_provider {
+                    self.provider_connection_test_status = message.clone();
+                }
+                self.status = message;
+                return;
+            }
+        };
+        let probe_model_label = probe_model_status_label(&endpoint);
+        let endpoint_name = endpoint.name.clone();
+        let timeout_seconds = config.request_timeout_seconds;
+        let pending_status = format!("正在测试连接：{endpoint_name} / {probe_model_label}");
+        let endpoint_name_for_result = endpoint_name.clone();
+        let probe_model_label_for_result = probe_model_label.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let message = match HttpProbe::new(timeout_seconds) {
+                Ok(probe) => match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => {
+                        let result = runtime.block_on(probe.probe_endpoint(&endpoint, &config));
+                        format_connection_test_result(
+                            &endpoint_name_for_result,
+                            &probe_model_label_for_result,
+                            &result,
+                        )
+                    }
+                    Err(err) => format!("连接测试失败：创建异步运行时失败：{err}"),
+                },
+                Err(err) => format!("连接测试失败：创建探测器失败：{err}"),
+            };
+            let _ = tx.send(ConnectionTestResult { message });
+        });
+        self.connection_test_rx = Some(rx);
+        self.connection_test_loading = true;
+        if self.connection_test_is_provider {
+            self.provider_connection_test_status = pending_status.clone();
+        }
+        self.status = pending_status;
+    }
+
+    fn connection_test_config_for_provider(
+        &self,
+        mut provider: Value,
+    ) -> Result<(EndpointConfig, AppConfig), String> {
+        let name = value_to_string(provider.get("name")).if_empty("临时供应商");
+        provider["name"] = json!(name.clone());
+        let mut data = default_config_data();
+        for key in [
+            "request_timeout_seconds",
+            "probe_expected_text",
+            "probe_path",
+            "polluted_response_keywords",
+            "polluted_response_threshold",
+            "polluted_context_window",
+            "polluted_check_max_chars",
+        ] {
+            if let Some(value) = self.editor_json.get(key) {
+                data[key] = value.clone();
+            }
+        }
+        data["providers"] = json!([provider]);
+        data["endpoint_refs"] = json!([{
+            "provider": name,
+            "enabled": true
+        }]);
+        let text = serde_json::to_string(&data).map_err(|err| err.to_string())?;
+        let config = AppConfig::from_json_str(&text).map_err(|err| err.to_string())?;
+        let endpoint = config
+            .endpoints
+            .first()
+            .cloned()
+            .ok_or_else(|| "未生成可测试接口".to_string())?;
+        Ok((endpoint, config))
     }
 
     fn bind_session_candidate(&mut self, candidate: &SessionCandidate) {
@@ -8594,6 +9355,31 @@ impl WatchApiApp {
             .and_then(|items| items.get_mut(self.selected_provider))
     }
 
+    fn selected_provider_value_mut_in(
+        provider_json: &mut Value,
+        selected_provider: usize,
+    ) -> Option<&mut Value> {
+        provider_json
+            .get_mut("providers")
+            .and_then(Value::as_array_mut)
+            .and_then(|items| items.get_mut(selected_provider))
+    }
+
+    fn commit_selected_provider_library_update(
+        &mut self,
+        status: impl Into<String>,
+        update: impl FnOnce(&mut Value),
+    ) -> bool {
+        let mut next_provider_json = self.provider_json.clone();
+        let Some(provider) =
+            Self::selected_provider_value_mut_in(&mut next_provider_json, self.selected_provider)
+        else {
+            return false;
+        };
+        update(provider);
+        self.commit_provider_library_change(next_provider_json, status)
+    }
+
     fn provider_names(&self) -> Vec<String> {
         self.provider_json
             .get("providers")
@@ -8933,44 +9719,80 @@ impl WatchApiApp {
     }
 
     fn save_provider_library(&mut self) {
-        match self.persist_provider_library_value(&self.provider_json) {
+        let provider_json = self.provider_json.clone();
+        match self.persist_provider_library_value(&provider_json) {
             Ok(()) => {
                 self.status = "供应商库已保存".to_string();
-                if !self.running && self.config_path_path().is_some() {
-                    self.load_config();
-                }
             }
             Err(err) => self.status = format!("保存供应商库失败：{err}"),
         }
     }
 
-    fn persist_provider_library_value(&self, provider_json: &Value) -> Result<(), String> {
-        let scoped_snapshot = self.config_path_path().map(|config_path| {
-            let provider_path = provider_library_path_for_config(&config_path);
-            let previous_text = std::fs::read_to_string(&provider_path).ok();
-            (provider_path, previous_text)
-        });
-        self.sync_provider_library_to_current_config_value(provider_json)?;
+    fn persist_provider_library_value(&mut self, provider_json: &Value) -> Result<(), String> {
+        let snapshots = self.provider_library_file_snapshots_for_known_configs();
+        self.sync_provider_library_to_known_configs_value(provider_json, &snapshots)?;
         if let Err(err) = save_global_provider_json(provider_json) {
             let mut rollback_error = None;
-            if let Some((provider_path, previous_text)) = scoped_snapshot {
-                match previous_text {
-                    Some(text) => {
-                        if let Err(err) = write_text_atomic(&provider_path, &text) {
-                            rollback_error = Some(err.to_string());
-                        }
-                    }
-                    None => match std::fs::remove_file(&provider_path) {
-                        Ok(()) => {}
-                        Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(err) => rollback_error = Some(err.to_string()),
-                    },
+            for (provider_path, previous_text) in &snapshots {
+                if let Err(err) =
+                    restore_provider_library_file_snapshot(provider_path, previous_text)
+                {
+                    rollback_error.get_or_insert_with(|| err.to_string());
                 }
             }
             if let Some(rollback_error) = rollback_error {
-                return Err(format!("{err}；回滚当前配置供应商库失败：{rollback_error}"));
+                return Err(format!("{err}；回滚配置供应商库失败：{rollback_error}"));
             }
             return Err(err);
+        }
+        self.refresh_current_config_after_provider_library_change(provider_json)?;
+        Ok(())
+    }
+
+    fn commit_provider_library_change(
+        &mut self,
+        provider_json: Value,
+        status: impl Into<String>,
+    ) -> bool {
+        match self.persist_provider_library_value(&provider_json) {
+            Ok(()) => {
+                self.provider_json = provider_json;
+                self.status = status.into();
+                true
+            }
+            Err(err) => {
+                self.status = format!("保存供应商库失败：{err}");
+                false
+            }
+        }
+    }
+
+    fn refresh_current_config_after_provider_library_change(
+        &mut self,
+        provider_json: &Value,
+    ) -> Result<(), String> {
+        let Some(config_path) = self.config_path_path() else {
+            return Ok(());
+        };
+        let next_config =
+            self.editor_config_for_session_binding_result_with_provider_json(provider_json)?;
+        self.config = Some(next_config.clone());
+        self.selected_endpoint = self
+            .selected_endpoint
+            .min(next_config.endpoints.len().saturating_sub(1));
+        self.update_last_rows_from_config_snapshot(&next_config);
+        if self.running {
+            let command = RuntimeCommand::ReplaceConfigSnapshot(next_config);
+            if let Some(tx) = &self.stop_tx {
+                tx.send(command).map_err(|_| "运行线程已退出".to_string())?;
+            }
+        } else if let Some(runtime) = &self.runtime {
+            if let Some(mut guard) = runtime.try_lock() {
+                guard.replace_config_snapshot(next_config);
+                self.last_rows = guard.rows();
+            }
+        } else if config_path.exists() {
+            self.load_config();
         }
         Ok(())
     }
@@ -8985,6 +9807,63 @@ impl WatchApiApp {
     ) -> Result<(), String> {
         if let Some(path) = self.config_path_path() {
             save_provider_json_for_config(&path, provider_json)?;
+        }
+        Ok(())
+    }
+
+    fn known_provider_library_config_paths(&self) -> Vec<PathBuf> {
+        let mut paths = self.registry.paths.clone();
+        if let Some(path) = self.config_path_path() {
+            paths.push(path);
+        }
+        paths = paths
+            .into_iter()
+            .filter(|path| path.exists() || self.config_path_path().as_ref() == Some(path))
+            .map(normalize_config_path)
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    fn provider_library_file_snapshots_for_known_configs(&self) -> Vec<(PathBuf, Option<String>)> {
+        let mut paths = self
+            .known_provider_library_config_paths()
+            .into_iter()
+            .map(|config_path| provider_library_path_for_config(&config_path))
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        paths
+            .into_iter()
+            .map(|provider_path| {
+                let previous_text = std::fs::read_to_string(&provider_path).ok();
+                (provider_path, previous_text)
+            })
+            .collect()
+    }
+
+    fn sync_provider_library_to_known_configs_value(
+        &self,
+        provider_json: &Value,
+        snapshots: &[(PathBuf, Option<String>)],
+    ) -> Result<(), String> {
+        let mut written: Vec<PathBuf> = Vec::new();
+        for (provider_path, _) in snapshots {
+            if let Err(err) = save_provider_json_at_path(provider_path, provider_json) {
+                for written_path in written.iter().rev() {
+                    if let Some((_, previous_text)) =
+                        snapshots.iter().find(|(path, _)| path == written_path)
+                    {
+                        let _ = restore_provider_library_file_snapshot(written_path, previous_text);
+                    }
+                }
+                return Err(format!(
+                    "同步供应商库到 {} 失败：{err}",
+                    provider_path.display()
+                ));
+            }
+            written.push(provider_path.to_path_buf());
         }
         Ok(())
     }
@@ -9051,13 +9930,19 @@ impl WatchApiApp {
     }
 
     fn editor_config_for_session_binding_result(&self) -> Result<AppConfig, String> {
+        self.editor_config_for_session_binding_result_with_provider_json(&self.provider_json)
+    }
+
+    fn editor_config_for_session_binding_result_with_provider_json(
+        &self,
+        provider_json: &Value,
+    ) -> Result<AppConfig, String> {
         let mut data = self.editor_json.clone();
-        data["providers"] = self
-            .provider_json
+        data["providers"] = provider_json
             .get("providers")
             .cloned()
             .unwrap_or_else(|| json!([]));
-        let valid_providers = provider_name_set(&self.provider_json);
+        let valid_providers = provider_name_set(provider_json);
         prune_endpoint_refs_not_in_set(&mut data, &valid_providers);
         let text = serde_json::to_string(&data).map_err(|err| err.to_string())?;
         let mut config = AppConfig::from_json_str(&text).map_err(|err| err.to_string())?;
@@ -10197,6 +11082,36 @@ impl WatchApiApp {
                 status
             )
         }
+    }
+
+    fn run_state_chips_with_control_state(&self, control_state: Option<&Value>) -> Vec<StatusChip> {
+        let selected_row = self.last_rows.iter().find(|row| row.selected);
+        let endpoint = selected_row.map(|row| row.name.as_str()).unwrap_or("");
+        let mut chips = Vec::new();
+        chips.push(StatusChip::neutral(format!(
+            "配置 {}",
+            self.current_config_display_name()
+        )));
+        if !endpoint.is_empty() {
+            chips.push(StatusChip::accent(format!("接口 {endpoint}")));
+        }
+        chips.push(if self.running {
+            StatusChip::success("运行中")
+        } else {
+            StatusChip::muted("已停止")
+        });
+        let status = self.status_with_start_error();
+        if !status.trim().is_empty() && !chips.iter().any(|chip| chip.text == status) {
+            chips.push(StatusChip::for_runtime_status(status));
+        }
+        if let Some(next_probe) = selected_row.and_then(|row| row.next_probe_in_seconds) {
+            chips.push(StatusChip::accent(format_next_probe_label(next_probe)));
+        }
+        let pause = self.pause_state_label_with_control_state(control_state);
+        if !pause.is_empty() && !chips.iter().any(|chip| chip.text.contains(&pause)) {
+            chips.push(StatusChip::warning(pause));
+        }
+        chips
     }
 
     fn current_control_state(&self) -> Option<Value> {
@@ -11608,59 +12523,165 @@ fn format_runtime_elapsed(started_at: Option<Instant>) -> String {
     }
 }
 
-fn configure_visuals(ctx: &egui::Context) {
-    ctx.set_theme(egui::Theme::Dark);
-    if ctx.cumulative_pass_nr() <= 1 {
-        ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
-        ctx.style_mut_of(egui::Theme::Dark, apply_github_dark_style);
-        ctx.style_mut_of(egui::Theme::Light, apply_github_dark_style);
+thread_local! {
+    static ACTIVE_GUI_THEME: Cell<GuiTheme> = Cell::new(GuiTheme::Dark);
+}
+
+#[derive(Clone, Copy)]
+struct AppPalette {
+    bg: Color32,
+    canvas: Color32,
+    surface_2: Color32,
+    surface_hover: Color32,
+    button_fill: Color32,
+    button_hover_fill: Color32,
+    button_active_fill: Color32,
+    button_outline: Color32,
+    tree_guide: Color32,
+    tree_joint: Color32,
+    accent: Color32,
+    primary_hover: Color32,
+    primary_container: Color32,
+    selected_fill: Color32,
+    text: Color32,
+    text_muted: Color32,
+    error: Color32,
+    warning: Color32,
+    success: Color32,
+}
+
+fn set_gui_theme(theme: GuiTheme) {
+    ACTIVE_GUI_THEME.with(|active| active.set(theme));
+}
+
+fn current_gui_theme() -> GuiTheme {
+    ACTIVE_GUI_THEME.with(Cell::get)
+}
+
+fn palette_for_theme(theme: GuiTheme) -> AppPalette {
+    match theme {
+        GuiTheme::Dark => AppPalette {
+            bg: Color32::from_rgb(13, 17, 23),
+            canvas: Color32::from_rgb(1, 4, 9),
+            surface_2: Color32::from_rgb(16, 22, 29),
+            surface_hover: Color32::from_rgb(22, 27, 34),
+            button_fill: Color32::from_rgb(20, 27, 36),
+            button_hover_fill: Color32::from_rgb(28, 38, 50),
+            button_active_fill: Color32::from_rgb(21, 67, 138),
+            button_outline: Color32::from_rgb(48, 60, 76),
+            tree_guide: Color32::from_rgb(48, 54, 61),
+            tree_joint: Color32::from_rgb(88, 96, 105),
+            accent: Color32::from_rgb(47, 129, 247),
+            primary_hover: Color32::from_rgb(88, 166, 255),
+            primary_container: Color32::from_rgb(31, 111, 235),
+            selected_fill: Color32::from_rgb(12, 45, 107),
+            text: Color32::from_rgb(230, 237, 243),
+            text_muted: Color32::from_rgb(132, 141, 151),
+            error: Color32::from_rgb(248, 81, 73),
+            warning: Color32::from_rgb(210, 153, 34),
+            success: Color32::from_rgb(63, 185, 80),
+        },
+        GuiTheme::Light => AppPalette {
+            bg: Color32::from_rgb(246, 248, 250),
+            canvas: Color32::from_rgb(255, 255, 255),
+            surface_2: Color32::from_rgb(234, 238, 242),
+            surface_hover: Color32::from_rgb(218, 226, 234),
+            button_fill: Color32::from_rgb(246, 248, 250),
+            button_hover_fill: Color32::from_rgb(230, 237, 243),
+            button_active_fill: Color32::from_rgb(221, 235, 255),
+            button_outline: Color32::from_rgb(208, 215, 222),
+            tree_guide: Color32::from_rgb(208, 215, 222),
+            tree_joint: Color32::from_rgb(140, 149, 159),
+            accent: Color32::from_rgb(9, 105, 218),
+            primary_hover: Color32::from_rgb(9, 105, 218),
+            primary_container: Color32::from_rgb(221, 235, 255),
+            selected_fill: Color32::from_rgb(221, 235, 255),
+            text: Color32::from_rgb(31, 35, 40),
+            text_muted: Color32::from_rgb(87, 96, 106),
+            error: Color32::from_rgb(207, 34, 46),
+            warning: Color32::from_rgb(154, 103, 0),
+            success: Color32::from_rgb(26, 127, 55),
+        },
     }
 }
 
-fn apply_github_dark_style(style: &mut egui::Style) {
+fn current_palette() -> AppPalette {
+    palette_for_theme(current_gui_theme())
+}
+
+fn egui_theme_for(theme: GuiTheme) -> egui::Theme {
+    match theme {
+        GuiTheme::Dark => egui::Theme::Dark,
+        GuiTheme::Light => egui::Theme::Light,
+    }
+}
+
+fn system_theme_for(theme: GuiTheme) -> egui::SystemTheme {
+    match theme {
+        GuiTheme::Dark => egui::SystemTheme::Dark,
+        GuiTheme::Light => egui::SystemTheme::Light,
+    }
+}
+
+fn configure_visuals(ctx: &egui::Context) {
+    let theme = current_gui_theme();
+    ctx.set_theme(egui_theme_for(theme));
+    ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(system_theme_for(theme)));
+    if ctx.cumulative_pass_nr() <= 1 {
+        ctx.style_mut_of(egui::Theme::Dark, |style| {
+            apply_watchapi_style(style, GuiTheme::Dark)
+        });
+        ctx.style_mut_of(egui::Theme::Light, |style| {
+            apply_watchapi_style(style, GuiTheme::Light)
+        });
+    }
+}
+
+fn apply_watchapi_style(style: &mut egui::Style, theme: GuiTheme) {
+    let palette = palette_for_theme(theme);
     style.spacing.item_spacing = vec2(6.0, 5.0);
-    style.spacing.button_padding = vec2(9.0, 5.0);
+    style.spacing.button_padding = vec2(12.0, 5.0);
     style.spacing.interact_size.y = 28.0;
     style.spacing.menu_margin = Margin::symmetric(6, 4);
-    style.visuals = egui::Visuals::dark();
-    style.visuals.override_text_color = Some(md_text());
-    style.visuals.panel_fill = md_bg();
-    style.visuals.window_fill = md_canvas();
-    style.visuals.extreme_bg_color = md_surface_dim();
-    style.visuals.faint_bg_color = md_bg();
-    style.visuals.code_bg_color = md_canvas();
-    style.visuals.warn_fg_color = md_warning();
-    style.visuals.error_fg_color = md_error();
-    style.visuals.hyperlink_color = accent();
-    style.visuals.selection.bg_fill = selected_fill();
-    style.visuals.selection.stroke = Stroke::new(1.0, md_primary_hover());
-    style.visuals.widgets.noninteractive.bg_fill = md_bg();
-    style.visuals.widgets.noninteractive.weak_bg_fill = md_bg();
-    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(0.5, md_outline_faint());
+    style.visuals = egui_theme_for(theme).default_visuals();
+    style.visuals.override_text_color = Some(palette.text);
+    style.visuals.panel_fill = palette.bg;
+    style.visuals.window_fill = palette.canvas;
+    style.visuals.extreme_bg_color = palette.canvas;
+    style.visuals.faint_bg_color = palette.bg;
+    style.visuals.code_bg_color = palette.canvas;
+    style.visuals.warn_fg_color = palette.warning;
+    style.visuals.error_fg_color = palette.error;
+    style.visuals.hyperlink_color = palette.accent;
+    style.visuals.selection.bg_fill = palette.selected_fill;
+    style.visuals.selection.stroke = Stroke::new(1.0, palette.primary_hover);
+    style.visuals.widgets.noninteractive.bg_fill = palette.bg;
+    style.visuals.widgets.noninteractive.weak_bg_fill = palette.bg;
+    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(0.5, palette.bg);
     style.visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(8);
-    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, md_text());
-    style.visuals.widgets.inactive.bg_fill = md_surface_2();
-    style.visuals.widgets.inactive.weak_bg_fill = md_surface_2();
-    style.visuals.widgets.inactive.bg_stroke = Stroke::new(0.5, md_outline_faint());
-    style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(8);
-    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, md_text());
-    style.visuals.widgets.hovered.bg_fill = md_surface_hover();
-    style.visuals.widgets.hovered.weak_bg_fill = md_surface_hover();
-    style.visuals.widgets.hovered.bg_stroke = Stroke::new(0.8, md_primary_hover());
-    style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(8);
-    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, md_text());
-    style.visuals.widgets.active.bg_fill = selected_fill();
-    style.visuals.widgets.active.weak_bg_fill = selected_fill();
-    style.visuals.widgets.active.bg_stroke = Stroke::new(0.8, accent());
-    style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(8);
-    style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, md_text());
-    style.visuals.widgets.open.bg_fill = md_surface_hover();
-    style.visuals.widgets.open.weak_bg_fill = md_surface_hover();
-    style.visuals.widgets.open.bg_stroke = Stroke::new(0.8, accent());
-    style.visuals.widgets.open.corner_radius = egui::CornerRadius::same(8);
-    style.visuals.widgets.open.fg_stroke = Stroke::new(1.0, md_text());
-    style.visuals.text_cursor.stroke = Stroke::new(1.5, md_primary_hover());
-    style.visuals.window_stroke = Stroke::new(0.5, md_outline_faint());
+    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, palette.text);
+    style.visuals.widgets.inactive.bg_fill = palette.button_fill;
+    style.visuals.widgets.inactive.weak_bg_fill = palette.button_fill;
+    style.visuals.widgets.inactive.bg_stroke = Stroke::new(0.8, palette.button_outline);
+    style.visuals.widgets.inactive.corner_radius = md3_button_radius();
+    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, palette.text);
+    style.visuals.widgets.hovered.bg_fill = palette.button_hover_fill;
+    style.visuals.widgets.hovered.weak_bg_fill = palette.button_hover_fill;
+    style.visuals.widgets.hovered.bg_stroke = Stroke::new(0.9, palette.primary_hover);
+    style.visuals.widgets.hovered.corner_radius = md3_button_radius();
+    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, palette.text);
+    style.visuals.widgets.active.bg_fill = palette.button_active_fill;
+    style.visuals.widgets.active.weak_bg_fill = palette.button_active_fill;
+    style.visuals.widgets.active.bg_stroke = Stroke::new(0.8, palette.accent);
+    style.visuals.widgets.active.corner_radius = md3_button_radius();
+    style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, palette.text);
+    style.visuals.widgets.open.bg_fill = palette.surface_hover;
+    style.visuals.widgets.open.weak_bg_fill = palette.surface_hover;
+    style.visuals.widgets.open.bg_stroke = Stroke::new(0.8, palette.accent);
+    style.visuals.widgets.open.corner_radius = md3_button_radius();
+    style.visuals.widgets.open.fg_stroke = Stroke::new(1.0, palette.text);
+    style.visuals.text_cursor.stroke = Stroke::new(1.5, palette.primary_hover);
+    style.visuals.window_stroke = Stroke::new(0.5, palette.bg);
     style.visuals.window_corner_radius = egui::CornerRadius::same(4);
     style.visuals.window_shadow = egui::Shadow {
         offset: [0, 8],
@@ -11687,11 +12708,11 @@ fn paint_app_background(ctx: &egui::Context) {
 }
 
 fn md_bg() -> Color32 {
-    Color32::from_rgb(13, 17, 23)
+    current_palette().bg
 }
 
 fn md_canvas() -> Color32 {
-    Color32::from_rgb(1, 4, 9)
+    current_palette().canvas
 }
 
 fn md_selection_fill() -> Color32 {
@@ -11725,7 +12746,7 @@ fn terminal_blank_cell() -> watchapi_core::terminal_emulator::TerminalCellView {
 }
 
 fn terminal_background_color() -> Color32 {
-    md_canvas()
+    Color32::BLACK
 }
 
 fn terminal_emulator_default_background_color() -> Color32 {
@@ -11733,7 +12754,7 @@ fn terminal_emulator_default_background_color() -> Color32 {
 }
 
 fn terminal_default_foreground_color() -> Color32 {
-    md_text()
+    terminal_emulator_default_foreground_color()
 }
 
 fn terminal_emulator_default_foreground_color() -> Color32 {
@@ -12525,6 +13546,31 @@ fn terminal_cell_from_pos(
     })
 }
 
+fn terminal_view_absolute_row_start(view: &TerminalView) -> usize {
+    view.scrollback_lines.saturating_sub(view.display_offset)
+}
+
+fn terminal_view_row_to_absolute(view: &TerminalView, row: usize) -> Option<usize> {
+    (row < view.rows).then_some(terminal_view_absolute_row_start(view) + row)
+}
+
+fn terminal_absolute_row_to_view_row(view: &TerminalView, absolute_row: usize) -> Option<usize> {
+    let row_start = terminal_view_absolute_row_start(view);
+    absolute_row
+        .checked_sub(row_start)
+        .filter(|row| *row < view.rows)
+}
+
+fn terminal_selection_cell_from_view_cell(
+    cell: TerminalCellPos,
+    absolute_row_start: usize,
+) -> TerminalCellPos {
+    TerminalCellPos {
+        row: absolute_row_start + cell.row,
+        col: cell.col,
+    }
+}
+
 fn terminal_selection_bounds(selection: TerminalSelection) -> (TerminalCellPos, TerminalCellPos) {
     let start = selection.anchor;
     let end = selection.focus;
@@ -12568,7 +13614,9 @@ fn terminal_selection_row_bounds_for_view(
         return None;
     }
     let visible_cols = visible_cols.min(view.cols);
-    let (mut start, mut end) = terminal_selection_row_bounds(selection, row, visible_cols)?;
+    let absolute_row = terminal_view_row_to_absolute(view, row)?;
+    let (mut start, mut end) =
+        terminal_selection_row_bounds(selection, absolute_row, visible_cols)?;
     let row_offset = row * view.cols;
     if start > 0
         && view
@@ -12608,13 +13656,26 @@ fn terminal_selection_copy_start_col(view: &TerminalView, row: usize, col: usize
 
 fn terminal_selected_text(view: &TerminalView, selection: TerminalSelection) -> Option<String> {
     let (start, end) = terminal_selection_bounds(selection);
-    if start.row >= view.rows || end.row >= view.rows || view.cols == 0 {
+    if view.rows == 0 || view.cols == 0 {
+        return None;
+    }
+    let view_row_start = terminal_view_absolute_row_start(view);
+    let view_row_end = view_row_start + view.rows - 1;
+    let first_row = start.row.max(view_row_start);
+    let last_row = end.row.min(view_row_end);
+    if first_row > last_row {
         return None;
     }
     let mut out = String::new();
-    for row in start.row..=end.row {
-        let mut start_col = if row == start.row { start.col } else { 0 }.min(view.cols - 1);
-        let end_col = if row == end.row {
+    for absolute_row in first_row..=last_row {
+        let row = terminal_absolute_row_to_view_row(view, absolute_row)?;
+        let mut start_col = if absolute_row == start.row {
+            start.col
+        } else {
+            0
+        }
+        .min(view.cols - 1);
+        let end_col = if absolute_row == end.row {
             end.col
         } else {
             view.cols - 1
@@ -12638,13 +13699,13 @@ fn terminal_selected_text(view: &TerminalView, selection: TerminalSelection) -> 
             .cells
             .get(row * view.cols + view.cols - 1)
             .is_some_and(|cell| cell.wrapline);
-        let join_wrapped_row = row != end.row && full_row_selected && wrapped;
+        let join_wrapped_row = absolute_row != end.row && full_row_selected && wrapped;
         if join_wrapped_row {
             out.push_str(&line);
         } else {
             out.push_str(line.trim_end());
         }
-        if row != end.row && !join_wrapped_row {
+        if absolute_row != last_row && !join_wrapped_row {
             out.push('\n');
         }
     }
@@ -12655,10 +13716,14 @@ fn terminal_full_selection(view: &TerminalView) -> Option<TerminalSelection> {
     if view.rows == 0 || view.cols == 0 {
         return None;
     }
+    let absolute_row_start = terminal_view_absolute_row_start(view);
     Some(TerminalSelection {
-        anchor: TerminalCellPos { row: 0, col: 0 },
+        anchor: TerminalCellPos {
+            row: absolute_row_start,
+            col: 0,
+        },
         focus: TerminalCellPos {
-            row: view.rows - 1,
+            row: absolute_row_start + view.rows - 1,
             col: view.cols - 1,
         },
     })
@@ -12685,13 +13750,14 @@ fn terminal_visible_selection(
         return None;
     }
     let row_start = key.row_start.min(view.rows.saturating_sub(visible_rows));
+    let absolute_row_start = terminal_view_absolute_row_start(view) + row_start;
     Some(TerminalSelection {
         anchor: TerminalCellPos {
-            row: row_start,
+            row: absolute_row_start,
             col: 0,
         },
         focus: TerminalCellPos {
-            row: row_start + visible_rows - 1,
+            row: absolute_row_start + visible_rows - 1,
             col: visible_cols - 1,
         },
     })
@@ -12744,7 +13810,8 @@ fn terminal_word_selection(
     let index = cell.row * view.cols + col;
     let c = view.cells.get(index)?.c;
     if !terminal_word_char(c) {
-        let cell = TerminalCellPos { row: cell.row, col };
+        let row = terminal_view_row_to_absolute(view, cell.row)?;
+        let cell = TerminalCellPos { row, col };
         return Some(TerminalSelection {
             anchor: cell,
             focus: cell,
@@ -12781,11 +13848,11 @@ fn terminal_word_selection(
 
     Some(TerminalSelection {
         anchor: TerminalCellPos {
-            row: cell.row,
+            row: terminal_view_row_to_absolute(view, cell.row)?,
             col: start_col,
         },
         focus: TerminalCellPos {
-            row: cell.row,
+            row: terminal_view_row_to_absolute(view, cell.row)?,
             col: end_col,
         },
     })
@@ -13016,6 +14083,7 @@ fn terminal_keyboard_actions_for_events_with_modifiers(
     let has_explicit_terminal_clipboard_key = events
         .iter()
         .any(terminal_event_is_explicit_clipboard_or_control_key);
+    let alt_text_keys = terminal_alt_text_keys(events);
     for event in events {
         match event {
             egui::Event::Copy | egui::Event::Cut if has_explicit_terminal_clipboard_key => {}
@@ -13040,6 +14108,7 @@ fn terminal_keyboard_actions_for_events_with_modifiers(
             }
             egui::Event::Text(_) if *ime_preediting => {}
             egui::Event::Text(text) if Some(text.as_str()) == last_ime_commit_text => {}
+            egui::Event::Text(text) if terminal_text_matches_alt_key(text, &alt_text_keys) => {}
             egui::Event::Key {
                 key: Key::Enter,
                 pressed: true,
@@ -13065,6 +14134,74 @@ fn terminal_keyboard_actions_for_events_with_modifiers(
         }
     }
     actions
+}
+
+fn terminal_alt_text_keys(events: &[egui::Event]) -> HashSet<char> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } if terminal_normalized_modifiers(*modifiers).alt => terminal_key_ascii_char(*key),
+            _ => None,
+        })
+        .collect()
+}
+
+fn terminal_key_ascii_char(key: Key) -> Option<char> {
+    match key {
+        Key::A => Some('a'),
+        Key::B => Some('b'),
+        Key::C => Some('c'),
+        Key::D => Some('d'),
+        Key::E => Some('e'),
+        Key::F => Some('f'),
+        Key::G => Some('g'),
+        Key::H => Some('h'),
+        Key::I => Some('i'),
+        Key::J => Some('j'),
+        Key::K => Some('k'),
+        Key::L => Some('l'),
+        Key::M => Some('m'),
+        Key::N => Some('n'),
+        Key::O => Some('o'),
+        Key::P => Some('p'),
+        Key::Q => Some('q'),
+        Key::R => Some('r'),
+        Key::S => Some('s'),
+        Key::T => Some('t'),
+        Key::U => Some('u'),
+        Key::V => Some('v'),
+        Key::W => Some('w'),
+        Key::X => Some('x'),
+        Key::Y => Some('y'),
+        Key::Z => Some('z'),
+        Key::Num0 => Some('0'),
+        Key::Num1 => Some('1'),
+        Key::Num2 => Some('2'),
+        Key::Num3 => Some('3'),
+        Key::Num4 => Some('4'),
+        Key::Num5 => Some('5'),
+        Key::Num6 => Some('6'),
+        Key::Num7 => Some('7'),
+        Key::Num8 => Some('8'),
+        Key::Num9 => Some('9'),
+        _ => None,
+    }
+}
+
+fn terminal_text_matches_alt_key(text: &str, alt_text_keys: &HashSet<char>) -> bool {
+    if alt_text_keys.is_empty() {
+        return false;
+    }
+    let mut chars = text.chars();
+    let Some(ch) = chars.next() else {
+        return false;
+    };
+    chars.next().is_none() && alt_text_keys.contains(&ch.to_ascii_lowercase())
 }
 
 fn terminal_event_is_explicit_clipboard_or_control_key(event: &egui::Event) -> bool {
@@ -13865,6 +15002,14 @@ fn terminal_bracketed_paste_text(text: &str) -> String {
         .replace("\x1b[201~", "")
 }
 
+fn terminal_dropped_paths_text(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| format!("\"{}\"", path.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn ctrl_terminal_key_sequence(key: Key) -> Option<&'static str> {
     match key {
         Key::A => Some("\x01"),
@@ -13974,15 +15119,35 @@ fn md_surface() -> Color32 {
 }
 
 fn md_surface_2() -> Color32 {
-    Color32::from_rgb(16, 22, 29)
+    current_palette().surface_2
 }
 
 fn md_surface_hover() -> Color32 {
-    Color32::from_rgb(22, 27, 34)
+    current_palette().surface_hover
 }
 
 fn md_surface_dim() -> Color32 {
     md_canvas()
+}
+
+fn md3_button_radius() -> egui::CornerRadius {
+    egui::CornerRadius::same(MD3_BUTTON_RADIUS)
+}
+
+fn md_button_fill() -> Color32 {
+    current_palette().button_fill
+}
+
+fn md_button_hover_fill() -> Color32 {
+    current_palette().button_hover_fill
+}
+
+fn md_button_active_fill() -> Color32 {
+    current_palette().button_active_fill
+}
+
+fn md_button_outline() -> Color32 {
+    current_palette().button_outline
 }
 
 fn md_outline_soft() -> Color32 {
@@ -13994,35 +15159,35 @@ fn md_outline_faint() -> Color32 {
 }
 
 fn config_tree_guide_color() -> Color32 {
-    Color32::from_rgb(48, 54, 61)
+    current_palette().tree_guide
 }
 
 fn config_tree_joint_color() -> Color32 {
-    Color32::from_rgb(88, 96, 105)
+    current_palette().tree_joint
 }
 
 fn accent() -> Color32 {
-    Color32::from_rgb(47, 129, 247)
+    current_palette().accent
 }
 
 fn md_primary_hover() -> Color32 {
-    Color32::from_rgb(88, 166, 255)
+    current_palette().primary_hover
 }
 
 fn md_primary_container() -> Color32 {
-    Color32::from_rgb(31, 111, 235)
+    current_palette().primary_container
 }
 
 fn selected_fill() -> Color32 {
-    Color32::from_rgb(12, 45, 107)
+    current_palette().selected_fill
 }
 
 fn md_text() -> Color32 {
-    Color32::from_rgb(230, 237, 243)
+    current_palette().text
 }
 
 fn md_text_muted() -> Color32 {
-    Color32::from_rgb(132, 141, 151)
+    current_palette().text_muted
 }
 
 fn muted() -> Color32 {
@@ -14030,15 +15195,15 @@ fn muted() -> Color32 {
 }
 
 fn md_error() -> Color32 {
-    Color32::from_rgb(248, 81, 73)
+    current_palette().error
 }
 
 fn md_warning() -> Color32 {
-    Color32::from_rgb(210, 153, 34)
+    current_palette().warning
 }
 
 fn md_success() -> Color32 {
-    Color32::from_rgb(63, 185, 80)
+    current_palette().success
 }
 
 fn app_panel_frame() -> Frame {
@@ -14138,6 +15303,7 @@ enum ToolButtonIcon {
     Delete,
     Edit,
     Refresh,
+    Settings,
     Folder,
     File,
     ImportFile,
@@ -14395,6 +15561,16 @@ fn paint_tool_button_icon(
                 ],
                 stroke,
             );
+        }
+        ToolButtonIcon::Settings => {
+            painter.circle_stroke(center, 4.0, Stroke::new(1.2, color));
+            painter.circle_filled(center, 1.4, color);
+            for (x, y) in [(0.0, -5.4), (0.0, 5.4), (-5.4, 0.0), (5.4, 0.0)] {
+                let direction = vec2(x, y).normalized();
+                let outer = center + vec2(x, y);
+                let inner = center + direction * 3.2;
+                painter.line_segment([inner, outer], stroke);
+            }
         }
         ToolButtonIcon::Folder | ToolButtonIcon::ImportFolder => {
             let top = center.y - 4.0;
@@ -14946,6 +16122,278 @@ fn paint_proxy_list_item_text(
     );
 }
 
+fn paint_config_status_badge(
+    ui: &egui::Ui,
+    row_rect: Rect,
+    status: &str,
+    terminal_running: bool,
+    status_is_error: bool,
+) {
+    let (fill, stroke, text_color) =
+        config_status_badge_colors(status, terminal_running, status_is_error);
+    let font_id = FontId::proportional(12.0);
+    let text_width = ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(status.to_string(), font_id.clone(), text_color)
+            .rect
+            .width()
+    });
+    let badge_width =
+        (text_width + CONFIG_STATUS_BADGE_PADDING_X * 2.0).clamp(34.0, CONFIG_STATUS_BADGE_W);
+    let badge_rect = Rect::from_center_size(
+        pos2(
+            row_rect.right() - badge_width * 0.5 - 4.0,
+            row_rect.center().y,
+        ),
+        vec2(badge_width, CONFIG_STATUS_BADGE_H),
+    );
+    let painter = ui.painter().with_clip_rect(row_rect);
+    painter.rect_filled(badge_rect, CONFIG_STATUS_BADGE_H * 0.5, fill);
+    painter.rect_stroke(
+        badge_rect,
+        CONFIG_STATUS_BADGE_H * 0.5,
+        Stroke::new(0.8, stroke),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        badge_rect.center(),
+        Align2::CENTER_CENTER,
+        status,
+        font_id,
+        text_color,
+    );
+}
+
+fn render_status_chip(ui: &mut egui::Ui, chip: &StatusChip) -> egui::Response {
+    let (fill, stroke, text_color) = status_chip_colors(&chip.tone);
+    let text = RichText::new(chip.text.as_str()).small().color(text_color);
+    ui.add(
+        egui::Button::new(text)
+            .fill(fill)
+            .stroke(Stroke::new(0.8, stroke))
+            .corner_radius(egui::CornerRadius::same(11))
+            .frame(true),
+    )
+    .on_hover_text(chip.text.clone())
+}
+
+fn render_table_status_badge(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
+    let text = text.into();
+    if text.trim().is_empty() {
+        return endpoint_table_cell(ui, "");
+    }
+    let chip = table_status_chip(text);
+    render_compact_status_chip(
+        ui,
+        &chip,
+        TABLE_STATUS_CHIP_HEIGHT,
+        TABLE_STATUS_CHIP_RADIUS,
+        TABLE_STATUS_CHIP_PADDING_X,
+    )
+}
+
+fn render_compact_status_chip(
+    ui: &mut egui::Ui,
+    chip: &StatusChip,
+    height: f32,
+    radius: u8,
+    padding_x: f32,
+) -> egui::Response {
+    let (fill, stroke, text_color) = status_chip_colors(&chip.tone);
+    let font_id = FontId::proportional(12.0);
+    let galley =
+        ui.fonts(|fonts| fonts.layout_no_wrap(chip.text.clone(), font_id.clone(), text_color));
+    let available_width = ui.available_width().max(TABLE_STATUS_CHIP_MIN_WIDTH);
+    let chip_width =
+        (galley.rect.width() + padding_x * 2.0).clamp(TABLE_STATUS_CHIP_MIN_WIDTH, available_width);
+    let (rect, response) = ui.allocate_exact_size(vec2(chip_width, height), Sense::hover());
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect_filled(rect, egui::CornerRadius::same(radius), fill);
+    painter.rect_stroke(
+        rect,
+        egui::CornerRadius::same(radius),
+        Stroke::new(0.7, stroke),
+        egui::StrokeKind::Inside,
+    );
+    let text_rect = rect.shrink2(vec2(TABLE_STATUS_CHIP_TEXT_LEFT_PADDING, 0.0));
+    let display_text = table_status_chip_display_text(
+        ui,
+        chip.text.as_str(),
+        &font_id,
+        text_color,
+        text_rect.width().max(0.0),
+    );
+    painter.text(
+        text_rect.left_center(),
+        Align2::LEFT_CENTER,
+        display_text,
+        font_id,
+        text_color,
+    );
+    response.on_hover_text(chip.text.as_str())
+}
+
+fn table_status_chip_display_text(
+    ui: &egui::Ui,
+    text: &str,
+    font_id: &FontId,
+    color: Color32,
+    max_width: f32,
+) -> String {
+    if max_width <= 0.0 {
+        return String::new();
+    }
+    let full_width = ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(text.to_string(), font_id.clone(), color)
+            .rect
+            .width()
+    });
+    if full_width <= max_width {
+        return text.to_string();
+    }
+    let ellipsis = "...";
+    let ellipsis_width = ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(ellipsis.to_string(), font_id.clone(), color)
+            .rect
+            .width()
+    });
+    if ellipsis_width >= max_width {
+        return ellipsis.to_string();
+    }
+    let mut out = String::new();
+    for ch in text.chars() {
+        let candidate = format!("{out}{ch}{ellipsis}");
+        let width = ui.fonts(|fonts| {
+            fonts
+                .layout_no_wrap(candidate.clone(), font_id.clone(), color)
+                .rect
+                .width()
+        });
+        if width > max_width {
+            break;
+        }
+        out.push(ch);
+    }
+    if out.is_empty() {
+        ellipsis.to_string()
+    } else {
+        out.push_str(ellipsis);
+        out
+    }
+}
+
+fn table_status_chip(text: String) -> StatusChip {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        StatusChip::muted("-")
+    } else if status_has_error_marker(trimmed)
+        || trimmed.contains("失败")
+        || trimmed.contains("污染")
+        || trimmed.contains("禁用")
+    {
+        StatusChip::error(trimmed)
+    } else if trimmed.contains("暂停")
+        || trimmed.contains("待")
+        || trimmed.contains("需")
+        || trimmed.contains("冷却")
+    {
+        StatusChip::warning(trimmed)
+    } else if trimmed.contains("正常")
+        || trimmed.contains("运行")
+        || trimmed.eq_ignore_ascii_case("ok")
+        || trimmed == "是"
+    {
+        StatusChip::success(trimmed)
+    } else {
+        StatusChip::neutral(trimmed)
+    }
+}
+
+fn config_status_badge_colors(
+    status: &str,
+    terminal_running: bool,
+    status_is_error: bool,
+) -> (Color32, Color32, Color32) {
+    if status_is_error {
+        return status_chip_colors(&StatusChipTone::Error);
+    }
+    match status {
+        "运行中" => status_chip_colors(&StatusChipTone::Success),
+        "暂停中" | "完成暂停" => status_chip_colors(&StatusChipTone::Warning),
+        "Goal中" | "启动中" => status_chip_colors(&StatusChipTone::Accent),
+        "已停止" if !terminal_running => status_chip_colors(&StatusChipTone::Muted),
+        _ if terminal_running => status_chip_colors(&StatusChipTone::Success),
+        _ => status_chip_colors(&StatusChipTone::Muted),
+    }
+}
+
+fn status_chip_colors(tone: &StatusChipTone) -> (Color32, Color32, Color32) {
+    match tone {
+        StatusChipTone::Accent => (
+            Color32::from_rgba_unmultiplied(accent().r(), accent().g(), accent().b(), 30),
+            Color32::from_rgba_unmultiplied(accent().r(), accent().g(), accent().b(), 150),
+            md_primary_hover(),
+        ),
+        StatusChipTone::Success => (
+            Color32::from_rgba_unmultiplied(
+                md_success().r(),
+                md_success().g(),
+                md_success().b(),
+                30,
+            ),
+            Color32::from_rgba_unmultiplied(
+                md_success().r(),
+                md_success().g(),
+                md_success().b(),
+                150,
+            ),
+            md_success(),
+        ),
+        StatusChipTone::Warning => (
+            Color32::from_rgba_unmultiplied(
+                md_warning().r(),
+                md_warning().g(),
+                md_warning().b(),
+                28,
+            ),
+            Color32::from_rgba_unmultiplied(
+                md_warning().r(),
+                md_warning().g(),
+                md_warning().b(),
+                145,
+            ),
+            md_warning(),
+        ),
+        StatusChipTone::Error => (
+            Color32::from_rgba_unmultiplied(md_error().r(), md_error().g(), md_error().b(), 28),
+            Color32::from_rgba_unmultiplied(md_error().r(), md_error().g(), md_error().b(), 150),
+            md_error(),
+        ),
+        StatusChipTone::Muted => (
+            Color32::from_rgba_unmultiplied(muted().r(), muted().g(), muted().b(), 18),
+            Color32::from_rgba_unmultiplied(muted().r(), muted().g(), muted().b(), 80),
+            muted(),
+        ),
+        StatusChipTone::Neutral => (
+            Color32::from_rgba_unmultiplied(
+                md_text_muted().r(),
+                md_text_muted().g(),
+                md_text_muted().b(),
+                20,
+            ),
+            Color32::from_rgba_unmultiplied(
+                md_text_muted().r(),
+                md_text_muted().g(),
+                md_text_muted().b(),
+                88,
+            ),
+            md_text(),
+        ),
+    }
+}
+
 fn config_status_label_is_error(status: &str) -> bool {
     status == "异常"
 }
@@ -15089,6 +16537,79 @@ struct EndpointTableColumn {
     min_width: f32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StatusChipTone {
+    Accent,
+    Success,
+    Warning,
+    Error,
+    Muted,
+    Neutral,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusChip {
+    text: String,
+    tone: StatusChipTone,
+}
+
+impl StatusChip {
+    fn accent(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tone: StatusChipTone::Accent,
+        }
+    }
+
+    fn success(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tone: StatusChipTone::Success,
+        }
+    }
+
+    fn warning(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tone: StatusChipTone::Warning,
+        }
+    }
+
+    fn error(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tone: StatusChipTone::Error,
+        }
+    }
+
+    fn muted(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tone: StatusChipTone::Muted,
+        }
+    }
+
+    fn neutral(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tone: StatusChipTone::Neutral,
+        }
+    }
+
+    fn for_runtime_status(status: impl Into<String>) -> Self {
+        let status = status.into();
+        if status_has_error_marker(&status) {
+            Self::error(status)
+        } else if status.contains("暂停") {
+            Self::warning(status)
+        } else if status.contains("运行") || status.contains("空闲") {
+            Self::success(status)
+        } else {
+            Self::neutral(status)
+        }
+    }
+}
+
 const AUTO_RESTART_MAX_ATTEMPTS: u32 = 3;
 const AUTO_RESTART_DELAY: Duration = Duration::from_secs(5);
 const PROXY_LIST_SCROLL_ID: &str = "watch_proxy_list_scroll";
@@ -15099,11 +16620,6 @@ const ENDPOINT_TABLE_COLUMNS: &[EndpointTableColumn] = &[
         heading: "启用",
         initial_width: 42.0,
         min_width: 36.0,
-    },
-    EndpointTableColumn {
-        heading: "强探",
-        initial_width: 34.0,
-        min_width: 28.0,
     },
     EndpointTableColumn {
         heading: "固定",
@@ -15189,6 +16705,88 @@ const ENDPOINT_TABLE_COLUMNS: &[EndpointTableColumn] = &[
 
 fn endpoint_table_columns() -> &'static [EndpointTableColumn] {
     ENDPOINT_TABLE_COLUMNS
+}
+
+fn endpoint_table_columns_for_rows(
+    ui: &egui::Ui,
+    rows: &[EndpointTableRow],
+) -> Vec<EndpointTableColumn> {
+    let mut columns = endpoint_table_columns().to_vec();
+    widen_endpoint_status_column(
+        ui,
+        rows,
+        &mut columns,
+        "请求状态",
+        endpoint_row_request_status,
+    );
+    widen_endpoint_status_column(
+        ui,
+        rows,
+        &mut columns,
+        "运行状态",
+        endpoint_row_runtime_status,
+    );
+    widen_endpoint_status_column(ui, rows, &mut columns, "状态码", endpoint_row_status_code);
+    columns
+}
+
+fn widen_endpoint_status_column(
+    ui: &egui::Ui,
+    rows: &[EndpointTableRow],
+    columns: &mut [EndpointTableColumn],
+    heading: &str,
+    text_for_row: fn(&EndpointTableRow) -> Option<&str>,
+) {
+    let Some(column) = columns.iter_mut().find(|column| column.heading == heading) else {
+        return;
+    };
+    let font_id = FontId::proportional(12.0);
+    let max_text_width = rows
+        .iter()
+        .filter_map(text_for_row)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| {
+            ui.fonts(|fonts| {
+                fonts
+                    .layout_no_wrap(text.to_string(), font_id.clone(), Color32::WHITE)
+                    .rect
+                    .width()
+            })
+        })
+        .fold(0.0_f32, f32::max);
+    if max_text_width <= 0.0 {
+        return;
+    }
+    let desired_width = max_text_width + TABLE_STATUS_CHIP_PADDING_X * 2.0 + 14.0;
+    column.initial_width = column.initial_width.max(desired_width.min(320.0));
+}
+
+fn endpoint_row_request_status(row: &EndpointTableRow) -> Option<&str> {
+    match row {
+        EndpointTableRow::Runtime(row) => Some(row.request_status.as_str()),
+        EndpointTableRow::Config(endpoint) => Some(if endpoint.enabled {
+            "待探测"
+        } else {
+            "已禁用"
+        }),
+        EndpointTableRow::PendingConfig(_) => Some("需重启生效"),
+    }
+}
+
+fn endpoint_row_runtime_status(row: &EndpointTableRow) -> Option<&str> {
+    match row {
+        EndpointTableRow::Runtime(row) => Some(row.runtime_state.as_str()),
+        EndpointTableRow::PendingConfig(_) => Some("未加载"),
+        EndpointTableRow::Config(_) => None,
+    }
+}
+
+fn endpoint_row_status_code(row: &EndpointTableRow) -> Option<&str> {
+    match row {
+        EndpointTableRow::Runtime(row) => Some(row.last_status_code.as_str()),
+        EndpointTableRow::Config(_) | EndpointTableRow::PendingConfig(_) => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -15315,11 +16913,114 @@ fn centered_singleline<'a>(text: &'a mut String) -> TextEdit<'a> {
     TextEdit::singleline(text).vertical_align(Align::Center)
 }
 
+fn external_application_name(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("外部应用")
+        .to_string()
+}
+
+fn external_application_is_command_script(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("bat") || extension.eq_ignore_ascii_case("cmd")
+        })
+}
+
 fn top_nav_button(text: impl Into<WidgetText>, selected: bool) -> egui::Button<'static> {
+    let fill = if selected {
+        md_button_active_fill()
+    } else {
+        md_button_fill()
+    };
+    let stroke = if selected {
+        Stroke::new(1.0, md_primary_hover())
+    } else {
+        Stroke::new(0.8, md_button_outline())
+    };
     egui::Button::new(text)
         .selected(selected)
-        .min_size(vec2(TOP_NAV_BUTTON_W, 0.0))
+        .fill(fill)
+        .stroke(stroke)
+        .corner_radius(md3_button_radius())
+        .min_size(vec2(TOP_NAV_BUTTON_W, TOP_NAV_BUTTON_H))
         .wrap()
+}
+
+fn render_top_nav_segmented(
+    ui: &mut egui::Ui,
+    id_source: &'static str,
+    segments: &[TopNavSegment],
+    selected_index: usize,
+) -> Option<MainPage> {
+    if segments.is_empty() {
+        return None;
+    }
+
+    let nav_width = TOP_NAV_BUTTON_W * segments.len() as f32;
+    let nav_size = vec2(nav_width, TOP_NAV_BUTTON_H);
+    let (rect, _) = ui.allocate_exact_size(nav_size, Sense::hover());
+    let radius = md3_button_radius();
+    ui.painter().rect_filled(rect, radius, md_surface_dim());
+    ui.painter().rect_stroke(
+        rect,
+        radius,
+        Stroke::new(0.8, md_button_outline()),
+        egui::StrokeKind::Inside,
+    );
+
+    let segment_width = rect.width() / segments.len() as f32;
+    let mut clicked = None;
+    for (index, segment) in segments.iter().enumerate() {
+        let left = rect.left() + segment_width * index as f32;
+        let right = if index + 1 == segments.len() {
+            rect.right()
+        } else {
+            left + segment_width
+        };
+        let segment_rect = Rect::from_min_max(pos2(left, rect.top()), pos2(right, rect.bottom()));
+        let response = ui.interact(
+            segment_rect,
+            ui.id().with(id_source).with(index),
+            Sense::click(),
+        );
+        if response.clicked() {
+            clicked = Some(segment.page);
+        }
+
+        let selected = index == selected_index;
+        let fill = if selected {
+            md_button_active_fill()
+        } else if response.hovered() {
+            md_button_hover_fill()
+        } else {
+            Color32::TRANSPARENT
+        };
+        if fill != Color32::TRANSPARENT {
+            ui.painter()
+                .rect_filled(segment_rect.shrink(2.0), egui::CornerRadius::same(6), fill);
+        }
+        if index > 0 {
+            let x = segment_rect.left();
+            ui.painter().line_segment(
+                [pos2(x, rect.top() + 5.0), pos2(x, rect.bottom() - 5.0)],
+                Stroke::new(0.8, md_button_outline()),
+            );
+        }
+
+        let text_color = if selected { md_text() } else { md_text_muted() };
+        ui.painter().text(
+            segment_rect.center(),
+            Align2::CENTER_CENTER,
+            segment.label,
+            FontId::proportional(13.0),
+            text_color,
+        );
+    }
+
+    clicked
 }
 
 fn compare_proxy_key_rows(left: &SmartProxyKeyRow, right: &SmartProxyKeyRow) -> std::cmp::Ordering {
@@ -16374,6 +18075,12 @@ const GLOBAL_AGENT_FIELDS: &[GlobalFieldSpec] = &[
     },
 ];
 
+const GLOBAL_CODEX_FIELDS: &[GlobalFieldSpec] = &[GlobalFieldSpec {
+    key: "codex_model_context_window",
+    label: "上下文长度",
+    hint: "写入 Codex 的 model_context_window；留空时使用模型默认上下文窗口。",
+}];
+
 const GLOBAL_PROBE_FIELDS: &[GlobalFieldSpec] = &[
     GlobalFieldSpec {
         key: "probe_expected_text",
@@ -16409,6 +18116,10 @@ const GLOBAL_FIELD_GROUPS: &[GlobalFieldGroup] = &[
         fields: GLOBAL_AGENT_FIELDS,
     },
     GlobalFieldGroup {
+        title: "Codex",
+        fields: GLOBAL_CODEX_FIELDS,
+    },
+    GlobalFieldGroup {
         title: "探测配置",
         fields: GLOBAL_PROBE_FIELDS,
     },
@@ -16428,6 +18139,10 @@ const WORKSPACE_DEFAULT_FIELD_GROUPS: &[GlobalFieldGroup] = &[
         fields: GLOBAL_POLLUTION_FIELDS,
     },
     GlobalFieldGroup {
+        title: "Codex",
+        fields: GLOBAL_CODEX_FIELDS,
+    },
+    GlobalFieldGroup {
         title: "探测配置",
         fields: GLOBAL_PROBE_FIELDS,
     },
@@ -16438,16 +18153,22 @@ const WORKSPACE_DEFAULT_EXTRA_KEYS: &[&str] = &[
     "auto_prompt",
     "polluted_response_keywords",
     "completion_pause_keywords",
+    "continuation_trigger_rules",
 ];
 
 const AGENT_DRIVER_OPTIONS: &[&str] = &["codex", "claude-code", "opencode", "generic"];
-const REASONING_EFFORT_OPTIONS: &[&str] = &["low", "medium", "high", "xhigh"];
+const REASONING_EFFORT_OPTIONS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
 const SERVICE_TIER_OPTIONS: &[&str] = &["", "auto", "default", "flex", "priority", "fast"];
 const PROMPT_SUBMIT_SEQUENCE_OPTIONS: &[&str] = &["control-m", "cr", "crlf", "lf"];
 const MODEL_OPTIONS: &[&str] = &[
+    "gpt-5.6",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
     "gpt-5.5",
     "gpt-5.4",
     "gpt-5.4-mini",
+    "gpt-5.4-nano",
     "gpt-5.3-codex",
     "gpt-5.2",
     "claude-sonnet-4-5",
@@ -16831,7 +18552,7 @@ fn default_config_data() -> Value {
         "fallback_idle_seconds": 180,
         "fallback_prompt": "继续围绕当前 /goal 推进。如果目标已完成，请说明完成证据；否则继续下一步。"
     });
-    json!({
+    let mut data = json!({
         "config_name": "新配置",
         "agent_id": "default",
         "probe_interval_seconds": 1,
@@ -16864,6 +18585,7 @@ fn default_config_data() -> Value {
         "probe_path": "/v1/responses",
         "polluted_response_keywords": [],
         "completion_pause_keywords": ["任务完成", "测试通过", "没有剩余任务"],
+        "continuation_trigger_rules": [],
         "workdir": std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).to_string_lossy(),
         "continuation_mode": "auto",
         "agent_goal": agent_goal,
@@ -16873,7 +18595,9 @@ fn default_config_data() -> Value {
             "provider": "high",
             "enabled": true
         }]
-    })
+    });
+    data["codex_model_context_window"] = Value::Null;
+    data
 }
 
 fn workspace_default_config_data() -> Value {
@@ -16938,6 +18662,7 @@ fn blank_provider() -> Value {
         "base_url": "http://127.0.0.1:8787/v1",
         "api_key": "replace-with-api-key",
         "model": "gpt-5.4",
+        "probe_model": "",
         "reasoning_effort": "high",
         "service_tier": "fast",
         "weight": 100,
@@ -16959,6 +18684,7 @@ fn default_guard_proxy_json() -> Value {
         "fallback_models": [],
         "remove_keywords": [],
         "fail_keywords": ["余额不足", "quota exceeded", "insufficient quota"],
+        "builtin_high_risk_rules": watchapi_core::pollution::default_high_risk_rules(),
         "redact_phone": false,
         "redact_email": false,
         "redact_url": false,
@@ -17151,6 +18877,31 @@ fn load_provider_json_for_config(config_path: &Path) -> Value {
         .unwrap_or_else(default_provider_library_data)
 }
 
+fn save_provider_json_at_path(path: &Path, value: &Value) -> Result<(), String> {
+    validate_provider_json(value)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let text = serde_json::to_string_pretty(value)
+        .map(|text| text + "\n")
+        .map_err(|err| err.to_string())?;
+    write_text_atomic(path, &text).map_err(|err| err.to_string())
+}
+
+fn restore_provider_library_file_snapshot(
+    path: &Path,
+    previous_text: &Option<String>,
+) -> std::io::Result<()> {
+    match previous_text {
+        Some(text) => write_text_atomic(path, text),
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        },
+    }
+}
+
 fn load_global_provider_json() -> Value {
     std::fs::read_to_string(global_provider_library_path())
         .ok()
@@ -17172,15 +18923,7 @@ fn load_global_provider_json_with_config_fallback(config_path: &Path) -> Value {
 }
 
 fn save_provider_json_for_config(config_path: &Path, value: &Value) -> Result<(), String> {
-    validate_provider_json(value)?;
-    let path = provider_library_path_for_config(config_path);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    let text = serde_json::to_string_pretty(value)
-        .map(|text| text + "\n")
-        .map_err(|err| err.to_string())?;
-    write_text_atomic(&path, &text).map_err(|err| err.to_string())
+    save_provider_json_at_path(&provider_library_path_for_config(config_path), value)
 }
 
 fn save_global_provider_json(value: &Value) -> Result<(), String> {
@@ -17482,6 +19225,14 @@ fn set_json_scalar(root: &mut Value, key: &str, text: &str) {
     root[key] = parse_scalar(text);
 }
 
+fn set_optional_json_scalar(root: &mut Value, key: &str, text: &str) {
+    if text.trim().is_empty() {
+        root[key] = Value::Null;
+    } else {
+        root[key] = parse_scalar(text);
+    }
+}
+
 fn set_object_scalar(object: &mut Value, key: &str, text: &str) {
     object[key] = parse_scalar(text);
 }
@@ -17588,7 +19339,11 @@ fn render_workspace_default_field_row(
             );
         });
         if value != value_to_string(data.get(key)) {
-            set_json_scalar(data, key, &value);
+            if key == "codex_model_context_window" {
+                set_optional_json_scalar(data, key, &value);
+            } else {
+                set_json_scalar(data, key, &value);
+            }
         }
     }
     ui.add_space(8.0);
@@ -17649,6 +19404,121 @@ fn render_workspace_default_keyword_block(
         data[key] = json!(split_lines(&text));
     }
     ui.add_space(8.0);
+}
+
+fn render_continuation_trigger_rules(ui: &mut egui::Ui, data: &mut Value) {
+    config_param_hint(
+        ui,
+        "每条规则的关键词使用 Rust 正则语法，每行一条。命中正则数占全部正则数的比例达到阈值时，下一次自动续航仅发送一次该提示词；多条命中时按列表顺序优先第一条。保存配置时会校验正则。",
+    );
+    ui.add_space(4.0);
+
+    if !data
+        .get("continuation_trigger_rules")
+        .is_some_and(Value::is_array)
+    {
+        data["continuation_trigger_rules"] = json!([]);
+    }
+
+    let mut add_rule = false;
+    let mut remove_rule = None;
+    let rules = data["continuation_trigger_rules"]
+        .as_array_mut()
+        .expect("continuation trigger rules should be an array");
+
+    for (index, rule) in rules.iter_mut().enumerate() {
+        if !rule.is_object() {
+            *rule = default_continuation_trigger_rule_json();
+        }
+        inset_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("规则 {}", index + 1)).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if circular_tool_button(ui, "删除规则", ToolButtonIcon::Delete, true).clicked()
+                    {
+                        remove_rule = Some(index);
+                    }
+                });
+            });
+            ui.add_space(4.0);
+
+            ui.label(RichText::new("正则关键词（每行一条）").strong());
+            let mut keywords = json_array_to_lines(rule.get("keywords"));
+            if ui
+                .add_sized(
+                    [ui.available_width().max(180.0), (3.0_f32 * 22.0).max(66.0)],
+                    TextEdit::multiline(&mut keywords).desired_rows(3),
+                )
+                .changed()
+            {
+                rule["keywords"] = json!(split_lines(&keywords));
+            }
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("命中比例").strong());
+                let mut percent = rule
+                    .get("threshold")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.35)
+                    .mul_add(100.0, 0.0)
+                    .clamp(0.0, 100.0);
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut percent)
+                            .range(0.0..=100.0)
+                            .speed(1.0)
+                            .suffix("%"),
+                    )
+                    .changed()
+                {
+                    rule["threshold"] = json!(percent / 100.0);
+                }
+            });
+
+            ui.add_space(4.0);
+            ui.label(RichText::new("触发提示词（仅下一次自动续航发送一次）").strong());
+            let mut prompt = rule
+                .get("prompt")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if ui
+                .add_sized(
+                    [ui.available_width().max(180.0), (4.0_f32 * 22.0).max(88.0)],
+                    TextEdit::multiline(&mut prompt).desired_rows(4),
+                )
+                .changed()
+            {
+                rule["prompt"] = json!(prompt);
+            }
+        });
+        ui.add_space(6.0);
+    }
+
+    ui.horizontal(|ui| {
+        if circular_add_button(ui, "添加一次性续航规则").clicked() {
+            add_rule = true;
+        }
+        if rules.is_empty() {
+            ui.label(RichText::new("尚未配置规则").color(muted()));
+        }
+    });
+
+    if let Some(index) = remove_rule {
+        rules.remove(index);
+    }
+    if add_rule {
+        rules.push(default_continuation_trigger_rule_json());
+    }
+}
+
+fn default_continuation_trigger_rule_json() -> Value {
+    json!({
+        "keywords": [],
+        "threshold": 0.35,
+        "prompt": ""
+    })
 }
 
 fn render_guard_proxy_fields(
@@ -17814,6 +19684,16 @@ fn render_guard_proxy_fields(
     edit_guard_multiline_cell(
         ui,
         guard,
+        "builtin_high_risk_rules",
+        "内置高危规则",
+        "每行一个规则 ID；清空即关闭",
+        6,
+        text_cell_width,
+    );
+    ui.add_space(6.0);
+    edit_guard_multiline_cell(
+        ui,
+        guard,
         "fallback_models",
         "降级模型",
         "每行一个",
@@ -17947,6 +19827,9 @@ fn guard_field_hint(key: &str) -> &'static str {
         "max_tokens" => "请求改写字段。正数会统一限制输出 token；-1 会移除原请求里的 token 限制；留空不覆盖原请求。",
         "remove_keywords" => "过滤关键词。用于污染检测；response_rewrite_enabled 开启且模式允许改写时，会从成功响应文本里删除这些词。",
         "fail_keywords" => "失败关键词。用于污染检测；filter_and_fail 会立即记污染失败，observe_then_fail 会原样透传到连续阈值后失败。",
+        "builtin_high_risk_rules" => {
+            "hybrid 模式的内置高危规则列表。每行一个规则 ID；清空后保护层不再使用任何内置规则，只剩过滤关键词和失败关键词。URL/外链相关规则包括 external-contact、external-exfiltration、context-exfiltration、dangerous-link-scheme；URL 脱敏仍只受 URL 脱敏开关控制。"
+        }
         "fallback_models" => "降级模型列表。保护层内部第 2 次及之后上游尝试可按行替换 model；observe_then_fail 的污染计数不使用它。",
         "anti_injection_prefix" => "请求改写字段。非空时写入上游请求的系统/指令内容前面，用来约束模型忽略响应里的外部指令。",
         "system_prompt_suffix" => "请求改写字段。非空时和防注入前缀一起写入上游请求的系统/指令内容；留空不改。",
@@ -17959,7 +19842,7 @@ fn guard_combo_option_hint(key: &str, value: &str) -> &'static str {
         ("rule_group", "strict") => "当前预设 strict：默认启用失败关键词、请求防注入和失败记录；过滤关键词和脱敏都需单独配置。",
         ("rule_group", "lenient") => "当前预设 lenient：默认更宽松，不启用失败关键词；过滤关键词和脱敏都需单独配置。",
         ("rule_group", "observe") => "当前预设 observe：默认只观察响应风险，不改写成功响应、不把命中立即判失败。",
-        ("detection_mode", "hybrid") => "当前检测 hybrid：配置关键词和内置高危规则都会参与判断，适合需要兜住未知污染样式。",
+        ("detection_mode", "hybrid") => "当前检测 hybrid：配置关键词和“内置高危规则”列表都会参与判断；清空内置高危规则列表后，不再使用隐藏规则。",
         ("detection_mode", "keywords_only") => "当前检测 keywords_only：只按配置的过滤关键词和失败关键词判断，内置高危规则不参与。",
         ("mode", "filter_and_fail") => "当前模式 filter_and_fail：失败关键词命中立即记录污染失败；高风险连续到阈值也记录污染失败，并按改写开关决定替换响应或返回本地错误。",
         ("mode", "observe_then_fail") => "当前模式 observe_then_fail：前 N-1 次风险命中原样透传只计数；第 N 次返回本地错误/SSE error 并记录一次污染失败，N 是连续高危次数。",
@@ -18121,6 +20004,7 @@ fn endpoint_field_label(key: &str) -> String {
         "base_url" => "URL".to_string(),
         "api_key" => "Key".to_string(),
         "model" => "模型".to_string(),
+        "probe_model" => "探测模型".to_string(),
         "reasoning_effort" => "思考等级".to_string(),
         "service_tier" => "服务档位".to_string(),
         "weight" => "权重".to_string(),
@@ -18129,12 +20013,171 @@ fn endpoint_field_label(key: &str) -> String {
     }
 }
 
+fn probe_model_status_label(endpoint: &EndpointConfig) -> String {
+    endpoint
+        .probe_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(|model| format!("探测模型 {model}"))
+        .unwrap_or_else(|| "自动最低价探测模型".to_string())
+}
+
+fn format_connection_test_result(
+    endpoint_name: &str,
+    probe_model_label: &str,
+    result: &ProbeResult,
+) -> String {
+    let status = result
+        .status_code
+        .map(|code| format!("HTTP {code}"))
+        .unwrap_or_else(|| "未收到 HTTP 状态".to_string());
+    if result.available {
+        return format!("连接测试成功：{endpoint_name} / {probe_model_label} / {status}");
+    }
+    let reason = if result.error.trim().is_empty() {
+        if result.quota_limited {
+            "额度不足或限流".to_string()
+        } else if result.polluted {
+            "响应命中污染判断".to_string()
+        } else {
+            "探测未通过".to_string()
+        }
+    } else {
+        result.error.clone()
+    };
+    format!("连接测试失败：{endpoint_name} / {probe_model_label} / {status} / {reason}")
+}
+
+fn parse_provider_connection_text(text: &str) -> (Option<String>, Option<String>) {
+    let mut url = None;
+    let mut key = None;
+    if let Ok(value) = serde_json::from_str::<Value>(text) {
+        collect_provider_connection_fields(&value, &mut url, &mut key);
+    }
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if key.is_none() {
+            if let Some(index) = lower.find("bearer ") {
+                key = clean_imported_key(&trimmed[index + "bearer ".len()..]);
+            } else if is_key_assignment(&lower) {
+                key = split_import_assignment(trimmed).and_then(clean_imported_key);
+            }
+        }
+        if url.is_none() && is_url_assignment(&lower) {
+            url = split_import_assignment(trimmed).and_then(clean_imported_url);
+        }
+    }
+
+    if url.is_none() {
+        url = text.split_whitespace().find_map(clean_imported_url);
+    }
+    (url, key)
+}
+
+fn collect_provider_connection_fields(
+    value: &Value,
+    url: &mut Option<String>,
+    key: &mut Option<String>,
+) {
+    match value {
+        Value::Object(fields) => {
+            for (name, value) in fields {
+                let normalized = name.to_ascii_lowercase().replace(['-', ' '], "_");
+                if url.is_none()
+                    && matches!(
+                        normalized.as_str(),
+                        "base_url" | "url" | "api_url" | "endpoint"
+                    )
+                {
+                    *url = value.as_str().and_then(clean_imported_url);
+                }
+                if key.is_none()
+                    && matches!(
+                        normalized.as_str(),
+                        "api_key" | "apikey" | "key" | "authorization"
+                    )
+                {
+                    *key = value.as_str().and_then(clean_imported_key);
+                }
+                collect_provider_connection_fields(value, url, key);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_provider_connection_fields(value, url, key);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_url_assignment(line: &str) -> bool {
+    [
+        "base_url",
+        "base url",
+        "api_url",
+        "api url",
+        "url",
+        "endpoint",
+        "接口地址",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
+}
+
+fn is_key_assignment(line: &str) -> bool {
+    ["api_key", "api key", "apikey", "key", "authorization"]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+}
+
+fn split_import_assignment(line: &str) -> Option<&str> {
+    line.split_once([':', '='])
+        .map(|(_, value)| value.trim())
+        .or_else(|| line.split_whitespace().nth(1))
+}
+
+fn clean_imported_url(value: &str) -> Option<String> {
+    let value = value
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | ']' | '}'));
+    let parsed = Url::parse(value).ok()?;
+    (matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some())
+        .then(|| value.to_string())
+}
+
+fn clean_imported_key(value: &str) -> Option<String> {
+    let value = value
+        .trim()
+        .trim_start_matches("Bearer ")
+        .trim_start_matches("bearer ")
+        .trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | ']' | '}'));
+    (!value.is_empty() && !value.contains("//")).then(|| value.to_string())
+}
+
+fn mask_api_key(key: &str) -> String {
+    let visible = key.chars().take(4).collect::<String>();
+    if key.chars().count() <= 8 {
+        "已识别".to_string()
+    } else {
+        format!("{visible}... (已识别)")
+    }
+}
+
 fn endpoint_field_hint(key: &str) -> &'static str {
     match key {
         "name" => "接口组显示名，用于表格、日志和切换提示，建议能看出用途。",
         "base_url" => "真实接口地址或本地聚合代理地址，通常应包含 /v1。",
         "api_key" => "请求该接口使用的 Key；如果选择聚合代理，这里会写入本地代理 Key。",
-        "model" => "实际对话和探测使用的模型名，不会被便宜模型自动替换。",
+        "model" => {
+            "实际对话使用的模型名；留空探测模型时，探测会先从 models 接口里选最便宜的已知模型。"
+        }
+        "probe_model" => {
+            "自定义探测请求使用的模型名。留空时自动从 models 接口获取并选择最便宜的已知模型。"
+        }
         "reasoning_effort" => "模型思考等级，会写入 Agent 启动参数；不支持时由上游忽略或报错。",
         "service_tier" => "Codex/OpenAI 服务档位；fast 会写入 service_tier，留空会清除旧档位。",
         "weight" => "权重越高优先级越高；正常策略只探测比当前更高权重的接口。",
@@ -18608,6 +20651,26 @@ fn save_prompt_library_editor_item(
 mod tests {
     use super::*;
 
+    #[test]
+    fn provider_connection_import_parses_json_fields() {
+        let (url, key) = parse_provider_connection_text(
+            r#"{"base_url":"https://api.example.com/v1","api_key":"sk-example-key"}"#,
+        );
+
+        assert_eq!(url.as_deref(), Some("https://api.example.com/v1"));
+        assert_eq!(key.as_deref(), Some("sk-example-key"));
+    }
+
+    #[test]
+    fn provider_connection_import_parses_text_url_and_bearer_key() {
+        let (url, key) = parse_provider_connection_text(
+            "Base URL: https://gateway.example.com/v1\nAuthorization: Bearer sk-example-key",
+        );
+
+        assert_eq!(url.as_deref(), Some("https://gateway.example.com/v1"));
+        assert_eq!(key.as_deref(), Some("sk-example-key"));
+    }
+
     fn provider_named(name: &str) -> Value {
         let mut provider = blank_provider();
         provider["name"] = json!(name);
@@ -18705,17 +20768,23 @@ mod tests {
             Stroke::new(1.0, md_primary_hover())
         );
         assert_eq!(style.visuals.widgets.noninteractive.bg_fill, md_bg());
-        assert_eq!(style.visuals.widgets.inactive.bg_fill, md_surface_2());
+        assert_eq!(style.visuals.widgets.inactive.bg_fill, md_button_fill());
         assert_eq!(
             style.visuals.widgets.inactive.bg_stroke,
-            Stroke::new(0.5, md_outline_faint())
+            Stroke::new(0.8, md_button_outline())
         );
-        assert_eq!(style.visuals.widgets.hovered.bg_fill, md_surface_hover());
+        assert_eq!(
+            style.visuals.widgets.hovered.bg_fill,
+            md_button_hover_fill()
+        );
         assert_eq!(
             style.visuals.widgets.hovered.bg_stroke,
-            Stroke::new(0.8, md_primary_hover())
+            Stroke::new(0.9, md_primary_hover())
         );
-        assert_eq!(style.visuals.widgets.active.bg_fill, selected_fill());
+        assert_eq!(
+            style.visuals.widgets.active.bg_fill,
+            md_button_active_fill()
+        );
         assert_eq!(
             style.visuals.widgets.active.bg_stroke,
             Stroke::new(0.8, accent())
@@ -18739,11 +20808,21 @@ mod tests {
         configure_visuals(&ctx);
 
         let style = ctx.style();
-        let radius = egui::CornerRadius::same(8);
+        let radius = md3_button_radius();
         assert_eq!(style.visuals.widgets.inactive.corner_radius, radius);
         assert_eq!(style.visuals.widgets.hovered.corner_radius, radius);
         assert_eq!(style.visuals.widgets.active.corner_radius, radius);
         assert_eq!(style.visuals.widgets.open.corner_radius, radius);
+        let source = include_str!("app.rs");
+        let nav_button = source
+            .split("fn top_nav_button")
+            .nth(1)
+            .and_then(|tail| tail.split("fn render_top_nav_segmented").next())
+            .expect("top nav button helper should be discoverable");
+        assert!(
+            nav_button.contains("vec2(TOP_NAV_BUTTON_W, TOP_NAV_BUTTON_H)"),
+            "顶部操作菜单按钮高度必须和右侧 segmented 页签一致"
+        );
     }
 
     #[test]
@@ -18786,52 +20865,52 @@ mod tests {
     }
 
     #[test]
-    fn github_dark_theme_is_forced_for_all_default_component_styles() {
+    fn theme_styles_support_dark_and_light_component_palettes() {
         let source = include_str!("app.rs");
         let configure_block = source
             .split("fn configure_visuals(ctx: &egui::Context)")
             .nth(1)
-            .and_then(|tail| tail.split("fn md_bg").next())
+            .and_then(|tail| tail.split("fn apply_watchapi_style").next())
             .expect("configure_visuals block should be discoverable");
 
         assert!(
-            configure_block.contains("ctx.set_theme(egui::Theme::Dark);"),
-            "theme preference must be forced to dark so OS/theme events cannot restore light defaults"
+            configure_block.contains("let theme = current_gui_theme();")
+                && configure_block.contains("ctx.set_theme(egui_theme_for(theme));"),
+            "the saved GUI theme must select the corresponding egui style slot"
         );
         assert!(
-            configure_block.contains(
-                "ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));"
-            ),
-            "native viewports must also receive a dark theme command so OS title bars and child windows do not stay gray"
+            configure_block.contains("ViewportCommand::SetTheme(system_theme_for(theme))"),
+            "native viewports must receive the selected theme so child title bars stay in sync"
         );
         assert!(
             configure_block.contains("style_mut_of(egui::Theme::Dark")
                 && configure_block.contains("style_mut_of(egui::Theme::Light"),
-            "both egui style slots must be overwritten so popups and child viewports keep the same component colors"
+            "both egui style slots must be configured for live theme changes"
         );
         assert!(
-            configure_block.matches("apply_github_dark_style").count() >= 2,
-            "all default component visuals should be driven through the same GitHub dark style function"
+            configure_block.contains("apply_watchapi_style(style, GuiTheme::Dark)")
+                && configure_block.contains("apply_watchapi_style(style, GuiTheme::Light)"),
+            "dark and light visual slots must each use their matching palette"
         );
     }
 
     #[test]
-    fn github_dark_style_is_not_rebuilt_every_frame() {
+    fn theme_styles_are_initialized_once_per_viewport() {
         let source = include_str!("app.rs");
         let configure_block = source
             .split("fn configure_visuals(ctx: &egui::Context)")
             .nth(1)
-            .and_then(|tail| tail.split("fn apply_github_dark_style").next())
+            .and_then(|tail| tail.split("fn apply_watchapi_style").next())
             .expect("configure_visuals block should be discoverable");
         let gate = "if ctx.cumulative_pass_nr() <= 1";
         let gate_pos = configure_block
             .find(gate)
             .expect("theme setup should be gated to new viewport frames");
         let dark_pos = configure_block
-            .find("ctx.style_mut_of(egui::Theme::Dark, apply_github_dark_style);")
+            .find("ctx.style_mut_of(egui::Theme::Dark")
             .expect("dark style setup should be present");
         let light_pos = configure_block
-            .find("ctx.style_mut_of(egui::Theme::Light, apply_github_dark_style);")
+            .find("ctx.style_mut_of(egui::Theme::Light")
             .expect("light style setup should be present");
         let after_gate = &configure_block[gate_pos..];
         let gate_body_end = after_gate
@@ -18850,7 +20929,67 @@ mod tests {
     }
 
     #[test]
-    fn github_dark_theme_replaces_direct_black_surface_painting() {
+    fn system_settings_save_persists_theme_and_external_app_list() {
+        let mut app = WatchApiApp::default();
+        let app_path = app_root().join("tools").join("helper.exe");
+        app.system_settings_theme = GuiTheme::Light;
+        app.system_settings_external_apps = vec![GuiExternalApplication {
+            name: "Helper".to_string(),
+            path: app_path.clone(),
+        }];
+
+        app.save_system_settings();
+
+        assert_eq!(app.registry.theme, GuiTheme::Light);
+        assert_eq!(app.registry.external_apps.len(), 1);
+        let mut loaded = GuiConfigRegistry::new(app.registry.state_path.clone());
+        loaded.load();
+        assert_eq!(loaded.theme, GuiTheme::Light);
+        assert_eq!(loaded.external_apps.len(), 1);
+        assert_eq!(loaded.external_apps[0].name, "Helper");
+        assert_eq!(loaded.external_apps[0].path, app_path);
+    }
+
+    #[test]
+    fn external_applications_launch_scripts_in_a_separate_console() {
+        let source = include_str!("app.rs");
+        let launch_block = source
+            .split("fn launch_external_application")
+            .nth(1)
+            .and_then(|tail| tail.split("fn render_provider_import_dialog").next())
+            .expect("external application launch block should be discoverable");
+
+        assert!(external_application_is_command_script(Path::new(
+            "launch.bat"
+        )));
+        assert!(external_application_is_command_script(Path::new(
+            "launch.CMD"
+        )));
+        assert!(!external_application_is_command_script(Path::new(
+            "launch.exe"
+        )));
+        assert!(launch_block.contains("external_application_is_command_script(path)"));
+        assert!(launch_block.contains("Command::new(\"cmd.exe\")"));
+        assert!(launch_block.contains("command.args([\"/d\", \"/c\"]).arg(path)"));
+        assert!(launch_block.contains("command.current_dir(parent)"));
+        assert!(launch_block.contains("Command::new(path)"));
+        assert!(launch_block.contains("Stdio::null()"));
+        assert!(launch_block.contains("DETACHED_PROCESS"));
+        assert!(launch_block.contains("CREATE_NEW_CONSOLE"));
+        assert!(launch_block.contains("CREATE_NEW_PROCESS_GROUP"));
+        assert!(
+            launch_block.contains("CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP"),
+            "command scripts should get their own console and process group"
+        );
+        assert!(
+            launch_block.contains("DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP"),
+            "executables should remain detached from the GUI"
+        );
+        assert!(!launch_block.contains("CREATE_NO_WINDOW"));
+    }
+
+    #[test]
+    fn themed_surfaces_use_palette_helpers_while_terminal_stays_dark() {
         let source = include_str!("app.rs");
         let terminal_block = source
             .split("fn render_terminal")
@@ -18873,10 +21012,10 @@ mod tests {
             .and_then(|tail| tail.split("fn paint_terminal_text_runs").next())
             .expect("terminal selection renderer should be discoverable");
 
-        assert!(!terminal_block.contains("Color32::BLACK"));
-        assert!(!terminal_output_block.contains("Color32::BLACK"));
         assert!(terminal_block.contains("terminal_background_color()"));
         assert!(terminal_output_block.contains("terminal_background_color()"));
+        assert!(source.contains("fn terminal_background_color() -> Color32"));
+        assert!(source.contains("Color32::BLACK"));
         assert!(!markdown_code_block.contains("Color32::BLACK"));
         assert!(markdown_code_block.contains("md_canvas()"));
         assert!(!selection_block.contains("Color32::from_rgba_unmultiplied"));
@@ -19083,7 +21222,6 @@ mod tests {
             headings,
             vec![
                 "启用",
-                "强探",
                 "固定",
                 "保护",
                 "名称",
@@ -19102,7 +21240,42 @@ mod tests {
                 "操作",
             ]
         );
-        assert_eq!(endpoint_table_columns().len(), 18);
+        assert_eq!(endpoint_table_columns().len(), 17);
+        assert!(!headings.contains(&"强探"));
+    }
+
+    #[test]
+    fn endpoint_table_status_columns_adapt_and_clip_long_chip_text() {
+        let source = include_str!("app.rs");
+        let table_block = source
+            .split("fn render_endpoint_table")
+            .nth(1)
+            .and_then(|tail| tail.split("fn paint_endpoint_table_background").next())
+            .expect("endpoint table block should be discoverable");
+        let columns_helper = source
+            .split("fn endpoint_table_columns_for_rows")
+            .nth(1)
+            .and_then(|tail| tail.split("fn widen_endpoint_status_column").next())
+            .expect("dynamic endpoint column helper should be discoverable");
+        let compact_chip = source
+            .split("fn render_compact_status_chip")
+            .nth(1)
+            .and_then(|tail| tail.split("fn table_status_chip_display_text").next())
+            .expect("compact status chip renderer should be discoverable");
+        let clip_helper = source
+            .split("fn table_status_chip_display_text")
+            .nth(1)
+            .and_then(|tail| tail.split("fn table_status_chip").next())
+            .expect("table status chip clipping helper should be discoverable");
+
+        assert!(table_block.contains("endpoint_table_columns_for_rows(ui, &rows[start..end])"));
+        assert!(columns_helper.contains("\"请求状态\""));
+        assert!(columns_helper.contains("\"运行状态\""));
+        assert!(columns_helper.contains("\"状态码\""));
+        assert!(compact_chip.contains("table_status_chip_display_text("));
+        assert!(compact_chip.contains("text_rect.left_center()"));
+        assert!(compact_chip.contains("Align2::LEFT_CENTER"));
+        assert!(clip_helper.contains("out.push_str(ellipsis)"));
     }
 
     #[test]
@@ -20332,30 +22505,48 @@ mod tests {
             "顶部动作菜单应命名为“操作”，避免和运行页签重名"
         );
         assert!(
-            update_block.contains("top_nav_button(\"工作台\"")
-                && update_block.contains("top_nav_button(\"代理\"")
-                && update_block.contains("top_nav_button(\"供应商\""),
-            "顶部页签应显示为代理 / 供应商 / 工作台"
+            update_block.contains("self.render_top_bar(ui, ctx);"),
+            "顶部栏应通过固定高度 toolbar helper 渲染"
         );
-        let proxy_nav = update_block
-            .find("top_nav_button(\"代理\"")
-            .expect("proxy nav button should be discoverable");
-        let provider_nav = update_block
-            .find("top_nav_button(\"供应商\"")
-            .expect("provider nav button should be discoverable");
-        let workspace_nav = update_block
-            .find("top_nav_button(\"工作台\"")
-            .expect("workspace nav button should be discoverable");
-        let second_separator = update_block
-            .match_indices("ui.separator();")
+        let top_bar = source
+            .split("fn render_top_bar")
             .nth(1)
-            .map(|(index, _)| index)
-            .expect("proxy/provider group should be separated from workspace tab");
+            .and_then(|tail| tail.split("fn render_top_menu").next())
+            .expect("top bar helper should be discoverable");
         assert!(
-            proxy_nav < provider_nav
-                && provider_nav < second_separator
-                && second_separator < workspace_nav,
-            "顶部页签应把代理和供应商放同一组，右侧竖线分隔后再放工作台"
+            top_bar.contains("egui::Layout::left_to_right(egui::Align::Center)")
+                && top_bar.contains("TOP_BAR_CONTENT_HEIGHT")
+                && top_bar.contains("self.render_main_nav_segment(ui);")
+                && !top_bar.contains("\"WatchApi\""),
+            "顶部操作菜单和页签必须在同一固定高度居中 toolbar 中渲染，且不再绘制 WatchApi 标题"
+        );
+        let main_nav = source
+            .split("fn render_main_nav_segment")
+            .nth(1)
+            .and_then(|tail| tail.split("fn render_run_page").next())
+            .expect("main nav segment should be discoverable");
+        assert!(
+            main_nav.contains("render_top_nav_segmented")
+                && main_nav.contains("main_page_segmented")
+                && !main_nav.contains("top_nav_button("),
+            "顶部页签应使用自绘 segmented 组件，而不是按钮"
+        );
+        let proxy_nav = main_nav
+            .find("label: \"代理\"")
+            .expect("proxy nav segment should be discoverable");
+        let provider_nav = main_nav
+            .find("label: \"供应商\"")
+            .expect("provider nav segment should be discoverable");
+        let workspace_nav = main_nav
+            .find("label: \"工作台\"")
+            .expect("workspace nav segment should be discoverable");
+        assert!(
+            proxy_nav < provider_nav && provider_nav < workspace_nav,
+            "顶部页签应按代理 / 供应商 / 工作台顺序排列"
+        );
+        assert!(
+            !main_nav.contains("ui.separator();"),
+            "顶部页签应使用连续 segmented 容器，而不是硬分隔线"
         );
         assert!(
             !update_block.contains("top_nav_button(\"运行\"")
@@ -20499,6 +22690,11 @@ mod tests {
             "左侧栏最小宽度必须能容纳树缩进、固定名称起点和状态列，避免拖太窄后右侧出现黑边/内容挤压"
         );
         assert!(
+            source.contains("const CONFIG_STATUS_BADGE_W: f32 = 58.0;")
+                && source.contains("CONFIG_STATUS_BADGE_PADDING_X"),
+            "左侧配置状态 chip 应保持紧凑，不能回退成过宽的固定胶囊"
+        );
+        assert!(
             config_list.contains("self.autostart_toggle_label()"),
             "配置项右键菜单应提供自动运行开关"
         );
@@ -20509,14 +22705,14 @@ mod tests {
             "配置项右键菜单应提供强制新对话"
         );
         let proxy_nav = source
-            .find("top_nav_button(\"代理\"")
-            .expect("proxy nav button should be discoverable");
+            .find("label: \"代理\"")
+            .expect("proxy nav segment should be discoverable");
         let provider_nav = source
-            .find("top_nav_button(\"供应商\"")
-            .expect("provider nav button should be discoverable");
+            .find("label: \"供应商\"")
+            .expect("provider nav segment should be discoverable");
         assert!(
             proxy_nav < provider_nav,
-            "供应商是公共入口，应放在顶部聚合代理按钮右边"
+            "供应商是公共入口，应放在顶部代理页签右边"
         );
         assert!(
             config_list.contains("编辑配置")
@@ -20686,6 +22882,7 @@ mod tests {
             "endpoint_refs": [{ "provider": "wrong" }],
             "probe_interval_seconds": 40,
             "turn_stall_seconds": 120,
+            "codex_model_context_window": 65536,
             "auto_prompt": "工作区续航"
         });
 
@@ -20698,6 +22895,7 @@ mod tests {
         assert_eq!(config["endpoint_refs"][0]["provider"], json!("keep"));
         assert_eq!(config["probe_interval_seconds"], json!(40));
         assert_eq!(config["turn_stall_seconds"], json!(120));
+        assert_eq!(config["codex_model_context_window"], json!(65536));
         assert_eq!(config["auto_prompt"], json!("工作区续航"));
     }
 
@@ -21940,6 +24138,40 @@ mod tests {
     }
 
     #[test]
+    fn terminal_dropped_paths_are_quoted_for_terminal_input() {
+        let paths = vec![
+            PathBuf::from(r"C:\Source Files\screen shot.png"),
+            PathBuf::from(r"D:\docs\notes.txt"),
+        ];
+
+        assert_eq!(
+            terminal_dropped_paths_text(&paths),
+            r#""C:\Source Files\screen shot.png" "D:\docs\notes.txt""#
+        );
+    }
+
+    #[test]
+    fn terminal_renderer_receives_os_file_drop_events() {
+        let source = include_str!("app.rs");
+        let terminal_output = source
+            .split("fn render_pty_terminal_output")
+            .nth(1)
+            .and_then(|tail| tail.split("fn process_terminal_file_drop").next())
+            .expect("terminal output renderer should be discoverable");
+        let file_drop = source
+            .split("fn process_terminal_file_drop")
+            .nth(1)
+            .and_then(|tail| tail.split("fn update_terminal_ime_output").next())
+            .expect("terminal file drop helper should be discoverable");
+
+        assert!(terminal_output
+            .contains("self.process_terminal_file_drop(ui.ctx(), rect, terminal_id)"));
+        assert!(file_drop.contains(".dropped_files"));
+        assert!(file_drop.contains("terminal_rect.contains(position)"));
+        assert!(file_drop.contains("self.write_terminal_paste(&text)"));
+    }
+
+    #[test]
     fn terminal_clipboard_actions_use_explicit_terminal_copy_keys() {
         assert_eq!(terminal_clipboard_action(&egui::Event::Copy), None);
         assert_eq!(terminal_clipboard_action(&egui::Event::Cut), None);
@@ -22053,6 +24285,28 @@ mod tests {
             actions,
             vec![TerminalInputAction::Paste("粘贴内容".to_string())]
         );
+    }
+
+    #[test]
+    fn terminal_keyboard_drops_text_echo_from_alt_v_image_paste_shortcut() {
+        let mut preediting = false;
+        let events = vec![
+            egui::Event::Key {
+                key: Key::V,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    alt: true,
+                    ..Default::default()
+                },
+            },
+            egui::Event::Text("v".to_string()),
+        ];
+
+        let actions = terminal_keyboard_actions_for_events(&events, 24, None, &mut preediting);
+
+        assert_eq!(actions, vec![TerminalInputAction::WriteStatic("\x1bv")]);
     }
 
     #[test]
@@ -24306,7 +26560,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_row_force_and_fixed_actions_use_worker_command_channel() {
+    fn runtime_row_fixed_action_uses_worker_command_channel_without_force_probe_column() {
         let source = include_str!("app.rs");
         let block = source
             .split("fn render_runtime_row_cells")
@@ -24324,7 +26578,7 @@ mod tests {
             .and_then(|tail| tail.split("fn update_last_rows_force_probe").next())
             .expect("fixed endpoint helper should be discoverable");
 
-        assert!(block.contains("self.set_force_probe_endpoint"));
+        assert!(!block.contains("self.set_force_probe_endpoint"));
         assert!(block.contains("self.set_fixed_endpoint"));
         assert!(!block.contains(".lock()"));
         assert!(force_helper.contains("RuntimeCommand::SetForceProbeEndpoint"));
@@ -26263,6 +28517,91 @@ mod tests {
             Some(TerminalCellPos { row: 20, col: 1 })
         );
     }
+
+    #[test]
+    fn terminal_selection_tracks_absolute_scrollback_rows_after_scroll() {
+        let initial_view = TerminalView {
+            revision: 1,
+            rows: 3,
+            cols: 5,
+            scrollback_lines: 5,
+            cursor_row: 2,
+            cursor_col: 0,
+            cursor_shape: TerminalCursorShape::Block,
+            display_offset: 3,
+            modes: TerminalModeView::default(),
+            cells: "prev keep next ".chars().map(test_terminal_cell).collect(),
+        };
+        let initial_absolute_row_start = terminal_view_absolute_row_start(&initial_view);
+        let selection = TerminalSelection {
+            anchor: terminal_selection_cell_from_view_cell(
+                TerminalCellPos { row: 1, col: 0 },
+                initial_absolute_row_start,
+            ),
+            focus: terminal_selection_cell_from_view_cell(
+                TerminalCellPos { row: 1, col: 3 },
+                initial_absolute_row_start,
+            ),
+        };
+        assert_eq!(
+            selection,
+            TerminalSelection {
+                anchor: TerminalCellPos { row: 3, col: 0 },
+                focus: TerminalCellPos { row: 3, col: 3 },
+            }
+        );
+
+        let scrolled_view = TerminalView {
+            revision: 2,
+            rows: 3,
+            cols: 5,
+            scrollback_lines: 5,
+            cursor_row: 2,
+            cursor_col: 0,
+            cursor_shape: TerminalCursorShape::Block,
+            display_offset: 2,
+            modes: TerminalModeView::default(),
+            cells: "keep next last ".chars().map(test_terminal_cell).collect(),
+        };
+
+        assert_eq!(
+            terminal_selection_row_bounds_for_view(
+                &scrolled_view,
+                Some(selection),
+                0,
+                scrolled_view.cols
+            ),
+            Some((0, 3))
+        );
+        assert_eq!(
+            terminal_selection_row_bounds_for_view(
+                &scrolled_view,
+                Some(selection),
+                1,
+                scrolled_view.cols
+            ),
+            None
+        );
+        assert_eq!(
+            terminal_selected_text(&scrolled_view, selection).as_deref(),
+            Some("keep")
+        );
+
+        let bottom_view = TerminalView {
+            revision: 3,
+            rows: 3,
+            cols: 5,
+            scrollback_lines: 5,
+            cursor_row: 2,
+            cursor_col: 0,
+            cursor_shape: TerminalCursorShape::Block,
+            display_offset: 0,
+            modes: TerminalModeView::default(),
+            cells: "newerfinaltail ".chars().map(test_terminal_cell).collect(),
+        };
+        assert_eq!(terminal_selected_text(&bottom_view, selection), None);
+    }
+
     #[test]
     fn runtime_snapshot_refresh_reads_terminal_text_only_after_revision_changes() {
         let source = include_str!("app.rs");
@@ -26605,6 +28944,7 @@ mod tests {
         for key in [
             "name",
             "model",
+            "probe_model",
             "reasoning_effort",
             "service_tier",
             "weight",
@@ -26642,6 +28982,7 @@ mod tests {
             "max_tokens",
             "remove_keywords",
             "fail_keywords",
+            "builtin_high_risk_rules",
             "fallback_models",
             "anti_injection_prefix",
             "system_prompt_suffix",
@@ -26649,6 +28990,32 @@ mod tests {
             assert!(
                 !guard_field_hint(key).trim().is_empty(),
                 "missing guard hint for {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_dropdown_options_include_recent_gpt_models() {
+        for model in [
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.4-nano",
+        ] {
+            assert!(
+                MODEL_OPTIONS.contains(&model),
+                "missing model dropdown option: {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_options_include_new_gpt_56_levels() {
+        for effort in ["low", "medium", "high", "xhigh", "max", "ultra"] {
+            assert!(
+                REASONING_EFFORT_OPTIONS.contains(&effort),
+                "missing reasoning effort option: {effort}"
             );
         }
     }
@@ -26722,8 +29089,8 @@ mod tests {
             "供应商库是全局入口，不能因没有当前配置而拒绝打开，也不能写入 config_path"
         );
         assert!(
-            source.contains("top_nav_button(\"供应商\""),
-            "公共供应商库需要放在顶部代理页签右侧，不能放到单个配置右键菜单"
+            source.contains("label: \"供应商\""),
+            "公共供应商库需要放在顶部代理 segmented 页签右侧，不能放到单个配置右键菜单"
         );
         let update_block = source
             .split("fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame)")
@@ -27215,6 +29582,23 @@ mod tests {
     }
 
     #[test]
+    fn proxy_page_uses_right_gutter_like_run_page() {
+        let source = include_str!("app.rs");
+        let proxy_page = source
+            .split("fn render_proxy_page")
+            .nth(1)
+            .and_then(|tail| tail.split("fn render_provider_page").next())
+            .expect("proxy page block should be discoverable");
+
+        assert!(
+            proxy_page.contains("ui.available_width() - RUN_PAGE_RIGHT_GUTTER")
+                && proxy_page.contains("ui.set_width(content_width);")
+                && proxy_page.contains("ui.set_max_width(content_width);"),
+            "代理页说明卡、代理列表和详情区域应占满内容宽度，但必须扣 RUN_PAGE_RIGHT_GUTTER 保留右侧窗口间距"
+        );
+    }
+
+    #[test]
     fn provider_page_opens_without_current_config_path() {
         let mut app = WatchApiApp::new(None);
         app.config_path.clear();
@@ -27226,6 +29610,47 @@ mod tests {
         assert_eq!(app.main_page, MainPage::Provider);
         assert!(app.provider_json["providers"].is_array());
         assert_ne!(app.status, "请先打开工作区文件夹");
+    }
+
+    #[test]
+    fn provider_connection_editor_exposes_probe_model_and_test_button() {
+        let source = include_str!("app.rs");
+        let provider_fields = source
+            .split("fn render_provider_field_row")
+            .nth(1)
+            .and_then(|tail| tail.split("fn render_provider_connection_block").next())
+            .expect("provider field renderer should be discoverable");
+        let provider_connection = source
+            .split("fn render_provider_connection_block")
+            .nth(1)
+            .and_then(|tail| tail.split("fn render_endpoint_connection_block").next())
+            .expect("provider connection block should be discoverable");
+
+        assert!(provider_fields.contains("\"测试连接\""));
+        assert!(provider_fields.contains("self.start_connection_test_for_selected_provider();"));
+        assert!(provider_connection
+            .contains("self.render_provider_field_row(ui, \"probe_model\", label_w);"));
+    }
+
+    #[test]
+    fn connection_test_config_preserves_provider_probe_model() {
+        let app = WatchApiApp::new(None);
+        let mut provider = provider_named("probe");
+        provider["probe_model"] = json!("gpt-4.1-mini");
+
+        let (endpoint, config) = app
+            .connection_test_config_for_provider(provider)
+            .expect("temporary connection test config should parse");
+
+        assert_eq!(endpoint.name, "probe");
+        assert_eq!(endpoint.probe_model.as_deref(), Some("gpt-4.1-mini"));
+        assert_eq!(
+            config
+                .endpoints
+                .first()
+                .and_then(|endpoint| endpoint.probe_model.as_deref()),
+            Some("gpt-4.1-mini")
+        );
     }
 
     #[test]
@@ -27279,6 +29704,10 @@ mod tests {
             json!(true)
         );
         assert_eq!(default_guard_proxy_json()["remove_keywords"], json!([]));
+        assert_eq!(
+            default_guard_proxy_json()["builtin_high_risk_rules"],
+            json!(watchapi_core::pollution::default_high_risk_rules())
+        );
         assert_eq!(default_guard_proxy_json()["redact_phone"], json!(false));
         assert_eq!(default_guard_proxy_json()["redact_email"], json!(false));
         assert_eq!(default_guard_proxy_json()["redact_url"], json!(false));
@@ -27303,8 +29732,10 @@ mod tests {
         assert!(editor.contains("\"request_rewrite_enabled\""));
         assert!(editor.contains("\"response_rewrite_enabled\""));
         assert!(editor.contains("\"invalid_encrypted_content_retry_enabled\""));
+        assert!(editor.contains("\"builtin_high_risk_rules\""));
         assert!(source.contains("\"detection_mode\": \"hybrid\""));
         assert!(source.contains("只按配置的过滤关键词和失败关键词判断"));
+        assert!(source.contains("清空后保护层不再使用任何内置规则"));
         assert!(source.contains("前 N-1 次风险命中原样透传只计数"));
         assert!(source.contains("删除请求里的 encrypted_content 后重试一次"));
         assert!(source.contains("其他请求改写仍由“改写请求”控制"));
@@ -27378,7 +29809,7 @@ mod tests {
     fn removing_provider_prunes_refs_from_known_configs() {
         let temp = tempfile::tempdir().unwrap();
         let current_path = temp.path().join("current.json");
-        let other_path = temp.path().join("other.json");
+        let other_path = temp.path().join("other").join("other.json");
         let provider_json = json!({"providers": [provider_named("keep"), provider_named("drop") ]});
         save_provider_json_for_config(&current_path, &provider_json).unwrap();
         save_provider_json_for_config(&other_path, &provider_json).unwrap();
@@ -27751,7 +30182,8 @@ mod tests {
             add_provider_block.contains("self.persist_provider_library_value(&next_provider_json)")
         );
         assert!(!persist_provider_block.contains("let _ = write_text_atomic"));
-        assert!(persist_provider_block.contains("回滚当前配置供应商库失败"));
+        assert!(persist_provider_block.contains("回滚配置供应商库失败"));
+        assert!(persist_provider_block.contains("sync_provider_library_to_known_configs_value"));
         assert!(!stop_all_proxies_block.contains("let _ = self.proxy_registry.save"));
         assert!(stop_all_proxies_block.contains("全部代理已停止，但保存代理配置失败"));
         assert!(!exit_cleanup_block.contains("let _ = self.proxy_registry.save"));
@@ -28488,6 +30920,107 @@ mod tests {
         assert!(
             app.runtime.is_none(),
             "刷新表格用配置快照，不能重启 runtime"
+        );
+    }
+
+    #[test]
+    fn provider_weight_change_syncs_known_configs_and_refreshes_running_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let current_path = temp.path().join("current.json");
+        let other_path = temp.path().join("other.json");
+        let mut provider_high = provider_named("high");
+        provider_high["weight"] = json!(100);
+        let mut provider_second = provider_named("second");
+        provider_second["weight"] = json!(200);
+        let provider_json = json!({"providers": [provider_high, provider_second]});
+        save_provider_json_for_config(&current_path, &provider_json).unwrap();
+        save_provider_json_for_config(&other_path, &provider_json).unwrap();
+        write_config_refs(&current_path, &["high", "second"]);
+        write_config_refs(&other_path, &["high"]);
+
+        let mut app = WatchApiApp::new(None);
+        app.registry = GuiConfigRegistry::new(temp.path().join(".watchapi-gui.json"));
+        let workspace_id = app.registry.open_workspace(temp.path().join("workspace"));
+        app.registry
+            .register_config_in_workspace(&workspace_id, other_path.clone());
+        app.config_path = current_path.to_string_lossy().to_string();
+        app.editor_json = load_json_or_default(&current_path);
+        app.provider_json = load_provider_json_for_config(&current_path);
+        app.config = app.editor_config_for_session_binding();
+        app.running = true;
+        app.last_rows = vec![
+            EndpointRow {
+                enabled: true,
+                force_probe: false,
+                fixed: false,
+                guard_proxy_enabled: false,
+                name: "high".to_string(),
+                url: "http://127.0.0.1:8787/v1".to_string(),
+                weight: 100,
+                request_status: "ok".to_string(),
+                selected: true,
+                runtime_state: "运行中".to_string(),
+                agent_runtime: String::new(),
+                endpoint_runtime: String::new(),
+                token_cost: String::new(),
+                historical_token_cost: String::new(),
+                request_count: 0,
+                last_request_at: String::new(),
+                last_status_code: String::new(),
+                next_probe_in_seconds: None,
+            },
+            EndpointRow {
+                enabled: true,
+                force_probe: false,
+                fixed: false,
+                guard_proxy_enabled: false,
+                name: "second".to_string(),
+                url: "http://127.0.0.1:8787/v1".to_string(),
+                weight: 200,
+                request_status: "ok".to_string(),
+                selected: false,
+                runtime_state: String::new(),
+                agent_runtime: String::new(),
+                endpoint_runtime: String::new(),
+                token_cost: String::new(),
+                historical_token_cost: String::new(),
+                request_count: 0,
+                last_request_at: String::new(),
+                last_status_code: String::new(),
+                next_probe_in_seconds: None,
+            },
+        ];
+
+        let mut next_provider_json = app.provider_json.clone();
+        next_provider_json["providers"][0]["weight"] = json!(300);
+
+        assert!(app.commit_provider_library_change(next_provider_json, "供应商库已同步"));
+
+        assert_eq!(
+            app.config
+                .as_ref()
+                .unwrap()
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.name == "high")
+                .unwrap()
+                .weight,
+            300
+        );
+        assert_eq!(
+            app.endpoint_rows_for_table()
+                .into_iter()
+                .map(|row| endpoint_table_row_weight(&row))
+                .collect::<Vec<_>>(),
+            vec![300, 200]
+        );
+        assert_eq!(
+            load_provider_json_for_config(&current_path)["providers"][0]["weight"],
+            json!(300)
+        );
+        assert_eq!(
+            load_provider_json_for_config(&other_path)["providers"][0]["weight"],
+            json!(300)
         );
     }
 
@@ -29543,7 +32076,8 @@ mod tests {
             "auto_prompt": "工作区续航",
             "polluted_response_keywords": ["公益", "通知群"],
             "polluted_response_threshold": 0.2,
-            "polluted_context_window": 8
+            "polluted_context_window": 8,
+            "codex_model_context_window": 128000
         });
 
         app.prepare_new_config();
@@ -29555,6 +32089,7 @@ mod tests {
         );
         assert_eq!(app.editor_json["polluted_response_threshold"], json!(0.2));
         assert_eq!(app.editor_json["polluted_context_window"], json!(8));
+        assert_eq!(app.editor_json["codex_model_context_window"], json!(128000));
     }
 
     #[test]

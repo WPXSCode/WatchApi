@@ -91,8 +91,12 @@ impl HttpProbe {
         endpoint: &EndpointConfig,
         config: &AppConfig,
     ) -> ProbeResult {
-        let models = self.get_available_models(endpoint).await;
-        let model = choose_cheapest_probe_model(&endpoint.model, &models);
+        let model = if let Some(probe_model) = configured_probe_model(endpoint) {
+            probe_model.to_string()
+        } else {
+            let models = self.get_available_models(endpoint).await;
+            choose_cheapest_probe_model(&endpoint.model, &models)
+        };
         let payload = json!({
             "model": model,
             "input": format!("Reply with exactly {}. No extra text.", config.probe_expected_text),
@@ -333,6 +337,14 @@ pub fn choose_cheapest_probe_model(configured_model: &str, available_models: &[S
     priced[0].1.to_string()
 }
 
+fn configured_probe_model(endpoint: &EndpointConfig) -> Option<&str> {
+    endpoint
+        .probe_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+}
+
 pub fn model_id_matches(configured_model: &str, available_model: &str) -> bool {
     let configured = normalize_model_id_for_price(configured_model);
     let available = normalize_model_id_for_price(available_model);
@@ -452,13 +464,14 @@ pub fn extract_error_message_text(payload: &Value) -> String {
 }
 
 pub fn is_quota_limited_payload(payload: &Value) -> bool {
-    let text = payload_strings_text(payload).to_ascii_lowercase();
-    if text.is_empty() {
-        return false;
-    }
-    quota_keywords()
-        .iter()
-        .any(|keyword| text.contains(&keyword.to_ascii_lowercase()))
+    let mut candidates = Vec::new();
+    collect_quota_error_text(payload, false, false, &mut candidates);
+    candidates.iter().any(|text| {
+        let lowered = text.to_ascii_lowercase();
+        quota_keywords()
+            .iter()
+            .any(|keyword| lowered.contains(&keyword.to_ascii_lowercase()))
+    })
 }
 
 pub fn key_switch_cooldown_seconds(payload: &Value) -> Option<u64> {
@@ -523,6 +536,88 @@ fn walk_payload_strings(value: &Value, out: &mut String) {
         Value::Array(items) => {
             for child in items {
                 walk_payload_strings(child, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_quota_error_text(
+    value: &Value,
+    in_error_branch: bool,
+    failed_object: bool,
+    out: &mut Vec<String>,
+) {
+    match value {
+        Value::Object(map) => {
+            let object_failed = failed_object
+                || map
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .is_some_and(|value| !value)
+                || map
+                    .get("ok")
+                    .and_then(Value::as_bool)
+                    .is_some_and(|value| !value)
+                || map
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| {
+                        matches!(
+                            value.to_ascii_lowercase().as_str(),
+                            "error" | "failed" | "failure" | "incomplete"
+                        )
+                    });
+
+            for (key, child) in map {
+                let normalized_key = key.to_ascii_lowercase().replace('-', "_");
+                let error_branch = in_error_branch
+                    || matches!(
+                        normalized_key.as_str(),
+                        "error" | "errors" | "failure" | "failures"
+                    );
+                let structured_error_field = error_branch
+                    || matches!(
+                        normalized_key.as_str(),
+                        "code" | "error_code" | "errorcode" | "type"
+                    )
+                    || (object_failed
+                        && matches!(
+                            normalized_key.as_str(),
+                            "message" | "detail" | "details" | "reason"
+                        ));
+
+                if structured_error_field {
+                    let mut text = String::new();
+                    collect_string_values(child, &mut text);
+                    if !text.trim().is_empty() {
+                        out.push(text);
+                    }
+                }
+
+                collect_quota_error_text(child, error_branch, object_failed, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_quota_error_text(item, in_error_branch, failed_object, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_string_values(value: &Value, out: &mut String) {
+    match value {
+        Value::String(text) => push_payload_string(out, text),
+        Value::Object(map) => {
+            for child in map.values() {
+                collect_string_values(child, out);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                collect_string_values(child, out);
             }
         }
         _ => {}
@@ -609,6 +704,7 @@ mod tests {
             base_url,
             api_key: "key".to_string(),
             model: "gpt-test".to_string(),
+            probe_model: None,
             reasoning_effort: "high".to_string(),
             service_tier: None,
             initial_prompt: "bootstrap".to_string(),
@@ -652,6 +748,7 @@ mod tests {
             session_state_path: PathBuf::from(".watchapi-state.json"),
             restore_sessions: true,
             codex_provider_name: "custom".to_string(),
+            codex_model_context_window: None,
             probe_expected_text: "WATCHAPI_OK".to_string(),
             probe_path: "/v1/responses".to_string(),
             polluted_response_keywords: vec![],
@@ -659,6 +756,7 @@ mod tests {
             polluted_context_window: 12,
             polluted_check_max_chars: 300,
             completion_pause_keywords: vec![],
+            continuation_trigger_rules: vec![],
         }
     }
 
@@ -714,6 +812,35 @@ mod tests {
 
         assert!(!result.available);
         assert!(result.quota_limited);
+    }
+
+    #[test]
+    fn ignores_quota_words_in_normal_response_text() {
+        let cfg = config(endpoint("https://api.example.test/v1".to_string()));
+        let endpoint = cfg.endpoints[0].clone();
+        let result = probe_response_is_acceptable(
+            &json!({
+                "output_text": "WATCHAPI_OK。关于余额和额度的说明仅是普通回复内容。"
+            }),
+            &endpoint,
+            &cfg,
+        );
+
+        assert!(result.available);
+        assert!(!result.quota_limited);
+    }
+
+    #[test]
+    fn rejects_quota_error_string_in_structured_error_field() {
+        assert!(is_quota_limited_payload(
+            &json!({"error": "余额不足，请充值后重试"})
+        ));
+        assert!(is_quota_limited_payload(
+            &json!({"success": false, "message": "quota exceeded"})
+        ));
+        assert!(!is_quota_limited_payload(
+            &json!({"message": "本次回复会解释余额和额度的区别"})
+        ));
     }
 
     #[test]
@@ -874,6 +1001,42 @@ mod tests {
         assert_eq!(first.status_code, Some(200));
         assert!(!second_models.request_made);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn probe_endpoint_uses_configured_probe_model_without_models_lookup() {
+        let models_count = StdArc::new(AtomicUsize::new(0));
+        let response_count = StdArc::new(AtomicUsize::new(0));
+        let server = MockServer::start({
+            let models_count = StdArc::clone(&models_count);
+            let response_count = StdArc::clone(&response_count);
+            move |path, body| {
+                if path == "/v1/models" {
+                    models_count.fetch_add(1, Ordering::SeqCst);
+                    return (500, json!({"error": "models should not be requested"}));
+                }
+                if path == "/v1/responses" {
+                    response_count.fetch_add(1, Ordering::SeqCst);
+                    let payload: Value = serde_json::from_slice(body).unwrap();
+                    assert_eq!(
+                        payload.get("model").and_then(Value::as_str),
+                        Some("probe-lite")
+                    );
+                    return (200, json!({"output_text": "WATCHAPI_OK"}));
+                }
+                (404, json!({"error": "not found"}))
+            }
+        });
+        let mut endpoint = endpoint(format!("{}/v1", server.url()));
+        endpoint.probe_model = Some("probe-lite".to_string());
+        let cfg = config(endpoint.clone());
+        let probe = HttpProbe::new(2.0).unwrap();
+
+        let result = probe.probe_endpoint(&endpoint, &cfg).await;
+
+        assert!(result.available);
+        assert_eq!(models_count.load(Ordering::SeqCst), 0);
+        assert_eq!(response_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

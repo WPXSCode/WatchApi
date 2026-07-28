@@ -19,8 +19,8 @@ pub mod terminal_emulator;
 pub mod tokens;
 
 pub use config::{
-    AgentCommand, AgentDriver, AppConfig, EndpointConfig, EndpointProviderConfig,
-    EndpointProviderLibrary, GuardDetectionMode, PROVIDER_LIBRARY_FILENAME,
+    AgentCommand, AgentDriver, AppConfig, ContinuationTriggerRule, EndpointConfig,
+    EndpointProviderConfig, EndpointProviderLibrary, GuardDetectionMode, PROVIDER_LIBRARY_FILENAME,
 };
 pub use health::{EndpointHealth, EndpointHealthTracker};
 pub use http_probe::{

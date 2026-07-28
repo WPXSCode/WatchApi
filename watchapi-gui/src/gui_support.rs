@@ -21,6 +21,27 @@ fn session_log_lock() -> &'static Mutex<()> {
     SESSION_LOG_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuiTheme {
+    Dark,
+    Light,
+}
+
+impl Default for GuiTheme {
+    fn default() -> Self {
+        Self::Dark
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuiExternalApplication {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub path: PathBuf,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct GuiConfigRegistry {
     pub state_path: PathBuf,
@@ -31,6 +52,8 @@ pub struct GuiConfigRegistry {
     pub autostart_paths: HashSet<String>,
     pub workspaces: Vec<GuiWorkspace>,
     pub selected_workspace_id: Option<String>,
+    pub theme: GuiTheme,
+    pub external_apps: Vec<GuiExternalApplication>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +83,10 @@ struct RegistryState {
     #[serde(default)]
     workspaces: Vec<RegistryWorkspaceState>,
     selected_workspace: Option<String>,
+    #[serde(default)]
+    theme: GuiTheme,
+    #[serde(default)]
+    external_apps: Vec<GuiExternalApplication>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -162,6 +189,8 @@ impl GuiConfigRegistry {
             .map(normalize_config_path)
             .map(|path| path.to_string_lossy().to_string())
             .collect();
+        self.theme = state.theme;
+        self.external_apps = normalize_external_apps(state.external_apps);
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -191,6 +220,8 @@ impl GuiConfigRegistry {
                 .map(registry_workspace_to_state)
                 .collect(),
             selected_workspace: self.selected_workspace_id.clone(),
+            theme: self.theme,
+            external_apps: self.external_apps.clone(),
         };
         write_text_atomic(
             &self.state_path,
@@ -464,6 +495,49 @@ impl GuiConfigRegistry {
         self.autostart_paths
             .contains(normalized.to_string_lossy().as_ref())
     }
+
+    pub fn set_system_settings(
+        &mut self,
+        theme: GuiTheme,
+        external_apps: Vec<GuiExternalApplication>,
+    ) {
+        self.theme = theme;
+        self.external_apps = normalize_external_apps(external_apps);
+    }
+}
+
+fn normalize_external_apps(apps: Vec<GuiExternalApplication>) -> Vec<GuiExternalApplication> {
+    let mut seen = HashSet::new();
+    apps.into_iter()
+        .filter_map(|mut app| {
+            let path_text = app
+                .path
+                .to_string_lossy()
+                .trim()
+                .trim_matches('"')
+                .trim()
+                .to_string();
+            if path_text.is_empty() {
+                return None;
+            }
+            let key = path_text.to_ascii_lowercase();
+            if !seen.insert(key) {
+                return None;
+            }
+            app.path = PathBuf::from(path_text);
+            app.name = app.name.trim().to_string();
+            if app.name.is_empty() {
+                app.name = app
+                    .path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or("外部应用")
+                    .to_string();
+            }
+            Some(app)
+        })
+        .collect()
 }
 
 fn registry_workspace_from_state(state: RegistryWorkspaceState) -> Option<GuiWorkspace> {
@@ -980,6 +1054,41 @@ mod tests {
             loaded.manual_prompt_history,
             vec!["first".to_string(), "second".to_string()]
         );
+    }
+
+    #[test]
+    fn registry_round_trips_system_theme_and_external_apps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("gui.json");
+        let app_path = tmp.path().join("tools").join("agent.exe");
+        let mut registry = GuiConfigRegistry::new(state.clone());
+        registry.set_system_settings(
+            GuiTheme::Light,
+            vec![
+                GuiExternalApplication {
+                    name: "Agent".to_string(),
+                    path: app_path.clone(),
+                },
+                GuiExternalApplication {
+                    name: "重复路径".to_string(),
+                    path: app_path.clone(),
+                },
+                GuiExternalApplication {
+                    name: String::new(),
+                    path: tmp.path().join("tools").join("helper.exe"),
+                },
+            ],
+        );
+        registry.save().unwrap();
+
+        let mut loaded = GuiConfigRegistry::new(state);
+        loaded.load();
+
+        assert_eq!(loaded.theme, GuiTheme::Light);
+        assert_eq!(loaded.external_apps.len(), 2);
+        assert_eq!(loaded.external_apps[0].name, "Agent");
+        assert_eq!(loaded.external_apps[0].path, app_path);
+        assert_eq!(loaded.external_apps[1].name, "helper");
     }
 
     #[test]

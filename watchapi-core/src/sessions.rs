@@ -1,8 +1,10 @@
 use crate::atomic_write::write_text_atomic;
+use crate::config::ContinuationTriggerRule;
 use crate::pollution::{is_keyword_polluted_text, pollution_detection_configured};
 use crate::tokens::{extract_token_usage, TokenUsage};
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
@@ -481,12 +483,14 @@ pub struct CodexSessionMonitor {
     assistant_message_count_at_wait_start: Option<u64>,
     pub pollution_detected: bool,
     pub completion_pause_detected: bool,
+    pub continuation_trigger_prompt: Option<String>,
     pub endpoint_failure_detected: bool,
     pub token_usage_total: TokenUsage,
     active_turn_ids: HashSet<String>,
     position: u64,
     polluted_response_keywords: Vec<String>,
     completion_pause_keywords: Vec<String>,
+    continuation_trigger_rules: Vec<ContinuationTriggerRule>,
     polluted_response_threshold: f64,
     polluted_context_window: usize,
     polluted_check_max_chars: usize,
@@ -571,8 +575,10 @@ pub struct ClaudeSessionMonitor {
     position: u64,
     pub pollution_detected: bool,
     pub completion_pause_detected: bool,
+    pub continuation_trigger_prompt: Option<String>,
     polluted_response_keywords: Vec<String>,
     completion_pause_keywords: Vec<String>,
+    continuation_trigger_rules: Vec<ContinuationTriggerRule>,
     polluted_response_threshold: f64,
     polluted_context_window: usize,
     polluted_check_max_chars: usize,
@@ -591,6 +597,33 @@ impl ClaudeSessionMonitor {
         polluted_context_window: usize,
         polluted_check_max_chars: usize,
     ) -> Self {
+        Self::new_with_continuation_trigger_rules(
+            claude_home,
+            workdir,
+            launch_started_at,
+            session_id,
+            polluted_response_keywords,
+            completion_pause_keywords,
+            Vec::new(),
+            polluted_response_threshold,
+            polluted_context_window,
+            polluted_check_max_chars,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_continuation_trigger_rules(
+        claude_home: PathBuf,
+        workdir: PathBuf,
+        launch_started_at: DateTime<Utc>,
+        session_id: Option<String>,
+        polluted_response_keywords: Vec<String>,
+        completion_pause_keywords: Vec<String>,
+        continuation_trigger_rules: Vec<ContinuationTriggerRule>,
+        polluted_response_threshold: f64,
+        polluted_context_window: usize,
+        polluted_check_max_chars: usize,
+    ) -> Self {
         Self {
             index: ClaudeSessionIndex::new(claude_home),
             workdir,
@@ -600,8 +633,10 @@ impl ClaudeSessionMonitor {
             position: 0,
             pollution_detected: false,
             completion_pause_detected: false,
+            continuation_trigger_prompt: None,
             polluted_response_keywords,
             completion_pause_keywords,
+            continuation_trigger_rules,
             polluted_response_threshold,
             polluted_context_window,
             polluted_check_max_chars,
@@ -679,6 +714,10 @@ impl ClaudeSessionMonitor {
             );
         if polluted {
             self.pollution_detected = true;
+        } else if let Some(prompt) =
+            continuation_trigger_prompt_for_text(&text, &self.continuation_trigger_rules)
+        {
+            self.continuation_trigger_prompt.get_or_insert(prompt);
         } else if contains_keyword(&text, &self.completion_pause_keywords) {
             self.completion_pause_detected = true;
         }
@@ -693,9 +732,11 @@ pub struct OpenCodeSessionMonitor {
     pub session_id: Option<String>,
     pub pollution_detected: bool,
     pub completion_pause_detected: bool,
+    pub continuation_trigger_prompt: Option<String>,
     seen_fingerprint: String,
     polluted_response_keywords: Vec<String>,
     completion_pause_keywords: Vec<String>,
+    continuation_trigger_rules: Vec<ContinuationTriggerRule>,
     polluted_response_threshold: f64,
     polluted_context_window: usize,
     polluted_check_max_chars: usize,
@@ -714,6 +755,33 @@ impl OpenCodeSessionMonitor {
         polluted_context_window: usize,
         polluted_check_max_chars: usize,
     ) -> Self {
+        Self::new_with_continuation_trigger_rules(
+            command,
+            workdir,
+            launch_started_at,
+            session_id,
+            polluted_response_keywords,
+            completion_pause_keywords,
+            Vec::new(),
+            polluted_response_threshold,
+            polluted_context_window,
+            polluted_check_max_chars,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_continuation_trigger_rules(
+        command: Vec<String>,
+        workdir: PathBuf,
+        launch_started_at: DateTime<Utc>,
+        session_id: Option<String>,
+        polluted_response_keywords: Vec<String>,
+        completion_pause_keywords: Vec<String>,
+        continuation_trigger_rules: Vec<ContinuationTriggerRule>,
+        polluted_response_threshold: f64,
+        polluted_context_window: usize,
+        polluted_check_max_chars: usize,
+    ) -> Self {
         Self {
             command,
             workdir,
@@ -721,9 +789,11 @@ impl OpenCodeSessionMonitor {
             session_id,
             pollution_detected: false,
             completion_pause_detected: false,
+            continuation_trigger_prompt: None,
             seen_fingerprint: String::new(),
             polluted_response_keywords,
             completion_pause_keywords,
+            continuation_trigger_rules,
             polluted_response_threshold,
             polluted_context_window,
             polluted_check_max_chars,
@@ -779,6 +849,10 @@ impl OpenCodeSessionMonitor {
             );
         if polluted {
             self.pollution_detected = true;
+        } else if let Some(prompt) =
+            continuation_trigger_prompt_for_text(&text, &self.continuation_trigger_rules)
+        {
+            self.continuation_trigger_prompt.get_or_insert(prompt);
         } else if contains_keyword(&text, &self.completion_pause_keywords) {
             self.completion_pause_detected = true;
         }
@@ -840,6 +914,33 @@ impl CodexSessionMonitor {
         polluted_context_window: usize,
         polluted_check_max_chars: usize,
     ) -> Self {
+        Self::new_with_continuation_trigger_rules(
+            codex_home,
+            workdir,
+            launch_started_at,
+            session_id,
+            polluted_response_keywords,
+            completion_pause_keywords,
+            Vec::new(),
+            polluted_response_threshold,
+            polluted_context_window,
+            polluted_check_max_chars,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_continuation_trigger_rules(
+        codex_home: PathBuf,
+        workdir: PathBuf,
+        launch_started_at: DateTime<Utc>,
+        session_id: Option<String>,
+        polluted_response_keywords: Vec<String>,
+        completion_pause_keywords: Vec<String>,
+        continuation_trigger_rules: Vec<ContinuationTriggerRule>,
+        polluted_response_threshold: f64,
+        polluted_context_window: usize,
+        polluted_check_max_chars: usize,
+    ) -> Self {
         Self {
             codex_home,
             workdir,
@@ -854,12 +955,14 @@ impl CodexSessionMonitor {
             assistant_message_count_at_wait_start: None,
             pollution_detected: false,
             completion_pause_detected: false,
+            continuation_trigger_prompt: None,
             endpoint_failure_detected: false,
             token_usage_total: TokenUsage::default(),
             active_turn_ids: HashSet::new(),
             position: 0,
             polluted_response_keywords,
             completion_pause_keywords,
+            continuation_trigger_rules,
             polluted_response_threshold,
             polluted_context_window,
             polluted_check_max_chars,
@@ -1001,6 +1104,10 @@ impl CodexSessionMonitor {
                     );
                 if polluted {
                     self.pollution_detected = true;
+                } else if let Some(prompt) =
+                    continuation_trigger_prompt_for_text(&text, &self.continuation_trigger_rules)
+                {
+                    self.continuation_trigger_prompt.get_or_insert(prompt);
                 } else if contains_keyword(&text, &self.completion_pause_keywords) {
                     self.completion_pause_detected = true;
                 }
@@ -1745,6 +1852,36 @@ fn contains_keyword(text: &str, keywords: &[String]) -> bool {
         .iter()
         .filter(|keyword| !keyword.is_empty())
         .any(|keyword| haystack.contains(&keyword.to_ascii_lowercase()))
+}
+
+fn continuation_trigger_prompt_for_text(
+    text: &str,
+    rules: &[ContinuationTriggerRule],
+) -> Option<String> {
+    if text.trim().is_empty() {
+        return None;
+    }
+    rules.iter().find_map(|rule| {
+        let patterns = rule
+            .keywords
+            .iter()
+            .filter(|pattern| !pattern.trim().is_empty())
+            .collect::<Vec<_>>();
+        if patterns.is_empty() || rule.prompt.trim().is_empty() {
+            return None;
+        }
+        let matches = patterns
+            .iter()
+            .filter(|pattern| Regex::new(pattern).is_ok_and(|regex| regex.is_match(text)))
+            .count();
+        let ratio = matches as f64 / patterns.len() as f64;
+        let triggered = if rule.threshold <= 0.0 {
+            matches > 0
+        } else {
+            ratio >= rule.threshold
+        };
+        triggered.then(|| rule.prompt.clone())
+    })
 }
 
 fn claude_session_matches_workdir(path: &Path, normalized_workdir: &str) -> bool {
@@ -3173,5 +3310,44 @@ mod tests {
 
         assert!(monitor.pollution_detected);
         assert!(!monitor.completion_pause_detected);
+    }
+
+    #[test]
+    fn continuation_trigger_rules_use_regexes_and_match_ratio() {
+        let rules = vec![ContinuationTriggerRule {
+            keywords: vec!["(?i)todo\\b".to_string(), "FIXME".to_string()],
+            threshold: 0.5,
+            prompt: "先处理待办项。".to_string(),
+        }];
+
+        assert_eq!(
+            continuation_trigger_prompt_for_text("发现 TODO，后续继续。", &rules),
+            Some("先处理待办项。".to_string())
+        );
+        assert_eq!(
+            continuation_trigger_prompt_for_text("没有待办项。", &rules),
+            None
+        );
+    }
+
+    #[test]
+    fn first_matching_continuation_trigger_rule_wins() {
+        let rules = vec![
+            ContinuationTriggerRule {
+                keywords: vec!["TODO".to_string()],
+                threshold: 1.0,
+                prompt: "先执行第一条。".to_string(),
+            },
+            ContinuationTriggerRule {
+                keywords: vec!["TODO".to_string()],
+                threshold: 1.0,
+                prompt: "不应执行第二条。".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            continuation_trigger_prompt_for_text("TODO: continue", &rules),
+            Some("先执行第一条。".to_string())
+        );
     }
 }

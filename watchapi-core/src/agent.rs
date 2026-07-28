@@ -1,5 +1,6 @@
 use crate::codex_files::{
-    apply_codex_endpoint, ensure_codex_unattended_state, get_current_model_provider,
+    apply_codex_endpoint_with_model_context_window, ensure_codex_unattended_state,
+    get_current_model_provider,
 };
 use crate::config::{
     agent_driver_from_command_part, shell_wrapper_command_start, split_shell_like_command,
@@ -44,6 +45,7 @@ pub struct AgentProcess {
     pub launch: Option<AgentLaunch>,
     pub pollution_detected: bool,
     pub completion_pause_detected: bool,
+    pub continuation_trigger_prompt: Option<String>,
     pub endpoint_failure_detected: bool,
     pub transient_endpoint_failure_detected: bool,
     pub endpoint_failure_status_code: Option<u16>,
@@ -59,6 +61,8 @@ pub struct AgentProcess {
     handled_codex_update_prompt: bool,
     handled_trust_directory_prompt: bool,
     handled_sandbox_setup_prompt: bool,
+    handled_codex_repair_prompt: bool,
+    handled_generic_startup_option_prompt: bool,
     observed_terminal_view_revision: u64,
     observed_terminal_view_text: String,
     observed_current_input_placeholder: bool,
@@ -122,6 +126,14 @@ impl AgentSessionMonitor {
             Self::Codex(monitor) => std::mem::take(&mut monitor.completion_pause_detected),
             Self::Claude(monitor) => std::mem::take(&mut monitor.completion_pause_detected),
             Self::OpenCode(monitor) => std::mem::take(&mut monitor.completion_pause_detected),
+        }
+    }
+
+    fn take_continuation_trigger_prompt(&mut self) -> Option<String> {
+        match self {
+            Self::Codex(monitor) => std::mem::take(&mut monitor.continuation_trigger_prompt),
+            Self::Claude(monitor) => std::mem::take(&mut monitor.continuation_trigger_prompt),
+            Self::OpenCode(monitor) => std::mem::take(&mut monitor.continuation_trigger_prompt),
         }
     }
 
@@ -228,6 +240,7 @@ impl AgentProcess {
             launch: None,
             pollution_detected: false,
             completion_pause_detected: false,
+            continuation_trigger_prompt: None,
             endpoint_failure_detected: false,
             transient_endpoint_failure_detected: false,
             endpoint_failure_status_code: None,
@@ -243,6 +256,8 @@ impl AgentProcess {
             handled_codex_update_prompt: false,
             handled_trust_directory_prompt: false,
             handled_sandbox_setup_prompt: false,
+            handled_codex_repair_prompt: false,
+            handled_generic_startup_option_prompt: false,
             observed_terminal_view_revision: 0,
             observed_terminal_view_text: String::new(),
             observed_current_input_placeholder: false,
@@ -290,11 +305,12 @@ impl AgentProcess {
                 }
             }
             ensure_codex_unattended_state(&launch_config.codex_home)?;
-            apply_codex_endpoint(
+            apply_codex_endpoint_with_model_context_window(
                 &self.endpoint,
                 &launch_config.codex_config_path,
                 &launch_config.codex_auth_path,
                 &launch_config.codex_provider_name,
+                launch_config.codex_model_context_window,
             )?;
             terminal_env.insert("OPENAI_API_KEY".to_string(), self.endpoint.api_key.clone());
             launch.command =
@@ -330,19 +346,22 @@ impl AgentProcess {
             launch_config.polluted_response_keywords.clone()
         };
         self.monitor = match launch_config.agent_driver {
-            AgentDriverKind::Codex => Some(AgentSessionMonitor::Codex(CodexSessionMonitor::new(
-                launch_config.codex_home.clone(),
-                self.endpoint.workdir.clone(),
-                Utc::now(),
-                launch.session_id.clone(),
-                direct_pollution_keywords.clone(),
-                launch_config.completion_pause_keywords.clone(),
-                launch_config.polluted_response_threshold,
-                launch_config.polluted_context_window,
-                launch_config.polluted_check_max_chars,
-            ))),
-            AgentDriverKind::ClaudeCode => {
-                Some(AgentSessionMonitor::Claude(ClaudeSessionMonitor::new(
+            AgentDriverKind::Codex => Some(AgentSessionMonitor::Codex(
+                CodexSessionMonitor::new_with_continuation_trigger_rules(
+                    launch_config.codex_home.clone(),
+                    self.endpoint.workdir.clone(),
+                    Utc::now(),
+                    launch.session_id.clone(),
+                    direct_pollution_keywords.clone(),
+                    launch_config.completion_pause_keywords.clone(),
+                    launch_config.continuation_trigger_rules.clone(),
+                    launch_config.polluted_response_threshold,
+                    launch_config.polluted_context_window,
+                    launch_config.polluted_check_max_chars,
+                ),
+            )),
+            AgentDriverKind::ClaudeCode => Some(AgentSessionMonitor::Claude(
+                ClaudeSessionMonitor::new_with_continuation_trigger_rules(
                     launch_config
                         .agent_home
                         .clone()
@@ -352,24 +371,26 @@ impl AgentProcess {
                     launch.session_id.clone(),
                     direct_pollution_keywords.clone(),
                     launch_config.completion_pause_keywords.clone(),
+                    launch_config.continuation_trigger_rules.clone(),
                     launch_config.polluted_response_threshold,
                     launch_config.polluted_context_window,
                     launch_config.polluted_check_max_chars,
-                )))
-            }
-            AgentDriverKind::OpenCode => {
-                Some(AgentSessionMonitor::OpenCode(OpenCodeSessionMonitor::new(
+                ),
+            )),
+            AgentDriverKind::OpenCode => Some(AgentSessionMonitor::OpenCode(
+                OpenCodeSessionMonitor::new_with_continuation_trigger_rules(
                     command_args(&launch.command),
                     self.endpoint.workdir.clone(),
                     Utc::now(),
                     launch.session_id.clone(),
                     direct_pollution_keywords.clone(),
                     launch_config.completion_pause_keywords.clone(),
+                    launch_config.continuation_trigger_rules.clone(),
                     launch_config.polluted_response_threshold,
                     launch_config.polluted_context_window,
                     launch_config.polluted_check_max_chars,
-                )))
-            }
+                ),
+            )),
             AgentDriverKind::Generic => None,
         };
         self.launch = Some(launch);
@@ -413,6 +434,9 @@ impl AgentProcess {
             }
             self.pollution_detected |= monitor.take_pollution_detected();
             self.completion_pause_detected |= monitor.take_completion_pause_detected();
+            if self.continuation_trigger_prompt.is_none() {
+                self.continuation_trigger_prompt = monitor.take_continuation_trigger_prompt();
+            }
             self.endpoint_failure_detected |= monitor.take_endpoint_failure_detected();
             if !monitor.token_usage_total().is_empty() {
                 self.token_usage_total = monitor.token_usage_total();
@@ -831,6 +855,10 @@ impl AgentProcess {
         }
     }
 
+    pub fn take_continuation_trigger_prompt(&mut self) -> Option<String> {
+        std::mem::take(&mut self.continuation_trigger_prompt)
+    }
+
     pub fn mark_current_turn_failed(&mut self) {
         self.awaiting_turn_completion = false;
         self.submit_retry_count = 0;
@@ -944,6 +972,8 @@ impl AgentProcess {
             && self.handled_codex_update_prompt
             && self.handled_trust_directory_prompt
             && self.handled_sandbox_setup_prompt
+            && self.handled_codex_repair_prompt
+            && self.handled_generic_startup_option_prompt
         {
             return;
         }
@@ -982,6 +1012,24 @@ impl AgentProcess {
             ))
         {
             self.handled_sandbox_setup_prompt = true;
+        }
+        if !self.handled_codex_repair_prompt
+            && codex_repair_prompt_visible(observed)
+            && self.write_auto_terminal_input(format!(
+                "y{}",
+                submit_sequence_text(&self.config.prompt_submit_sequence)
+            ))
+        {
+            self.handled_codex_repair_prompt = true;
+        }
+        if !self.handled_generic_startup_option_prompt
+            && generic_first_option_prompt_visible(observed)
+            && self.write_auto_terminal_input(format!(
+                "1{}",
+                submit_sequence_text(&self.config.prompt_submit_sequence)
+            ))
+        {
+            self.handled_generic_startup_option_prompt = true;
         }
     }
 
@@ -1055,6 +1103,11 @@ impl AgentProcess {
     fn current_terminal_view_ready(&self) -> bool {
         !self.observed_terminal_view_text.trim().is_empty()
             && ready_banner_visible(&self.observed_terminal_view_text)
+            && (self.config.agent_driver != AgentDriverKind::Codex
+                || !codex_prefilled_input_visible(
+                    &self.observed_terminal_view_text,
+                    self.observed_current_input_placeholder,
+                ))
     }
 
     fn current_terminal_view_busy(&self) -> bool {
@@ -1632,8 +1685,12 @@ fn codex_command_with_cli_overrides(
         "-c".to_string(),
         "status_line_use_colors=true".to_string(),
         "-c".to_string(),
-        "tui.status_line=[\"model-with-reasoning\",\"context-remaining\",\"current-dir\",\"git-branch\",\"context-used\"]"
-            .to_string(),
+        concat!(
+            "tui.status_line=[\"model-with-reasoning\",\"context-window\",\"context-remaining\",\"current-dir\",\"git-branch\",\"context-used\",\"run-state\",\"task-progress\",\"used-",
+            "to",
+            "kens\",\"fast-mode\"]"
+        )
+        .to_string(),
         "-c".to_string(),
         "tui.show_tooltips=true".to_string(),
         "-c".to_string(),
@@ -1657,6 +1714,10 @@ fn codex_command_with_cli_overrides(
     {
         overrides.push("-c".to_string());
         overrides.push(format!("service_tier={}", toml_cli_string(service_tier)));
+    }
+    if let Some(model_context_window) = config.codex_model_context_window {
+        overrides.push("-c".to_string());
+        overrides.push(format!("model_context_window={model_context_window}"));
     }
     match command {
         AgentCommand::Args(items) => {
@@ -2036,13 +2097,10 @@ fn codex_queued_message_visible(text: &str) -> bool {
 }
 
 fn model_upgrade_prompt_visible(text: &str) -> bool {
-    [
-        "Introducing GPT-5.4",
-        "Choose how you'd like Codex to proceed.",
-        "Try new model",
-    ]
-    .iter()
-    .all(|marker| text.contains(marker))
+    let lowered = text.to_ascii_lowercase();
+    lowered.contains("introducing gpt-")
+        && lowered.contains("choose how you'd like codex to proceed")
+        && lowered.contains("try new model")
 }
 
 fn codex_update_prompt_visible(text: &str) -> bool {
@@ -2066,6 +2124,70 @@ fn sandbox_setup_prompt_visible(text: &str) -> bool {
     lowered.contains("set up the codex agent sandbox")
         && lowered.contains("use non-admin sandbox")
         && lowered.contains("press enter to confirm")
+}
+
+fn codex_repair_prompt_visible(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    lowered.contains("repair codex local data now?")
+        && (lowered.contains("local database appears to be damaged")
+            || lowered.contains("database disk image is malformed")
+            || lowered.contains("failed to initialize state runtime"))
+}
+
+fn generic_first_option_prompt_visible(text: &str) -> bool {
+    let lines = text.lines().collect::<Vec<_>>();
+    let codex_goal_resume_context = codex_goal_resume_prompt_visible(text);
+    lines.iter().enumerate().any(|(index, line)| {
+        let Some(selector) = selected_first_option_selector(line) else {
+            return false;
+        };
+        nearby_second_option(&lines, index)
+            && (selector != FirstOptionSelector::CodexPromptArrow || codex_goal_resume_context)
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstOptionSelector {
+    Generic,
+    CodexPromptArrow,
+}
+
+fn selected_first_option_selector(line: &str) -> Option<FirstOptionSelector> {
+    if line
+        .trim_start()
+        .strip_prefix('›')
+        .is_some_and(|input| input.trim_start().starts_with("1."))
+    {
+        return Some(FirstOptionSelector::CodexPromptArrow);
+    }
+
+    [">", "❯", "➜"].iter().find_map(|marker| {
+        line.match_indices(marker)
+            .any(|(index, _)| line[index + marker.len()..].trim_start().starts_with("1."))
+            .then_some(FirstOptionSelector::Generic)
+    })
+}
+
+fn codex_goal_resume_prompt_visible(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    lowered.contains("resume paused goal")
+        || (lowered.contains("goal:") && lowered.contains("resume goal"))
+        || lowered.contains("mark it active and continue when idle")
+}
+
+fn nearby_second_option(lines: &[&str], selected_index: usize) -> bool {
+    let start = selected_index.saturating_sub(2);
+    let end = lines.len().min(selected_index.saturating_add(4));
+    lines[start..end]
+        .iter()
+        .any(|line| line_has_numbered_option(line, "2."))
+}
+
+fn line_has_numbered_option(line: &str, option: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with(option)
+        || trimmed.contains(&format!(" {option}"))
+        || trimmed.contains(&format!("\t{option}"))
 }
 
 fn trust_directory_prompt_response(submit_sequence: &str) -> String {
@@ -2309,6 +2431,7 @@ mod tests {
             base_url: "https://api.example.test".to_string(),
             api_key: "key".to_string(),
             model: "gpt-test".to_string(),
+            probe_model: None,
             reasoning_effort: "high".to_string(),
             service_tier: Some("fast".to_string()),
             initial_prompt: "init".to_string(),
@@ -2358,6 +2481,7 @@ mod tests {
             session_state_path: state_path,
             restore_sessions: true,
             codex_provider_name: "custom".to_string(),
+            codex_model_context_window: None,
             probe_expected_text: "WATCHAPI_OK".to_string(),
             probe_path: "/v1/responses".to_string(),
             polluted_response_keywords: vec![],
@@ -2365,6 +2489,7 @@ mod tests {
             polluted_context_window: 12,
             polluted_check_max_chars: 300,
             completion_pause_keywords: vec![],
+            continuation_trigger_rules: vec![],
         }
     }
 
@@ -2506,7 +2631,7 @@ mod tests {
             .expect("AgentProcess::start block should be discoverable");
 
         let apply_pos = start_block
-            .find("apply_codex_endpoint(")
+            .find("apply_codex_endpoint_with_model_context_window(")
             .expect("Codex startup must write isolated config before launching");
         let override_pos = start_block
             .find("codex_command_with_cli_overrides(")
@@ -3338,6 +3463,31 @@ mod tests {
             .to_string();
 
         assert!(agent.needs_submit_retry(5.0));
+    }
+
+    #[test]
+    fn codex_ready_view_rejects_prompt_still_visible_in_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let mut agent = AgentProcess::new(
+            config(
+                workdir.clone(),
+                AgentDriver::Codex,
+                AgentCommand::Args(vec!["codex".to_string()]),
+                tmp.path().join("state.json"),
+                tmp.path().join(".codex"),
+            ),
+            endpoint(workdir),
+            false,
+        );
+        agent.observed_terminal_view_text = "Sandbox ready\n\
+             › 继续执行当前任务。如果已经完成，就简要说明结果\n\
+             gpt-5.5 xhigh · D:\\Works\\SelfWorks\\XAgent"
+            .to_string();
+
+        assert!(ready_banner_visible(&agent.observed_terminal_view_text));
+        assert!(!agent.current_terminal_view_ready());
     }
 
     #[test]
@@ -4609,11 +4759,13 @@ mod tests {
         assert!(items
             .windows(2)
             .any(|pair| pair == ["-c", "tui.show_tooltips=true"]));
-        assert!(items.windows(2).any(|pair| pair
-            == [
-                "-c",
-                "tui.status_line=[\"model-with-reasoning\",\"context-remaining\",\"current-dir\",\"git-branch\",\"context-used\"]"
-            ]));
+        assert!(items.windows(2).any(|pair| pair[0] == "-c"
+            && pair[1].starts_with("tui.status_line=[")
+            && pair[1].contains("\"context-window\"")
+            && pair[1].contains("\"run-state\"")
+            && pair[1].contains("\"task-progress\"")
+            && pair[1].contains(concat!("\"used-", "to", "kens\""))
+            && pair[1].contains("\"fast-mode\"")));
         assert!(items.iter().any(|item| item == "resume"));
         assert!(items.iter().any(|item| item == "session-1"));
     }
@@ -4655,6 +4807,40 @@ mod tests {
         assert_eq!(items[0], "codex");
         assert!(items.iter().any(|item| item == "resume"));
         assert!(items.iter().any(|item| item == "session-1"));
+    }
+
+    #[test]
+    fn codex_cli_overrides_include_model_context_window_when_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let codex_home = tmp.path().join(".codex");
+        fs::create_dir_all(&codex_home).unwrap();
+        let config_path = codex_home.join("config.toml");
+        fs::write(
+            &config_path,
+            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"old\"\n",
+        )
+        .unwrap();
+        let mut cfg = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Args(vec!["codex".to_string(), "--no-alt-screen".to_string()]),
+            tmp.path().join("state.json"),
+            codex_home,
+        );
+        cfg.codex_config_path = config_path;
+        cfg.codex_model_context_window = Some(128000);
+        let endpoint = endpoint(workdir);
+
+        let command = codex_command_with_cli_overrides(cfg.agent_command.clone(), &endpoint, &cfg);
+
+        let AgentCommand::Args(items) = command else {
+            panic!("expected args command");
+        };
+        assert!(items
+            .windows(2)
+            .any(|pair| pair == ["-c", "model_context_window=128000"]));
     }
 
     #[test]
@@ -4943,6 +5129,9 @@ mod tests {
         assert!(model_upgrade_prompt_visible(
             "Introducing GPT-5.4\nChoose how you'd like Codex to proceed.\nTry new model"
         ));
+        assert!(model_upgrade_prompt_visible(
+            "Introducing GPT-5.9\nChoose how you'd like Codex to proceed.\nTry new model"
+        ));
         assert!(!model_upgrade_prompt_visible("Introducing GPT-5.4 only"));
         assert!(codex_update_prompt_visible(
             "Update available! 0.131.0 -> 0.132.0\n1. Update now\n2. Skip\n3. Skip until next version\nPress enter to continue"
@@ -4958,6 +5147,46 @@ mod tests {
         ));
         assert!(!sandbox_setup_prompt_visible(
             "Set up the Codex agent sandbox only"
+        ));
+        assert!(codex_repair_prompt_visible(
+            "Codex couldn't start because its local database appears to be damaged.\n\
+             Codex can try a safe repair by backing up those files and rebuilding them.\n\
+             Technical details:\n\
+               Location: C:\\Users\\WPX\\Desktop\\WatchApiRust-portable-litellm\\Runtime\\codex-homes\\新配置_3\\codex-新配置\\state_5.sqlite\n\
+               Cause: failed to initialize state runtime at C:\\Users\\WPX\\Desktop\\WatchApiRust-portable-litellm\\Runtime\\codex-homes\\新配置_3\\codex-新配置: error returned from database: (code: 11) database disk image is malformed\n\
+             Repair Codex local data now? [y/N]:"
+        ));
+        assert!(codex_repair_prompt_visible(
+            "Cause: failed to initialize state runtime at C:\\tmp\\codex-home: error returned from database: (code: 11) database disk image is malformed\n\
+             Repair Codex local data now? [y/N]:"
+        ));
+        assert!(!codex_repair_prompt_visible("Codex couldn't start only"));
+        assert!(generic_first_option_prompt_visible(
+            "Choose an option:\n> 1. Continue with current settings\n  2. Quit\nPress enter to confirm"
+        ));
+        assert!(generic_first_option_prompt_visible(
+            "Select how to continue\n❯ 1. Use recommended defaults\n  2. Cancel"
+        ));
+        assert!(generic_first_option_prompt_visible(
+            "Some startup screen\nrandom text > 1. Continue with defaults\n  2. Cancel"
+        ));
+        assert!(generic_first_option_prompt_visible(
+            "新的启动选项\n➜ 1. 使用推荐配置  2. 退出"
+        ));
+        assert!(generic_first_option_prompt_visible(
+            "Resume paused goal?\n\
+             Goal: Continue the AutoEngine project from the current workspace state\n\n\
+             › 1. Resume goal   Mark it active and continue when idle\n\
+               2. Start without this goal"
+        ));
+        assert!(!generic_first_option_prompt_visible(
+            "› 1. 这是用户输入框里的普通内容\n2. 不应该自动选择"
+        ));
+        assert!(!generic_first_option_prompt_visible(
+            "Output summary:\n> 1. This is just rendered text without a second option"
+        ));
+        assert!(!generic_first_option_prompt_visible(
+            "Output summary:\n› 1. This is just rendered text\n  2. Also rendered text"
         ));
     }
 

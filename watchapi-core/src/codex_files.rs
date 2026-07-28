@@ -10,7 +10,11 @@ const CODEX_UNATTENDED_MODEL_UPGRADES: &[&str] = &["gpt-5.4"];
 const CODEX_DEFAULT_STATUS_LINE: &str = "true";
 const CODEX_DEFAULT_STATUS_LINE_USE_COLORS: &str = "true";
 const CODEX_DEFAULT_TUI_STATUS_LINE_ITEMS: &str =
-    "[\"model-with-reasoning\", \"context-remaining\", \"current-dir\", \"git-branch\", \"context-used\"]";
+    concat!(
+        "[\"model-with-reasoning\", \"context-window\", \"context-remaining\", \"current-dir\", \"git-branch\", \"context-used\", \"run-state\", \"task-progress\", \"used-",
+        "to",
+        "kens\", \"fast-mode\"]"
+    );
 const CODEX_DEFAULT_TUI_SHOW_TOOLTIPS: &str = "true";
 const CODEX_DEFAULT_TUI_ANIMATIONS: &str = "true";
 const CODEX_DEFAULT_TUI_RAW_OUTPUT_MODE: &str = "false";
@@ -164,6 +168,22 @@ pub fn apply_codex_endpoint(
     auth_path: &Path,
     provider_name: &str,
 ) -> Result<()> {
+    apply_codex_endpoint_with_model_context_window(
+        endpoint,
+        config_path,
+        auth_path,
+        provider_name,
+        None,
+    )
+}
+
+pub fn apply_codex_endpoint_with_model_context_window(
+    endpoint: &EndpointConfig,
+    config_path: &Path,
+    auth_path: &Path,
+    provider_name: &str,
+    model_context_window: Option<usize>,
+) -> Result<()> {
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -189,6 +209,7 @@ pub fn apply_codex_endpoint(
             model: Some(&endpoint.model),
             reasoning_effort: Some(&endpoint.reasoning_effort),
             service_tier: endpoint.service_tier.as_deref(),
+            model_context_window,
             sandbox_mode: Some("danger-full-access"),
             approval_policy: Some("never"),
         },
@@ -249,6 +270,7 @@ pub struct CodexConfigValues<'a> {
     pub model: Option<&'a str>,
     pub reasoning_effort: Option<&'a str>,
     pub service_tier: Option<&'a str>,
+    pub model_context_window: Option<usize>,
     pub sandbox_mode: Option<&'a str>,
     pub approval_policy: Option<&'a str>,
 }
@@ -266,6 +288,11 @@ pub fn set_codex_config_values(
         set_top_level_assignment(&mut lines, "model_reasoning_effort", value);
     }
     set_optional_top_level_assignment(&mut lines, "service_tier", values.service_tier);
+    set_optional_top_level_usize_assignment(
+        &mut lines,
+        "model_context_window",
+        values.model_context_window,
+    );
     if let Some(value) = values.sandbox_mode {
         set_top_level_assignment(&mut lines, "sandbox_mode", value);
     }
@@ -452,6 +479,18 @@ fn set_optional_top_level_assignment(lines: &mut Vec<String>, key: &str, value: 
     set_top_level_assignment(lines, key, value);
 }
 
+fn set_optional_top_level_usize_assignment(
+    lines: &mut Vec<String>,
+    key: &str,
+    value: Option<usize>,
+) {
+    let Some(value) = value else {
+        remove_top_level_assignment(lines, key);
+        return;
+    };
+    set_top_level_raw_assignment(lines, key, &value.to_string());
+}
+
 fn remove_top_level_assignment(lines: &mut Vec<String>, key: &str) {
     let search_end = find_first_section(lines).unwrap_or(lines.len());
     for index in matching_assignment_indexes(lines, 0, search_end, key)
@@ -567,6 +606,7 @@ mod tests {
             base_url: "https://new.example.test".to_string(),
             api_key: "new-key".to_string(),
             model: "new-model".to_string(),
+            probe_model: None,
             reasoning_effort: "high".to_string(),
             service_tier: Some("fast".to_string()),
             initial_prompt: "bootstrap".to_string(),
@@ -667,9 +707,9 @@ mod tests {
         assert!(config_text.contains("status_line = true"));
         assert!(config_text.contains("status_line_use_colors = true"));
         assert!(config_text.contains("[tui]"));
-        assert!(config_text.contains(
-            "status_line = [\"model-with-reasoning\", \"context-remaining\", \"current-dir\", \"git-branch\", \"context-used\"]"
-        ));
+        assert!(config_text.contains(&format!(
+            "status_line = {CODEX_DEFAULT_TUI_STATUS_LINE_ITEMS}"
+        )));
         assert!(config_text.contains("show_tooltips = true"));
         assert!(config_text.contains("animations = true"));
         assert!(config_text.contains("raw_output_mode = false"));
@@ -705,9 +745,9 @@ mod tests {
         let config_text = fs::read_to_string(config_path).unwrap();
         assert!(config_text.contains("status_line = true"));
         assert!(config_text.contains("status_line_use_colors = true"));
-        assert!(config_text.contains(
-            "status_line = [\"model-with-reasoning\", \"context-remaining\", \"current-dir\", \"git-branch\", \"context-used\"]"
-        ));
+        assert!(config_text.contains(&format!(
+            "status_line = {CODEX_DEFAULT_TUI_STATUS_LINE_ITEMS}"
+        )));
         assert!(config_text.contains("show_tooltips = true"));
         assert!(config_text.contains("animations = true"));
         assert!(config_text.contains("raw_output_mode = false"));
@@ -761,7 +801,9 @@ mod tests {
         );
         assert_eq!(
             config_text
-                .matches("status_line = [\"model-with-reasoning\", \"context-remaining\", \"current-dir\", \"git-branch\", \"context-used\"]")
+                .matches(&format!(
+                    "status_line = {CODEX_DEFAULT_TUI_STATUS_LINE_ITEMS}"
+                ))
                 .count(),
             1
         );
@@ -876,9 +918,9 @@ mod tests {
         let tui_pos = config_text.find("[tui]\n").unwrap();
         let nested_pos = config_text.find("[tui.model_availability_nux]").unwrap();
         assert!(tui_pos < nested_pos);
-        assert!(config_text.contains(
-            "status_line = [\"model-with-reasoning\", \"context-remaining\", \"current-dir\", \"git-branch\", \"context-used\"]"
-        ));
+        assert!(config_text.contains(&format!(
+            "status_line = {CODEX_DEFAULT_TUI_STATUS_LINE_ITEMS}"
+        )));
         assert!(config_text.contains("\"gpt-5.5\" = 4"));
     }
 
@@ -976,6 +1018,38 @@ mod tests {
         assert!(config_text.contains("base_url = \"https://new.example.test\""));
         assert!(config_text.contains("wire_api = \"responses\""));
         assert!(config_text.contains("requires_openai_auth = false"));
+    }
+
+    #[test]
+    fn apply_codex_endpoint_can_write_and_clear_model_context_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let auth_path = tmp.path().join("auth.json");
+
+        apply_codex_endpoint_with_model_context_window(
+            &endpoint(),
+            &config_path,
+            &auth_path,
+            "custom",
+            Some(128000),
+        )
+        .unwrap();
+
+        let config_text = fs::read_to_string(&config_path).unwrap();
+        assert!(config_text.contains("model_context_window = 128000"));
+
+        apply_codex_endpoint_with_model_context_window(
+            &endpoint(),
+            &config_path,
+            &auth_path,
+            "custom",
+            None,
+        )
+        .unwrap();
+
+        let cleared = fs::read_to_string(&config_path).unwrap();
+        assert!(!cleared.contains("model_context_window = 128000"));
+        assert!(!cleared.contains("model_context_window = "));
     }
 
     #[test]

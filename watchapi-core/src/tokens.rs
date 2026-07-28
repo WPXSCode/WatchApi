@@ -202,6 +202,38 @@ fn price_table() -> HashMap<&'static str, ModelTokenPrice> {
     use ModelTokenPrice as P;
     HashMap::from([
         (
+            "gpt-5.6",
+            P {
+                input_per_million: 5.00,
+                cached_input_per_million: 0.50,
+                output_per_million: 30.00,
+            },
+        ),
+        (
+            "gpt-5.6-sol",
+            P {
+                input_per_million: 5.00,
+                cached_input_per_million: 0.50,
+                output_per_million: 30.00,
+            },
+        ),
+        (
+            "gpt-5.6-terra",
+            P {
+                input_per_million: 2.50,
+                cached_input_per_million: 0.25,
+                output_per_million: 15.00,
+            },
+        ),
+        (
+            "gpt-5.6-luna",
+            P {
+                input_per_million: 1.00,
+                cached_input_per_million: 0.10,
+                output_per_million: 6.00,
+            },
+        ),
+        (
             "gpt-5.5",
             P {
                 input_per_million: 5.00,
@@ -231,6 +263,14 @@ fn price_table() -> HashMap<&'static str, ModelTokenPrice> {
                 input_per_million: 0.75,
                 cached_input_per_million: 0.075,
                 output_per_million: 4.50,
+            },
+        ),
+        (
+            "gpt-5.4-nano",
+            P {
+                input_per_million: 0.20,
+                cached_input_per_million: 0.02,
+                output_per_million: 1.25,
             },
         ),
         (
@@ -783,6 +823,50 @@ mod tests {
         };
 
         assert_eq!(format_token_cost("gpt-5.5", usage), "1.2k/$0.011");
+    }
+
+    #[test]
+    fn includes_gpt_56_and_gpt_54_nano_prices() {
+        assert_eq!(
+            model_token_price("gpt-5.6"),
+            Some(ModelTokenPrice {
+                input_per_million: 5.00,
+                cached_input_per_million: 0.50,
+                output_per_million: 30.00,
+            })
+        );
+        assert_eq!(
+            model_token_price("gpt-5.6-sol"),
+            Some(ModelTokenPrice {
+                input_per_million: 5.00,
+                cached_input_per_million: 0.50,
+                output_per_million: 30.00,
+            })
+        );
+        assert_eq!(
+            model_token_price("gpt-5.6-terra"),
+            Some(ModelTokenPrice {
+                input_per_million: 2.50,
+                cached_input_per_million: 0.25,
+                output_per_million: 15.00,
+            })
+        );
+        assert_eq!(
+            model_token_price("gpt-5.6-luna"),
+            Some(ModelTokenPrice {
+                input_per_million: 1.00,
+                cached_input_per_million: 0.10,
+                output_per_million: 6.00,
+            })
+        );
+        assert_eq!(
+            model_token_price("gpt-5.4-nano"),
+            Some(ModelTokenPrice {
+                input_per_million: 0.20,
+                cached_input_per_million: 0.02,
+                output_per_million: 1.25,
+            })
+        );
     }
 
     #[test]

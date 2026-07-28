@@ -1,9 +1,12 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+#![recursion_limit = "256"]
 
 use std::sync::Arc;
 
 #[cfg(windows)]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+#[cfg(windows)]
+use std::sync::atomic::{AtomicIsize, Ordering};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::HWND;
 #[cfg(windows)]
@@ -17,11 +20,15 @@ mod gui_support;
 mod litellm_proxy;
 mod tray;
 
+#[cfg(windows)]
+static MAIN_WINDOW_HANDLE: AtomicIsize = AtomicIsize::new(0);
+
 fn main() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("WatchApi Rust")
         .with_inner_size([1280.0, 860.0])
-        .with_min_inner_size([920.0, 620.0]);
+        .with_min_inner_size([920.0, 620.0])
+        .with_drag_and_drop(true);
     if let Some(icon) = load_window_icon() {
         viewport = viewport.with_icon(icon);
     }
@@ -50,18 +57,25 @@ fn register_main_window_handle(cc: &eframe::CreationContext<'_>) {
     if let Ok(handle) = cc.window_handle() {
         if let RawWindowHandle::Win32(handle) = handle.as_raw() {
             tray::set_main_window_handle(handle.hwnd.get());
-            apply_github_dark_window_decorations(handle.hwnd.get());
+            MAIN_WINDOW_HANDLE.store(handle.hwnd.get(), Ordering::Relaxed);
+            apply_native_window_theme(gui_support::GuiTheme::Dark);
         }
     }
 }
 
 #[cfg(windows)]
-fn apply_github_dark_window_decorations(hwnd: isize) {
-    let dark_mode: i32 = 1;
+fn apply_window_decorations(hwnd: isize, theme: gui_support::GuiTheme) {
+    let dark_mode: i32 = i32::from(theme == gui_support::GuiTheme::Dark);
     set_dwm_window_attribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark_mode);
 
-    let caption = github_dark_colorref(13, 17, 23);
-    let text = github_dark_colorref(230, 237, 243);
+    let (caption, text) = match theme {
+        gui_support::GuiTheme::Dark => {
+            (github_colorref(13, 17, 23), github_colorref(230, 237, 243))
+        }
+        gui_support::GuiTheme::Light => {
+            (github_colorref(246, 248, 250), github_colorref(31, 35, 40))
+        }
+    };
     set_dwm_window_attribute(hwnd, DWMWA_CAPTION_COLOR, &caption);
     set_dwm_window_attribute(hwnd, DWMWA_BORDER_COLOR, &caption);
     set_dwm_window_attribute(hwnd, DWMWA_TEXT_COLOR, &text);
@@ -71,8 +85,22 @@ fn apply_github_dark_window_decorations(hwnd: isize) {
 }
 
 #[cfg(windows)]
-fn github_dark_colorref(r: u8, g: u8, b: u8) -> u32 {
+fn github_colorref(r: u8, g: u8, b: u8) -> u32 {
     (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
+}
+
+pub(crate) fn apply_native_window_theme(theme: gui_support::GuiTheme) {
+    #[cfg(windows)]
+    {
+        let hwnd = MAIN_WINDOW_HANDLE.load(Ordering::Relaxed);
+        if hwnd != 0 {
+            apply_window_decorations(hwnd, theme);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = theme;
+    }
 }
 
 #[cfg(windows)]
@@ -163,7 +191,7 @@ fn app_root() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn main_window_handle_applies_github_dark_native_decorations() {
+    fn main_window_handle_applies_selected_native_theme_decorations() {
         let source = include_str!("main.rs");
         let register_block = source
             .split("fn register_main_window_handle")
@@ -172,9 +200,11 @@ mod tests {
             .expect("main window handle registration block should be discoverable");
 
         assert!(
-            register_block.contains("apply_github_dark_window_decorations(handle.hwnd.get());"),
-            "Windows native title bar and resize border must be themed after the HWND is available"
+            register_block.contains("apply_native_window_theme(gui_support::GuiTheme::Dark);"),
+            "Windows native title bar and resize border must be initialized after the HWND is available"
         );
+        assert!(source.contains("pub(crate) fn apply_native_window_theme"));
+        assert!(source.contains("gui_support::GuiTheme::Light"));
         assert!(source.contains("DWMWA_USE_IMMERSIVE_DARK_MODE"));
         assert!(source.contains("DWMWA_CAPTION_COLOR"));
         assert!(source.contains("DWMWA_BORDER_COLOR"));
