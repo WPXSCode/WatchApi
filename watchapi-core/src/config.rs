@@ -1131,7 +1131,7 @@ fn default_codex_command_name() -> &'static str {
     }
 }
 
-pub(crate) fn split_shell_like_command(text: &str) -> Vec<String> {
+pub fn split_shell_like_command(text: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;

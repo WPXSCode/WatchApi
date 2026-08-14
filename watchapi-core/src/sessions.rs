@@ -1,5 +1,7 @@
 use crate::atomic_write::write_text_atomic;
-use crate::config::ContinuationTriggerRule;
+use crate::config::{
+    agent_driver_from_command_part, shell_wrapper_command_start, ContinuationTriggerRule,
+};
 use crate::pollution::{is_keyword_polluted_text, pollution_detection_configured};
 use crate::tokens::{extract_token_usage, TokenUsage};
 use anyhow::{anyhow, Result};
@@ -18,6 +20,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+const OPENCODE_MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(750);
 
 static SESSION_STORE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const SUMMARY_TAIL_READ_BYTES: u64 = 256 * 1024;
@@ -468,6 +472,102 @@ impl ClaudeSessionIndex {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct OpenCodeSessionIndex {
+    command: Vec<String>,
+    data_dir: PathBuf,
+    max_count: usize,
+}
+
+impl OpenCodeSessionIndex {
+    pub fn new(command: Vec<String>) -> Self {
+        Self {
+            command,
+            data_dir: default_opencode_data_dir(),
+            max_count: 200,
+        }
+    }
+
+    pub fn with_data_dir(mut self, data_dir: PathBuf) -> Self {
+        self.data_dir = data_dir;
+        self
+    }
+
+    pub fn ranked_candidates(
+        &self,
+        workdir: &Path,
+        config_name: &str,
+        agent_name: &str,
+        store: &SessionStore,
+    ) -> Vec<SessionCandidate> {
+        let owners = store.bound_session_owners();
+        let context = RankingContext::new(workdir, config_name, agent_name);
+        let legacy_sessions = self.legacy_sessions();
+        let legacy_paths = legacy_sessions
+            .iter()
+            .filter_map(|(path, value)| extract_session_id(value).map(|id| (id, path.clone())))
+            .collect::<HashMap<_, _>>();
+        let max_count = self.max_count.to_string();
+        let mut candidates = self
+            .run_json(
+                workdir,
+                &[
+                    "session",
+                    "list",
+                    "--format",
+                    "json",
+                    "--max-count",
+                    &max_count,
+                    "--pure",
+                ],
+            )
+            .as_ref()
+            .map(coerce_json_list)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|item| {
+                opencode_candidate_from_value(
+                    item,
+                    legacy_paths.get(&extract_session_id(item)?).cloned(),
+                    &context,
+                    &owners,
+                )
+            })
+            .collect::<Vec<_>>();
+        candidates.extend(legacy_sessions.into_iter().filter_map(|(path, item)| {
+            opencode_candidate_from_value(&item, Some(path), &context, &owners)
+        }));
+        dedupe_session_candidates(&mut candidates);
+        sort_session_candidates(&mut candidates);
+        candidates
+    }
+
+    fn legacy_sessions(&self) -> Vec<(PathBuf, Value)> {
+        json_files(&self.data_dir.join("storage").join("session"))
+            .into_iter()
+            .filter_map(|path| {
+                let value = fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())?;
+                // Child sessions are OpenCode background-agent runs, not user conversations.
+                if value
+                    .get("parentID")
+                    .or_else(|| value.get("parentId"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.trim().is_empty())
+                {
+                    return None;
+                }
+                Some((path, value))
+            })
+            .collect()
+    }
+
+    fn run_json(&self, workdir: &Path, args: &[&str]) -> Option<Value> {
+        run_opencode_json(&self.command, workdir, args)
+    }
+}
+
 #[derive(Debug)]
 pub struct CodexSessionMonitor {
     codex_home: PathBuf,
@@ -573,6 +673,13 @@ pub struct ClaudeSessionMonitor {
     pub session_id: Option<String>,
     session_path: Option<PathBuf>,
     position: u64,
+    assistant_message_count: u64,
+    final_assistant_message_count: u64,
+    assistant_usage_by_id: HashMap<String, TokenUsage>,
+    assistant_message_count_at_wait_start: Option<u64>,
+    final_assistant_message_count_at_wait_start: Option<u64>,
+    pub last_session_append_at: Option<Instant>,
+    pub token_usage_total: TokenUsage,
     pub pollution_detected: bool,
     pub completion_pause_detected: bool,
     pub continuation_trigger_prompt: Option<String>,
@@ -631,6 +738,13 @@ impl ClaudeSessionMonitor {
             session_id,
             session_path: None,
             position: 0,
+            assistant_message_count: 0,
+            final_assistant_message_count: 0,
+            assistant_usage_by_id: HashMap::new(),
+            assistant_message_count_at_wait_start: None,
+            final_assistant_message_count_at_wait_start: None,
+            last_session_append_at: None,
+            token_usage_total: TokenUsage::default(),
             pollution_detected: false,
             completion_pause_detected: false,
             continuation_trigger_prompt: None,
@@ -684,6 +798,7 @@ impl ClaudeSessionMonitor {
             next_position = next_position.saturating_add(bytes as u64);
             if let Ok(item) = serde_json::from_str::<Value>(&line) {
                 self.observe_item(&item);
+                self.last_session_append_at = Some(Instant::now());
                 last_good_position = next_position;
             } else if line.ends_with('\n') || line.ends_with('\r') {
                 last_good_position = next_position;
@@ -694,6 +809,31 @@ impl ClaudeSessionMonitor {
         self.position = last_good_position;
     }
 
+    pub fn session_path(&self) -> Option<PathBuf> {
+        self.session_path.clone()
+    }
+
+    pub fn begin_waiting_for_new_turn(&mut self) {
+        self.assistant_message_count_at_wait_start = Some(self.assistant_message_count);
+        self.final_assistant_message_count_at_wait_start = Some(self.final_assistant_message_count);
+        self.last_session_append_at = Some(Instant::now());
+    }
+
+    pub fn has_assistant_message_since_wait_start(&self) -> bool {
+        self.assistant_message_count_at_wait_start
+            .is_some_and(|count| self.assistant_message_count > count)
+    }
+
+    pub fn has_completed_assistant_message_since_wait_start(&self) -> bool {
+        self.final_assistant_message_count_at_wait_start
+            .is_some_and(|count| self.final_assistant_message_count > count)
+    }
+
+    pub fn has_inflight_turn(&self) -> bool {
+        self.has_assistant_message_since_wait_start()
+            && !self.has_completed_assistant_message_since_wait_start()
+    }
+
     fn observe_item(&mut self, item: &Value) {
         if parse_timestamp(item.get("timestamp"))
             .is_some_and(|timestamp| timestamp < self.launch_started_at)
@@ -702,6 +842,17 @@ impl ClaudeSessionMonitor {
         }
         if !is_assistant_message(item) {
             return;
+        }
+        let usage = claude_message_token_usage(item);
+        if !usage.is_empty() {
+            self.assistant_usage_by_id
+                .insert(exported_assistant_message_id(item), usage);
+            self.token_usage_total = summed_token_usage(self.assistant_usage_by_id.values());
+        }
+        self.assistant_message_count = self.assistant_message_count.saturating_add(1);
+        if claude_assistant_message_is_final(item) {
+            self.final_assistant_message_count =
+                self.final_assistant_message_count.saturating_add(1);
         }
         let text = extract_claude_message_text(item);
         let polluted = pollution_detection_configured(&self.polluted_response_keywords)
@@ -729,11 +880,20 @@ pub struct OpenCodeSessionMonitor {
     command: Vec<String>,
     workdir: PathBuf,
     launch_started_at: DateTime<Utc>,
+    session_ids_before_launch: Option<HashSet<String>>,
     pub session_id: Option<String>,
     pub pollution_detected: bool,
     pub completion_pause_detected: bool,
     pub continuation_trigger_prompt: Option<String>,
     seen_fingerprint: String,
+    assistant_message_ids: HashSet<String>,
+    final_assistant_message_ids: HashSet<String>,
+    assistant_usage_by_id: HashMap<String, TokenUsage>,
+    assistant_message_count_at_wait_start: Option<usize>,
+    final_assistant_message_count_at_wait_start: Option<usize>,
+    pub last_session_append_at: Option<Instant>,
+    pub token_usage_total: TokenUsage,
+    last_cli_poll_at: Option<Instant>,
     polluted_response_keywords: Vec<String>,
     completion_pause_keywords: Vec<String>,
     continuation_trigger_rules: Vec<ContinuationTriggerRule>,
@@ -786,11 +946,20 @@ impl OpenCodeSessionMonitor {
             command,
             workdir,
             launch_started_at,
+            session_ids_before_launch: None,
             session_id,
             pollution_detected: false,
             completion_pause_detected: false,
             continuation_trigger_prompt: None,
             seen_fingerprint: String::new(),
+            assistant_message_ids: HashSet::new(),
+            final_assistant_message_ids: HashSet::new(),
+            assistant_usage_by_id: HashMap::new(),
+            assistant_message_count_at_wait_start: None,
+            final_assistant_message_count_at_wait_start: None,
+            last_session_append_at: None,
+            token_usage_total: TokenUsage::default(),
+            last_cli_poll_at: None,
             polluted_response_keywords,
             completion_pause_keywords,
             continuation_trigger_rules,
@@ -800,14 +969,39 @@ impl OpenCodeSessionMonitor {
         }
     }
 
+    pub fn capture_session_baseline(command: &[String], workdir: &Path) -> Option<HashSet<String>> {
+        let output = run_opencode_json(
+            command,
+            workdir,
+            &[
+                "session",
+                "list",
+                "--format",
+                "json",
+                "--max-count",
+                "200",
+                "--pure",
+            ],
+        )?;
+        Some(opencode_root_session_ids_for_workdir(&output, workdir))
+    }
+
+    pub fn with_session_baseline(mut self, session_ids: Option<HashSet<String>>) -> Self {
+        self.session_ids_before_launch = session_ids;
+        self
+    }
+
     pub fn poll(&mut self) {
+        if !self.reserve_cli_poll_slot(Instant::now()) {
+            return;
+        }
         if self.session_id.is_none() {
             self.session_id = self.find_latest_session_id();
         }
         let Some(session_id) = self.session_id.clone() else {
             return;
         };
-        let output = self.run_json(&["export", &session_id]);
+        let output = self.run_json(&["export", &session_id, "--pure"]);
         let Some(output) = output else {
             return;
         };
@@ -820,6 +1014,7 @@ impl OpenCodeSessionMonitor {
             return;
         }
         self.seen_fingerprint = fingerprint;
+        self.last_session_append_at = Some(Instant::now());
         for item in walk_dicts(value) {
             self.observe_exported_item(item);
         }
@@ -829,16 +1024,25 @@ impl OpenCodeSessionMonitor {
         if !is_assistant_like(item) {
             return;
         }
-        if parse_timestamp(
-            item.get("timestamp")
-                .or_else(|| item.get("time"))
-                .or_else(|| item.get("createdAt")),
-        )
-        .is_some_and(|timestamp| timestamp < self.launch_started_at)
+        if exported_message_timestamp(item)
+            .is_some_and(|timestamp| timestamp < self.launch_started_at)
         {
             return;
         }
+        let message_id = exported_assistant_message_id(item);
+        self.assistant_message_ids.insert(message_id.clone());
+        if opencode_assistant_message_is_final(item) {
+            self.final_assistant_message_ids.insert(message_id.clone());
+        }
+        let usage = opencode_message_token_usage(item);
+        if !usage.is_empty() {
+            self.assistant_usage_by_id.insert(message_id, usage);
+            self.token_usage_total = summed_token_usage(self.assistant_usage_by_id.values());
+        }
         let text = extract_any_message_text(item);
+        if text.trim().is_empty() {
+            return;
+        }
         let polluted = pollution_detection_configured(&self.polluted_response_keywords)
             && is_keyword_polluted_text(
                 &text,
@@ -858,39 +1062,71 @@ impl OpenCodeSessionMonitor {
         }
     }
 
+    pub fn begin_waiting_for_new_turn(&mut self) {
+        self.assistant_message_count_at_wait_start = Some(self.assistant_message_ids.len());
+        self.final_assistant_message_count_at_wait_start =
+            Some(self.final_assistant_message_ids.len());
+        self.last_session_append_at = Some(Instant::now());
+    }
+
+    pub fn has_assistant_message_since_wait_start(&self) -> bool {
+        self.assistant_message_count_at_wait_start
+            .is_some_and(|count| self.assistant_message_ids.len() > count)
+    }
+
+    pub fn has_completed_assistant_message_since_wait_start(&self) -> bool {
+        self.final_assistant_message_count_at_wait_start
+            .is_some_and(|count| self.final_assistant_message_ids.len() > count)
+    }
+
+    pub fn has_inflight_turn(&self) -> bool {
+        self.has_assistant_message_since_wait_start()
+            && !self.has_completed_assistant_message_since_wait_start()
+    }
+
     fn find_latest_session_id(&self) -> Option<String> {
-        let output =
-            self.run_json(&["session", "list", "--format", "json", "--max-count", "50"])?;
-        let target = normalize_workdir(&self.workdir);
-        let mut fallback = None;
-        for item in coerce_json_list(&output) {
-            let Some(id) = extract_session_id(item) else {
-                continue;
-            };
-            fallback.get_or_insert_with(|| id.clone());
-            if extract_workdir(item)
-                .as_deref()
-                .map(normalize_workdir)
-                .as_deref()
-                == Some(target.as_str())
-            {
-                return Some(id);
-            }
+        let output = self.run_json(&[
+            "session",
+            "list",
+            "--format",
+            "json",
+            "--max-count",
+            "50",
+            "--pure",
+        ])?;
+        new_opencode_session_id_since(
+            &output,
+            &self.workdir,
+            self.launch_started_at,
+            self.session_ids_before_launch.as_ref(),
+        )
+    }
+
+    fn reserve_cli_poll_slot(&mut self, now: Instant) -> bool {
+        if self.last_cli_poll_at.is_some_and(|last| {
+            now.saturating_duration_since(last) < OPENCODE_MONITOR_POLL_INTERVAL
+        }) {
+            return false;
         }
-        fallback
+        self.last_cli_poll_at = Some(now);
+        true
     }
 
     fn run_json(&self, args: &[&str]) -> Option<Value> {
-        let executable = self.command.first()?.clone();
-        let mut command = Command::new(executable);
-        command.args(args).current_dir(&self.workdir);
-        hide_command_window(&mut command);
-        let output = command.output().ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        serde_json::from_slice(&output.stdout).ok()
+        run_opencode_json(&self.command, &self.workdir, args)
     }
+}
+
+fn run_opencode_json(command_parts: &[String], workdir: &Path, args: &[&str]) -> Option<Value> {
+    let executable = opencode_cli_executable(command_parts)?;
+    let mut command = Command::new(executable);
+    command.args(args).current_dir(workdir);
+    hide_command_window(&mut command);
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&output.stdout).ok()
 }
 
 fn hide_command_window(command: &mut Command) {
@@ -899,6 +1135,24 @@ fn hide_command_window(command: &mut Command) {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
+}
+
+fn opencode_cli_executable(command: &[String]) -> Option<&str> {
+    if command
+        .first()
+        .is_some_and(|item| agent_driver_from_command_part(item) == Some("opencode"))
+    {
+        return command.first().map(String::as_str);
+    }
+    if let Some(start) = shell_wrapper_command_start(command) {
+        if command
+            .get(start)
+            .is_some_and(|item| agent_driver_from_command_part(item) == Some("opencode"))
+        {
+            return command.get(start).map(String::as_str);
+        }
+    }
+    command.first().map(String::as_str)
 }
 
 impl CodexSessionMonitor {
@@ -1164,6 +1418,28 @@ fn jsonl_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+fn json_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if root.exists() {
+        visit_json(root, &mut out);
+    }
+    out
+}
+
+fn visit_json(path: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            visit_json(&path, out);
+        } else if path.extension().and_then(|value| value.to_str()) == Some("json") {
+            out.push(path);
+        }
+    }
+}
+
 fn visit_jsonl(path: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(path) else {
         return;
@@ -1343,6 +1619,42 @@ fn claude_candidate_from_path(
         reason,
         summary,
         occupied_by: owners.get(&session_id).cloned(),
+    })
+}
+
+fn opencode_candidate_from_value(
+    item: &Value,
+    legacy_path: Option<PathBuf>,
+    context: &RankingContext,
+    owners: &HashMap<String, String>,
+) -> Option<SessionCandidate> {
+    if !opencode_session_is_root(item) {
+        return None;
+    }
+    let session_id = extract_session_id(item)?;
+    let workdir = extract_workdir(item);
+    let modified_at = opencode_session_timestamp(item);
+    let summary = opencode_session_summary(item);
+    if !session_matches_context(workdir.as_deref(), &summary, context) {
+        return None;
+    }
+    let (score, reason) = rank_candidate(
+        workdir.as_deref(),
+        context,
+        modified_at,
+        &summary,
+        owners.get(&session_id),
+    );
+    Some(SessionCandidate {
+        path: legacy_path
+            .unwrap_or_else(|| PathBuf::from(format!("opencode-session://{session_id}"))),
+        workdir,
+        modified_at,
+        score,
+        reason,
+        summary,
+        occupied_by: owners.get(&session_id).cloned(),
+        session_id,
     })
 }
 
@@ -1834,6 +2146,128 @@ fn parse_timestamp(value: Option<&Value>) -> Option<DateTime<Utc>> {
         .map(|value| value.with_timezone(&Utc))
 }
 
+fn parse_flexible_timestamp(value: Option<&Value>) -> Option<DateTime<Utc>> {
+    let value = value?;
+    if let Some(number) = value.as_i64() {
+        return if number.abs() >= 100_000_000_000 {
+            DateTime::<Utc>::from_timestamp_millis(number)
+        } else {
+            DateTime::<Utc>::from_timestamp(number, 0)
+        };
+    }
+    if let Some(number) = value.as_u64().and_then(|value| i64::try_from(value).ok()) {
+        return if number >= 100_000_000_000 {
+            DateTime::<Utc>::from_timestamp_millis(number)
+        } else {
+            DateTime::<Utc>::from_timestamp(number, 0)
+        };
+    }
+    let text = value.as_str()?.trim();
+    if let Ok(number) = text.parse::<i64>() {
+        return parse_flexible_timestamp(Some(&Value::Number(number.into())));
+    }
+    DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+}
+
+fn opencode_session_timestamp(item: &Value) -> Option<DateTime<Utc>> {
+    parse_flexible_timestamp(
+        item.get("updated")
+            .or_else(|| item.get("updatedAt"))
+            .or_else(|| item.get("created"))
+            .or_else(|| item.get("createdAt"))
+            .or_else(|| item.get("time").and_then(|time| time.get("updated")))
+            .or_else(|| item.get("time").and_then(|time| time.get("created"))),
+    )
+}
+
+fn opencode_session_created_timestamp(item: &Value) -> Option<DateTime<Utc>> {
+    parse_flexible_timestamp(
+        item.get("created")
+            .or_else(|| item.get("createdAt"))
+            .or_else(|| item.get("time").and_then(|time| time.get("created"))),
+    )
+}
+
+fn opencode_session_summary(item: &Value) -> String {
+    ["title", "name", "slug"]
+        .into_iter()
+        .filter_map(|key| item.get(key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn new_opencode_session_id_since(
+    value: &Value,
+    workdir: &Path,
+    launch_started_at: DateTime<Utc>,
+    session_ids_before_launch: Option<&HashSet<String>>,
+) -> Option<String> {
+    let target = normalize_workdir(workdir);
+    let earliest = launch_started_at - chrono::Duration::seconds(5);
+    coerce_json_list(value)
+        .into_iter()
+        .filter_map(|item| {
+            if !opencode_session_is_root(item) {
+                return None;
+            }
+            let session_workdir = extract_workdir(item)?;
+            if normalize_workdir(&session_workdir) != target {
+                return None;
+            }
+            let session_id = extract_session_id(item)?;
+            if session_ids_before_launch.is_some_and(|ids| ids.contains(&session_id)) {
+                return None;
+            }
+            // An old session may receive a fresh `updated` timestamp while the TUI
+            // starts. Creation time identifies the session created by this launch.
+            let created_at = opencode_session_created_timestamp(item)
+                .or_else(|| opencode_session_timestamp(item))?;
+            if created_at < earliest {
+                return None;
+            }
+            let distance = (created_at - launch_started_at).num_milliseconds().abs();
+            Some((distance, created_at, session_id))
+        })
+        .min_by_key(|(distance, created_at, _)| (*distance, *created_at))
+        .map(|(_, _, session_id)| session_id)
+}
+
+fn opencode_root_session_ids_for_workdir(value: &Value, workdir: &Path) -> HashSet<String> {
+    let target = normalize_workdir(workdir);
+    coerce_json_list(value)
+        .into_iter()
+        .filter(|item| opencode_session_is_root(item))
+        .filter_map(|item| {
+            let session_workdir = extract_workdir(item)?;
+            (normalize_workdir(&session_workdir) == target).then(|| extract_session_id(item))?
+        })
+        .collect()
+}
+
+fn opencode_session_is_root(item: &Value) -> bool {
+    item.get("parentID")
+        .or_else(|| item.get("parentId"))
+        .and_then(Value::as_str)
+        .is_none_or(|id| id.trim().is_empty())
+}
+
+fn default_opencode_data_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("XDG_DATA_HOME").filter(|path| !path.is_empty()) {
+        return PathBuf::from(path).join("opencode");
+    }
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".local")
+        .join("share")
+        .join("opencode")
+}
+
 fn extract_message_text(content: &Value) -> String {
     if let Some(text) = content.as_str() {
         return text.to_string();
@@ -1919,6 +2353,21 @@ fn is_assistant_message(item: &Value) -> bool {
             .and_then(|message| message.get("role"))
             .and_then(Value::as_str)
             == Some("assistant")
+}
+
+fn claude_assistant_message_is_final(item: &Value) -> bool {
+    item.get("message")
+        .and_then(|message| message.get("stop_reason"))
+        .or_else(|| item.get("stop_reason"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|reason| {
+            !reason.is_empty()
+                && !matches!(
+                    reason.to_ascii_lowercase().as_str(),
+                    "tool_use" | "tool-use" | "tool_calls" | "tool-calls"
+                )
+        })
 }
 
 fn extract_claude_message_text(item: &Value) -> String {
@@ -2017,6 +2466,11 @@ fn is_assistant_like(item: &Value) -> bool {
             .and_then(Value::as_str)
             .is_some_and(|role| role.eq_ignore_ascii_case("assistant"))
         || item
+            .get("info")
+            .and_then(|info| info.get("role"))
+            .and_then(Value::as_str)
+            .is_some_and(|role| role.eq_ignore_ascii_case("assistant"))
+        || item
             .get("type")
             .and_then(Value::as_str)
             .is_some_and(|kind| {
@@ -2029,7 +2483,7 @@ fn is_assistant_like(item: &Value) -> bool {
 
 fn extract_any_message_text(item: &Value) -> String {
     let mut parts = Vec::new();
-    for key in ["text", "content", "message", "output"] {
+    for key in ["text", "content", "message", "output", "parts"] {
         let Some(value) = item.get(key) else {
             continue;
         };
@@ -2048,6 +2502,179 @@ fn extract_any_message_text(item: &Value) -> String {
         }
     }
     parts.join("")
+}
+
+fn exported_message_timestamp(item: &Value) -> Option<DateTime<Utc>> {
+    parse_flexible_timestamp(
+        item.get("timestamp")
+            .or_else(|| item.get("createdAt"))
+            .or_else(|| item.get("completedAt"))
+            .or_else(|| {
+                item.get("time").and_then(|time| {
+                    time.get("completed")
+                        .or_else(|| time.get("created"))
+                        .or(Some(time))
+                })
+            })
+            .or_else(|| {
+                item.get("info").and_then(|info| {
+                    info.get("time").and_then(|time| {
+                        time.get("completed")
+                            .or_else(|| time.get("created"))
+                            .or(Some(time))
+                    })
+                })
+            }),
+    )
+}
+
+fn exported_assistant_message_id(item: &Value) -> String {
+    item.get("id")
+        .or_else(|| item.get("messageID"))
+        .or_else(|| item.get("messageId"))
+        .or_else(|| item.get("info").and_then(|info| info.get("id")))
+        .or_else(|| item.get("message").and_then(|message| message.get("id")))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let mut hasher = DefaultHasher::new();
+            serde_json::to_string(item)
+                .unwrap_or_default()
+                .hash(&mut hasher);
+            format!("anonymous:{:016x}", hasher.finish())
+        })
+}
+
+fn claude_message_token_usage(item: &Value) -> TokenUsage {
+    let Some(usage) = item
+        .get("message")
+        .and_then(|message| message.get("usage"))
+        .or_else(|| item.get("usage"))
+        .and_then(Value::as_object)
+    else {
+        return TokenUsage::default();
+    };
+    let uncached_input = json_u64(usage.get("input_tokens"));
+    let cache_creation = json_u64(usage.get("cache_creation_input_tokens"));
+    let cached_input_tokens = json_u64(usage.get("cache_read_input_tokens"));
+    let input_tokens = uncached_input
+        .saturating_add(cache_creation)
+        .saturating_add(cached_input_tokens);
+    let output_tokens = json_u64(usage.get("output_tokens"));
+    TokenUsage {
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        reasoning_output_tokens: 0,
+        total_tokens: input_tokens.saturating_add(output_tokens),
+    }
+}
+
+fn opencode_message_token_usage(item: &Value) -> TokenUsage {
+    let info = item.get("info").unwrap_or(item);
+    let openai_usage = extract_token_usage(info);
+    if !openai_usage.is_empty() {
+        return openai_usage;
+    }
+    let Some(tokens) = info.get("tokens").and_then(Value::as_object) else {
+        return TokenUsage::default();
+    };
+    let input_tokens = json_u64(tokens.get("input").or_else(|| tokens.get("input_tokens")));
+    let visible_output_tokens =
+        json_u64(tokens.get("output").or_else(|| tokens.get("output_tokens")));
+    let reasoning_output_tokens = json_u64(
+        tokens
+            .get("reasoning")
+            .or_else(|| tokens.get("reasoning_tokens")),
+    );
+    let output_tokens = visible_output_tokens.saturating_add(reasoning_output_tokens);
+    let cached_input_tokens = tokens
+        .get("cache")
+        .and_then(Value::as_object)
+        .map(|cache| {
+            json_u64(
+                cache
+                    .get("read")
+                    .or_else(|| cache.get("cached_input_tokens")),
+            )
+        })
+        .unwrap_or_else(|| {
+            json_u64(
+                tokens
+                    .get("cached")
+                    .or_else(|| tokens.get("cached_input_tokens")),
+            )
+        });
+    let total_tokens =
+        json_u64(tokens.get("total")).max(input_tokens.saturating_add(output_tokens));
+    TokenUsage {
+        input_tokens,
+        cached_input_tokens: cached_input_tokens.min(input_tokens),
+        output_tokens,
+        reasoning_output_tokens,
+        total_tokens,
+    }
+}
+
+fn json_u64(value: Option<&Value>) -> u64 {
+    value
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        })
+        .unwrap_or_default()
+}
+
+fn summed_token_usage<'a>(items: impl Iterator<Item = &'a TokenUsage>) -> TokenUsage {
+    items.fold(TokenUsage::default(), |total, usage| total + *usage)
+}
+
+fn opencode_assistant_message_is_final(item: &Value) -> bool {
+    let info = item.get("info").unwrap_or(item);
+    if let Some(finish) = info
+        .get("finish")
+        .or_else(|| info.get("finishReason"))
+        .or_else(|| info.get("finish_reason"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|finish| !finish.is_empty())
+    {
+        return !matches!(
+            finish.to_ascii_lowercase().as_str(),
+            "tool_use" | "tool-use" | "tool_calls" | "tool-calls"
+        );
+    }
+    info.get("time")
+        .and_then(|time| time.get("completed"))
+        .is_some_and(|completed| !completed.is_null())
+        || (item.get("info").is_none()
+            && item
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| role.eq_ignore_ascii_case("assistant"))
+            && !message_contains_tool_call(item))
+}
+
+fn message_contains_tool_call(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(message_contains_tool_call),
+        Value::Object(map) => {
+            let known_tool_kind = map
+                .get("type")
+                .or_else(|| map.get("kind"))
+                .and_then(Value::as_str)
+                .is_some_and(|kind| {
+                    matches!(
+                        kind.to_ascii_lowercase().as_str(),
+                        "tool" | "tool_use" | "tool-use" | "tool_call" | "tool-call"
+                    )
+                });
+            known_tool_kind || map.values().any(message_contains_tool_call)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -3257,6 +3884,75 @@ mod tests {
     }
 
     #[test]
+    fn claude_monitor_waits_for_terminal_stop_reason_after_tool_use() {
+        let launched_at = DateTime::parse_from_rfc3339("2026-08-14T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut monitor = ClaudeSessionMonitor::new(
+            PathBuf::from(".claude"),
+            PathBuf::from("D:/Works/SelfWorks/WatchApi"),
+            launched_at,
+            Some("claude-session-1".to_string()),
+            vec![],
+            vec![],
+            0.35,
+            12,
+            300,
+        );
+        monitor.begin_waiting_for_new_turn();
+
+        monitor.observe_item(&json!({
+            "timestamp": "2026-08-14T10:00:01Z",
+            "type": "assistant",
+            "message": {
+                "id": "tool-message",
+                "role": "assistant",
+                "stop_reason": "tool_use",
+                "content": [{"type": "tool_use", "name": "Read"}],
+                "usage": {
+                    "input_tokens": 10,
+                    "cache_creation_input_tokens": 2,
+                    "cache_read_input_tokens": 3,
+                    "output_tokens": 4
+                }
+            }
+        }));
+
+        assert!(monitor.has_assistant_message_since_wait_start());
+        assert!(!monitor.has_completed_assistant_message_since_wait_start());
+        assert!(monitor.has_inflight_turn());
+
+        monitor.observe_item(&json!({
+            "timestamp": "2026-08-14T10:00:02Z",
+            "type": "assistant",
+            "message": {
+                "id": "final-message",
+                "role": "assistant",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "完成。"}],
+                "usage": {
+                    "input_tokens": 20,
+                    "cache_read_input_tokens": 5,
+                    "output_tokens": 6
+                }
+            }
+        }));
+
+        assert!(monitor.has_completed_assistant_message_since_wait_start());
+        assert!(!monitor.has_inflight_turn());
+        assert_eq!(
+            monitor.token_usage_total,
+            TokenUsage {
+                input_tokens: 40,
+                cached_input_tokens: 8,
+                output_tokens: 10,
+                reasoning_output_tokens: 0,
+                total_tokens: 50,
+            }
+        );
+    }
+
+    #[test]
     fn opencode_export_parser_detects_assistant_completion_keyword() {
         let workdir = PathBuf::from("D:/Works/SelfWorks/WatchApi");
         let exported = json!({
@@ -3278,10 +3974,304 @@ mod tests {
             12,
             300,
         );
+        monitor.begin_waiting_for_new_turn();
 
         monitor.observe_exported_value(&exported);
 
         assert!(monitor.completion_pause_detected);
+        assert!(monitor.has_completed_assistant_message_since_wait_start());
+    }
+
+    #[test]
+    fn opencode_export_parser_handles_current_cli_message_schema() {
+        let workdir = PathBuf::from("D:/Works/SelfWorks/WatchApi");
+        let launched_at = DateTime::parse_from_rfc3339("2026-08-14T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let exported = json!({
+            "messages": [
+                {
+                    "info": {
+                        "role": "assistant",
+                        "time": {"created": (launched_at - chrono::Duration::minutes(1)).timestamp_millis()},
+                        "id": "old-message"
+                    },
+                    "parts": [{"type": "text", "text": "任务完成，但这是旧消息"}]
+                },
+                {
+                    "info": {
+                        "role": "assistant",
+                        "time": {"created": (launched_at + chrono::Duration::seconds(2)).timestamp_millis()},
+                        "id": "new-message"
+                    },
+                    "parts": [{"type": "text", "text": "任务完成，测试通过。"}]
+                }
+            ]
+        });
+        let mut monitor = OpenCodeSessionMonitor::new(
+            vec!["opencode".to_string()],
+            workdir,
+            launched_at,
+            Some("opencode-session-1".to_string()),
+            vec![],
+            vec!["任务完成".to_string()],
+            0.35,
+            12,
+            300,
+        );
+
+        monitor.observe_exported_value(&exported);
+
+        assert!(monitor.completion_pause_detected);
+        assert!(!monitor.seen_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn opencode_monitor_waits_for_stop_after_tool_calls() {
+        let workdir = PathBuf::from("D:/Works/SelfWorks/WatchApi");
+        let launched_at = DateTime::parse_from_rfc3339("2026-08-14T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut monitor = OpenCodeSessionMonitor::new(
+            vec!["opencode".to_string()],
+            workdir,
+            launched_at,
+            Some("opencode-session-1".to_string()),
+            vec![],
+            vec![],
+            0.35,
+            12,
+            300,
+        );
+        monitor.begin_waiting_for_new_turn();
+        let tool_message = json!({
+            "info": {
+                "id": "tool-message",
+                "role": "assistant",
+                "finish": "tool-calls",
+                "time": {
+                    "created": (launched_at + chrono::Duration::seconds(1)).timestamp_millis(),
+                    "completed": (launched_at + chrono::Duration::seconds(2)).timestamp_millis()
+                },
+                "tokens": {
+                    "input": 100,
+                    "output": 20,
+                    "reasoning": 5,
+                    "cache": {"read": 40, "write": 0}
+                }
+            },
+            "parts": [{"type": "tool", "tool": "read"}]
+        });
+
+        monitor.observe_exported_value(&json!({"messages": [tool_message.clone()]}));
+
+        assert!(monitor.has_assistant_message_since_wait_start());
+        assert!(!monitor.has_completed_assistant_message_since_wait_start());
+        assert!(monitor.has_inflight_turn());
+
+        monitor.observe_exported_value(&json!({
+            "messages": [
+                tool_message,
+                {
+                    "info": {
+                        "id": "final-message",
+                        "role": "assistant",
+                        "finish": "stop",
+                        "time": {
+                            "created": (launched_at + chrono::Duration::seconds(3)).timestamp_millis(),
+                            "completed": (launched_at + chrono::Duration::seconds(4)).timestamp_millis()
+                        },
+                        "tokens": {
+                            "input": 50,
+                            "output": 10,
+                            "reasoning": 0,
+                            "cache": {"read": 0, "write": 0}
+                        }
+                    },
+                    "parts": [{"type": "text", "text": "完成。"}]
+                }
+            ]
+        }));
+
+        assert!(monitor.has_completed_assistant_message_since_wait_start());
+        assert!(!monitor.has_inflight_turn());
+        assert_eq!(
+            monitor.token_usage_total,
+            TokenUsage {
+                input_tokens: 150,
+                cached_input_tokens: 40,
+                output_tokens: 35,
+                reasoning_output_tokens: 5,
+                total_tokens: 185,
+            }
+        );
+    }
+
+    #[test]
+    fn opencode_monitor_throttles_cli_exports() {
+        let mut monitor = OpenCodeSessionMonitor::new(
+            vec!["opencode".to_string()],
+            PathBuf::from("D:/Works/SelfWorks/WatchApi"),
+            Utc::now(),
+            Some("opencode-session-1".to_string()),
+            vec![],
+            vec![],
+            0.35,
+            12,
+            300,
+        );
+        let now = Instant::now();
+
+        assert!(monitor.reserve_cli_poll_slot(now));
+        assert!(!monitor.reserve_cli_poll_slot(now + OPENCODE_MONITOR_POLL_INTERVAL / 2));
+        assert!(monitor.reserve_cli_poll_slot(now + OPENCODE_MONITOR_POLL_INTERVAL));
+    }
+
+    #[test]
+    fn opencode_cli_discovery_uses_agent_inside_shell_wrapper() {
+        let command = vec![
+            "pwsh.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            "C:/Tools/opencode.exe".to_string(),
+            "--auto".to_string(),
+        ];
+
+        assert_eq!(
+            opencode_cli_executable(&command),
+            Some("C:/Tools/opencode.exe")
+        );
+        assert_eq!(
+            opencode_cli_executable(&["C:/Tools/opencode.exe".to_string()]),
+            Some("C:/Tools/opencode.exe")
+        );
+    }
+
+    #[test]
+    fn opencode_index_reads_legacy_sessions_without_running_the_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        let session_file = tmp.path().join("storage/session/project-id/ses_root.json");
+        fs::create_dir_all(session_file.parent().unwrap()).unwrap();
+        fs::create_dir_all(&workdir).unwrap();
+        fs::write(
+            &session_file,
+            serde_json::to_vec_pretty(&json!({
+                "id": "ses_root",
+                "directory": workdir,
+                "title": "修复 OpenCode 会话恢复",
+                "time": {"updated": 1_784_003_400_000_i64}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            session_file.parent().unwrap().join("ses_child.json"),
+            serde_json::to_vec_pretty(&json!({
+                "id": "ses_child",
+                "parentID": "ses_root",
+                "directory": workdir,
+                "title": "Background task",
+                "time": {"updated": 1_784_003_500_000_i64}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = SessionStore::new(tmp.path().join("state.json"));
+
+        let candidates = OpenCodeSessionIndex::new(vec!["missing-opencode".to_string()])
+            .with_data_dir(tmp.path().to_path_buf())
+            .ranked_candidates(&workdir, "配置", "opencode", &store);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].session_id, "ses_root");
+        assert_eq!(candidates[0].path, session_file);
+        assert!(candidates[0].summary.contains("修复 OpenCode"));
+        assert_eq!(
+            candidates[0].modified_at,
+            DateTime::<Utc>::from_timestamp_millis(1_784_003_400_000_i64)
+        );
+    }
+
+    #[test]
+    fn opencode_new_session_detection_rejects_prelaunch_and_recently_updated_old_sessions() {
+        let workdir = PathBuf::from("D:/Works/SelfWorks/WatchApi");
+        let launched_at = DateTime::parse_from_rfc3339("2026-08-14T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let old_created = (launched_at - chrono::Duration::days(1)).timestamp_millis();
+        let old_updated = (launched_at + chrono::Duration::seconds(8)).timestamp_millis();
+        let new_created = (launched_at + chrono::Duration::seconds(5)).timestamp_millis();
+        let new_updated = (launched_at + chrono::Duration::seconds(5)).timestamp_millis();
+        let sessions = json!([
+            {
+                "id": "old-session",
+                "directory": workdir,
+                "created": old_created,
+                "updated": old_updated
+            },
+            {
+                "id": "new-session",
+                "directory": workdir,
+                "created": new_created,
+                "updated": new_updated
+            }
+        ]);
+
+        assert_eq!(
+            new_opencode_session_id_since(&sessions, &workdir, launched_at, None),
+            Some("new-session".to_string())
+        );
+        assert_eq!(
+            new_opencode_session_id_since(
+                &json!([{
+                    "id": "old-session",
+                    "directory": workdir,
+                    "created": old_created,
+                    "updated": old_updated
+                }]),
+                &workdir,
+                launched_at,
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn opencode_new_session_detection_only_accepts_ids_absent_from_launch_baseline() {
+        let workdir = PathBuf::from("D:/Works/SelfWorks/WatchApi");
+        let launched_at = DateTime::parse_from_rfc3339("2026-08-14T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let recent = (launched_at + chrono::Duration::seconds(1)).timestamp_millis();
+        let sessions = json!([
+            {
+                "id": "known-session",
+                "directory": workdir,
+                "created": recent,
+                "updated": recent
+            },
+            {
+                "id": "background-session",
+                "parentID": "new-session",
+                "directory": workdir,
+                "created": recent,
+                "updated": recent
+            },
+            {
+                "id": "new-session",
+                "directory": workdir,
+                "created": recent,
+                "updated": recent
+            }
+        ]);
+        let known = HashSet::from(["known-session".to_string()]);
+
+        assert_eq!(
+            new_opencode_session_id_since(&sessions, &workdir, launched_at, Some(&known)),
+            Some("new-session".to_string())
+        );
     }
 
     #[test]

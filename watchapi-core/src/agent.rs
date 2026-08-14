@@ -8,9 +8,8 @@ use crate::config::{
 };
 use crate::cooldown::cooldown_seconds_from_text;
 use crate::sessions::{
-    codex_session_file_matches, discover_codex_session_homes, ClaudeSessionIndex,
-    ClaudeSessionMonitor, CodexSessionIndex, CodexSessionMonitor, OpenCodeSessionMonitor,
-    SessionBindingKey, SessionStore,
+    codex_session_file_matches, ClaudeSessionIndex, ClaudeSessionMonitor, CodexSessionIndex,
+    CodexSessionMonitor, OpenCodeSessionMonitor, SessionBindingKey, SessionStore,
 };
 use crate::terminal::{
     resolved_command_parts, InputSource, TerminalActivityWakeup, TerminalControl, TerminalError,
@@ -23,10 +22,11 @@ use chrono::Utc;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const CODEX_READY_UNLOCK_GRACE: Duration = Duration::from_secs(2);
 const CODEX_STALE_WORKING_UNLOCK_GRACE: Duration = Duration::from_secs(20);
+const CODEX_ISOLATED_RUNTIME_DIR: &str = "runtime-v2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentLaunch {
@@ -35,11 +35,18 @@ pub struct AgentLaunch {
     pub session_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentForkSource {
+    session_id: String,
+    session_path: Option<PathBuf>,
+}
+
 pub struct AgentProcess {
     config: AppConfig,
     endpoint: EndpointConfig,
     store: SessionStore,
     force_new_session: bool,
+    fork_source: Option<AgentForkSource>,
     terminal: Option<TerminalSession>,
     monitor: Option<AgentSessionMonitor>,
     pub launch: Option<AgentLaunch>,
@@ -62,6 +69,7 @@ pub struct AgentProcess {
     handled_trust_directory_prompt: bool,
     handled_sandbox_setup_prompt: bool,
     handled_codex_repair_prompt: bool,
+    handled_command_approval_prompt: bool,
     handled_generic_startup_option_prompt: bool,
     observed_terminal_view_revision: u64,
     observed_terminal_view_text: String,
@@ -80,14 +88,6 @@ pub enum MissingSessionPolicy {
 #[derive(Debug, Clone)]
 struct IsolatedCodexHome {
     home: PathBuf,
-    source_home: PathBuf,
-    session_baseline: HashMap<PathBuf, SessionFileFingerprint>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SessionFileFingerprint {
-    len: u64,
-    modified_millis: Option<u128>,
 }
 
 enum AgentSessionMonitor {
@@ -110,6 +110,14 @@ impl AgentSessionMonitor {
             Self::Codex(monitor) => monitor.session_id.clone(),
             Self::Claude(monitor) => monitor.session_id.clone(),
             Self::OpenCode(monitor) => monitor.session_id.clone(),
+        }
+    }
+
+    fn session_path(&self) -> Option<PathBuf> {
+        match self {
+            Self::Codex(monitor) => monitor.session_path.clone(),
+            Self::Claude(monitor) => monitor.session_path(),
+            Self::OpenCode(_) => None,
         }
     }
 
@@ -147,26 +155,41 @@ impl AgentSessionMonitor {
     fn token_usage_total(&self) -> TokenUsage {
         match self {
             Self::Codex(monitor) => monitor.token_usage_total,
-            Self::Claude(_) | Self::OpenCode(_) => TokenUsage::default(),
+            Self::Claude(monitor) => monitor.token_usage_total,
+            Self::OpenCode(monitor) => monitor.token_usage_total,
         }
     }
 
     fn begin_waiting_for_new_turn(&mut self) {
-        if let Self::Codex(monitor) = self {
-            monitor.begin_waiting_for_new_turn();
+        match self {
+            Self::Codex(monitor) => monitor.begin_waiting_for_new_turn(),
+            Self::Claude(monitor) => monitor.begin_waiting_for_new_turn(),
+            Self::OpenCode(monitor) => monitor.begin_waiting_for_new_turn(),
         }
     }
 
     fn has_inflight_turn(&self) -> bool {
-        matches!(self, Self::Codex(monitor) if monitor.has_inflight_turn())
+        match self {
+            Self::Codex(monitor) => monitor.has_inflight_turn(),
+            Self::Claude(monitor) => monitor.has_inflight_turn(),
+            Self::OpenCode(monitor) => monitor.has_inflight_turn(),
+        }
     }
 
     fn last_task_started(&self) -> bool {
-        matches!(self, Self::Codex(monitor) if monitor.last_task_started_at.is_some())
+        match self {
+            Self::Codex(monitor) => monitor.last_task_started_at.is_some(),
+            Self::Claude(monitor) => monitor.has_assistant_message_since_wait_start(),
+            Self::OpenCode(monitor) => monitor.has_assistant_message_since_wait_start(),
+        }
     }
 
     fn last_task_finished(&self) -> bool {
-        matches!(self, Self::Codex(monitor) if monitor.last_task_finished_at.is_some())
+        match self {
+            Self::Codex(monitor) => monitor.last_task_finished_at.is_some(),
+            Self::Claude(monitor) => monitor.has_completed_assistant_message_since_wait_start(),
+            Self::OpenCode(monitor) => monitor.has_completed_assistant_message_since_wait_start(),
+        }
     }
 
     fn mark_turn_completed_by_idle(&mut self) {
@@ -178,7 +201,8 @@ impl AgentSessionMonitor {
     fn has_assistant_message_since_wait_start(&self) -> bool {
         match self {
             Self::Codex(monitor) => monitor.has_assistant_message_since_wait_start(),
-            Self::Claude(_) | Self::OpenCode(_) => true,
+            Self::Claude(monitor) => monitor.has_assistant_message_since_wait_start(),
+            Self::OpenCode(monitor) => monitor.has_assistant_message_since_wait_start(),
         }
     }
 
@@ -189,12 +213,13 @@ impl AgentSessionMonitor {
                     && !monitor.has_inflight_turn()
                     && monitor.has_assistant_message_since_wait_start()
             }
-            Self::Claude(_) | Self::OpenCode(_) => true,
+            Self::Claude(monitor) => monitor.has_completed_assistant_message_since_wait_start(),
+            Self::OpenCode(monitor) => monitor.has_completed_assistant_message_since_wait_start(),
         }
     }
 
-    fn has_codex_assistant_message_since_wait_start(&self) -> bool {
-        matches!(self, Self::Codex(monitor) if monitor.has_assistant_message_since_wait_start())
+    fn has_session_assistant_message_since_wait_start(&self) -> bool {
+        self.has_assistant_message_since_wait_start()
     }
 
     fn clear_completion_pause_detected(&mut self) {
@@ -208,7 +233,8 @@ impl AgentSessionMonitor {
     fn last_session_append_elapsed(&self) -> Option<Duration> {
         match self {
             Self::Codex(monitor) => monitor.last_session_append_at.map(|at| at.elapsed()),
-            Self::Claude(_) | Self::OpenCode(_) => None,
+            Self::Claude(monitor) => monitor.last_session_append_at.map(|at| at.elapsed()),
+            Self::OpenCode(monitor) => monitor.last_session_append_at.map(|at| at.elapsed()),
         }
     }
 
@@ -222,19 +248,47 @@ impl AgentSessionMonitor {
     fn last_session_append_instant(&self) -> Option<Instant> {
         match self {
             Self::Codex(monitor) => monitor.last_session_append_at,
-            Self::Claude(_) | Self::OpenCode(_) => None,
+            Self::Claude(monitor) => monitor.last_session_append_at,
+            Self::OpenCode(monitor) => monitor.last_session_append_at,
         }
     }
 }
 
 impl AgentProcess {
     pub fn new(config: AppConfig, endpoint: EndpointConfig, force_new_session: bool) -> Self {
+        Self::with_fork_source(config, endpoint, force_new_session, None)
+    }
+
+    pub fn new_fork(
+        config: AppConfig,
+        endpoint: EndpointConfig,
+        source_session_id: String,
+        source_session_path: Option<PathBuf>,
+    ) -> Self {
+        Self::with_fork_source(
+            config,
+            endpoint,
+            false,
+            Some(AgentForkSource {
+                session_id: source_session_id,
+                session_path: source_session_path,
+            }),
+        )
+    }
+
+    fn with_fork_source(
+        config: AppConfig,
+        endpoint: EndpointConfig,
+        force_new_session: bool,
+        fork_source: Option<AgentForkSource>,
+    ) -> Self {
         let store = SessionStore::new(config.session_state_path.clone());
         Self {
             config,
             endpoint,
             store,
             force_new_session,
+            fork_source,
             terminal: None,
             monitor: None,
             launch: None,
@@ -257,6 +311,7 @@ impl AgentProcess {
             handled_trust_directory_prompt: false,
             handled_sandbox_setup_prompt: false,
             handled_codex_repair_prompt: false,
+            handled_command_approval_prompt: false,
             handled_generic_startup_option_prompt: false,
             observed_terminal_view_revision: 0,
             observed_terminal_view_text: String::new(),
@@ -281,10 +336,43 @@ impl AgentProcess {
             );
             self.isolated_codex_home = Some(isolated_home);
         }
-        let mut launch =
-            self.build_launch_for_runtime_config(&launch_config, &self.config.clone())?;
+        let mut launch = if let Some(source) = self.fork_source.as_ref() {
+            let command = match launch_config.agent_driver {
+                AgentDriverKind::Codex => codex_fork_command(
+                    &codex_goal_feature_command(&launch_config),
+                    &self.endpoint.workdir,
+                    &source.session_id,
+                )?,
+                AgentDriverKind::ClaudeCode => {
+                    claude_fork_command(&launch_config.agent_command, &source.session_id)?
+                }
+                AgentDriverKind::OpenCode => {
+                    opencode_fork_command(&launch_config.agent_command, &source.session_id)?
+                }
+                AgentDriverKind::Generic => {
+                    anyhow::bail!("Generic 驱动不支持分叉会话");
+                }
+            };
+            AgentLaunch {
+                command,
+                // A fork has inherited history, but must discover and bind its new session ID.
+                resumed: true,
+                session_id: None,
+            }
+        } else {
+            self.build_launch_for_runtime_config(&launch_config, &self.config.clone())?
+        };
         if launch_config.agent_driver == AgentDriverKind::Codex {
-            if let Some(session_id) = launch.session_id.as_deref().filter(|_| launch.resumed) {
+            if let Some(source) = self.fork_source.as_ref() {
+                copy_codex_resume_session_to_isolated_home(
+                    &self.config.codex_home,
+                    &launch_config.codex_home,
+                    &self.endpoint.workdir,
+                    &source.session_id,
+                    source.session_path.as_deref(),
+                )?;
+            } else if let Some(session_id) = launch.session_id.as_deref().filter(|_| launch.resumed)
+            {
                 let binding = session_binding_key(&self.config, &self.endpoint);
                 let bound_session_path = self.store.get_bound_session_path(&binding);
                 let copied_session = copy_codex_resume_session_to_isolated_home(
@@ -296,13 +384,6 @@ impl AgentProcess {
                 )?;
                 self.store
                     .set_bound_session_id(&binding, session_id, Some(&copied_session))?;
-                if let Some(isolated) = self.isolated_codex_home.as_mut() {
-                    add_codex_session_baseline_file(
-                        &mut isolated.session_baseline,
-                        &isolated.home,
-                        &copied_session,
-                    );
-                }
             }
             ensure_codex_unattended_state(&launch_config.codex_home)?;
             apply_codex_endpoint_with_model_context_window(
@@ -316,6 +397,53 @@ impl AgentProcess {
             launch.command =
                 codex_command_with_cli_overrides(launch.command, &self.endpoint, &launch_config);
         }
+        match launch_config.agent_driver {
+            AgentDriverKind::ClaudeCode => {
+                terminal_env.insert(
+                    "ANTHROPIC_BASE_URL".to_string(),
+                    anthropic_base_url(&self.endpoint.base_url),
+                );
+                terminal_env.insert(
+                    "ANTHROPIC_AUTH_TOKEN".to_string(),
+                    self.endpoint.api_key.clone(),
+                );
+                terminal_env.insert(
+                    "ANTHROPIC_API_KEY".to_string(),
+                    self.endpoint.api_key.clone(),
+                );
+                terminal_env.insert("ANTHROPIC_MODEL".to_string(), self.endpoint.model.clone());
+                launch.command =
+                    claude_command_with_endpoint_overrides(launch.command, &self.endpoint);
+            }
+            AgentDriverKind::OpenCode => {
+                terminal_env.insert("OPENAI_API_KEY".to_string(), self.endpoint.api_key.clone());
+                terminal_env.insert(
+                    "OPENAI_BASE_URL".to_string(),
+                    self.endpoint.base_url.clone(),
+                );
+                terminal_env.insert(
+                    "OPENCODE_CONFIG_CONTENT".to_string(),
+                    opencode_endpoint_config_content(
+                        &self.endpoint,
+                        &launch_config.probe_path,
+                        launch_config.codex_model_context_window,
+                    ),
+                );
+                launch.command =
+                    opencode_command_with_endpoint_overrides(launch.command, &self.endpoint);
+            }
+            AgentDriverKind::Codex | AgentDriverKind::Generic => {}
+        }
+        let opencode_session_baseline = if launch_config.agent_driver == AgentDriverKind::OpenCode
+            && launch.session_id.is_none()
+        {
+            OpenCodeSessionMonitor::capture_session_baseline(
+                &command_args(&launch.command),
+                &self.endpoint.workdir,
+            )
+        } else {
+            None
+        };
         let terminal = TerminalSession::start_with_env(
             &launch.command,
             self.endpoint.workdir.clone(),
@@ -389,7 +517,8 @@ impl AgentProcess {
                     launch_config.polluted_response_threshold,
                     launch_config.polluted_context_window,
                     launch_config.polluted_check_max_chars,
-                ),
+                )
+                .with_session_baseline(opencode_session_baseline),
             )),
             AgentDriverKind::Generic => None,
         };
@@ -404,13 +533,7 @@ impl AgentProcess {
             terminal.stop();
         }
         self.monitor = None;
-        if let Some(isolated) = self.isolated_codex_home.take() {
-            let _ = merge_codex_sessions_back_with_baseline(
-                &isolated.home,
-                &isolated.source_home,
-                &isolated.session_baseline,
-            );
-        }
+        self.isolated_codex_home = None;
     }
 
     pub fn is_running(&self) -> bool {
@@ -835,7 +958,7 @@ impl AgentProcess {
         self.poll_monitor();
         self.monitor
             .as_ref()
-            .is_some_and(AgentSessionMonitor::has_codex_assistant_message_since_wait_start)
+            .is_some_and(AgentSessionMonitor::has_session_assistant_message_since_wait_start)
     }
 
     fn terminal_had_activity_since_prompt(&self) -> bool {
@@ -880,11 +1003,35 @@ impl AgentProcess {
             .and_then(|launch| launch.session_id.as_deref())
         {
             let key = session_binding_key(&self.config, &self.endpoint);
-            let session_path = self.store.get_bound_session_path(&key);
+            let session_path = self
+                .monitor
+                .as_ref()
+                .and_then(AgentSessionMonitor::session_path)
+                .or_else(|| self.store.get_bound_session_path(&key));
             self.store
                 .set_bound_session_id(&key, session_id, session_path.as_deref())?;
         }
         Ok(())
+    }
+
+    pub fn active_session(&self) -> Option<(String, Option<PathBuf>)> {
+        let session_id = self
+            .launch
+            .as_ref()
+            .and_then(|launch| launch.session_id.clone())?;
+        let key = session_binding_key(&self.config, &self.endpoint);
+        let session_path = self
+            .monitor
+            .as_ref()
+            .and_then(AgentSessionMonitor::session_path)
+            .or_else(|| self.store.get_bound_session_path(&key));
+        Some((session_id, session_path))
+    }
+
+    pub fn active_codex_session(&self) -> Option<(String, Option<PathBuf>)> {
+        (self.config.agent_driver == AgentDriverKind::Codex)
+            .then(|| self.active_session())
+            .flatten()
     }
 
     pub fn build_launch(&mut self) -> Result<AgentLaunch> {
@@ -973,6 +1120,7 @@ impl AgentProcess {
             && self.handled_trust_directory_prompt
             && self.handled_sandbox_setup_prompt
             && self.handled_codex_repair_prompt
+            && self.handled_command_approval_prompt
             && self.handled_generic_startup_option_prompt
         {
             return;
@@ -1021,6 +1169,15 @@ impl AgentProcess {
             ))
         {
             self.handled_codex_repair_prompt = true;
+        }
+        if !self.handled_command_approval_prompt
+            && codex_command_approval_prompt_visible(observed)
+            && self.write_auto_terminal_input(format!(
+                "2{}",
+                submit_sequence_text(&self.config.prompt_submit_sequence)
+            ))
+        {
+            self.handled_command_approval_prompt = true;
         }
         if !self.handled_generic_startup_option_prompt
             && generic_first_option_prompt_visible(observed)
@@ -1203,6 +1360,7 @@ pub fn build_agent_launch_with_policy(
                 codex_index,
                 force_new_session,
                 missing_policy,
+                false,
             )?;
             Ok(AgentLaunch {
                 command: codex_resume_command(
@@ -1281,6 +1439,26 @@ fn build_agent_launch_for_codex_restore_home(
     force_new_session: bool,
     missing_policy: MissingSessionPolicy,
 ) -> Result<AgentLaunch> {
+    build_agent_launch_for_codex_restore_home_in(
+        &app_runtime_dir(),
+        runtime_config,
+        restore_config,
+        endpoint,
+        store,
+        force_new_session,
+        missing_policy,
+    )
+}
+
+fn build_agent_launch_for_codex_restore_home_in(
+    runtime_dir: &Path,
+    runtime_config: &AppConfig,
+    restore_config: &AppConfig,
+    endpoint: &EndpointConfig,
+    store: &mut SessionStore,
+    force_new_session: bool,
+    missing_policy: MissingSessionPolicy,
+) -> Result<AgentLaunch> {
     if runtime_config.agent_driver != AgentDriverKind::Codex {
         let index = CodexSessionIndex::new(runtime_config.codex_home.clone());
         return build_agent_launch_with_policy(
@@ -1292,10 +1470,32 @@ fn build_agent_launch_for_codex_restore_home(
             missing_policy,
         );
     }
-    let mut additional_homes = historical_isolated_codex_homes();
-    additional_homes.push(runtime_config.codex_home.clone());
-    let codex_index = CodexSessionIndex::new(restore_config.codex_home.clone())
-        .with_additional_homes(additional_homes);
+    // The isolated home belongs to this configuration. Do not search other
+    // configurations' homes by workdir because that can import their session ID
+    // into this configuration and create another history branch. Keep the global
+    // home only as a fallback for an already-bound session during migration.
+    let binding = session_binding_key(restore_config, endpoint);
+    if restore_config.restore_sessions && !force_new_session {
+        prefer_config_owned_legacy_session_binding_in(
+            runtime_dir,
+            restore_config,
+            endpoint,
+            store,
+            &binding,
+        )?;
+    }
+    let mut fallback_homes = Vec::new();
+    if let Some(session_id) = store.get_bound_session_id(&binding) {
+        let isolated_index = CodexSessionIndex::new(runtime_config.codex_home.clone());
+        if isolated_index
+            .find_latest_session_file_for_workdir(&endpoint.workdir, Some(&session_id))
+            .is_none()
+        {
+            fallback_homes.push(restore_config.codex_home.clone());
+        }
+    }
+    let codex_index = CodexSessionIndex::new(runtime_config.codex_home.clone())
+        .with_additional_homes(fallback_homes);
     let session_id = resume_session_id(
         restore_config,
         endpoint,
@@ -1303,6 +1503,9 @@ fn build_agent_launch_for_codex_restore_home(
         &codex_index,
         force_new_session,
         missing_policy,
+        // Each isolated runtime owns its own JSONL copy. Two configurations can
+        // legitimately retain an older branch with the same Codex session ID.
+        true,
     )?;
     Ok(AgentLaunch {
         command: codex_resume_command(
@@ -1313,6 +1516,106 @@ fn build_agent_launch_for_codex_restore_home(
         resumed: session_id.is_some(),
         session_id,
     })
+}
+
+fn prefer_config_owned_legacy_session_binding_in(
+    runtime_dir: &Path,
+    config: &AppConfig,
+    endpoint: &EndpointConfig,
+    store: &mut SessionStore,
+    binding: &SessionBindingKey,
+) -> Result<()> {
+    let config_root = isolated_codex_config_root_path_in(runtime_dir, config);
+    // Prefer this configuration's private history before using its original
+    // source home. The lookup is confined to the current configuration root,
+    // so it cannot adopt another configuration's branch.
+    let owned_homes = config_owned_codex_homes_in(runtime_dir, config);
+    let Some(session_id) = store.get_bound_session_id(binding) else {
+        if let Some((private_session_id, private_path)) =
+            find_latest_config_owned_session_binding(&owned_homes, endpoint)
+        {
+            store.set_bound_session_id(binding, &private_session_id, Some(&private_path))?;
+        }
+        return Ok(());
+    };
+    let bound_path = store.get_bound_session_path(binding);
+    if bound_path.as_deref().is_some_and(|path| {
+        path_is_within(path, &config_root)
+            && codex_session_file_matches(path, &endpoint.workdir, &session_id)
+    }) {
+        return Ok(());
+    }
+
+    for legacy_home in &owned_homes {
+        if prefer_config_owned_session_binding_from_home(
+            legacy_home,
+            endpoint,
+            store,
+            binding,
+            &session_id,
+        )? {
+            return Ok(());
+        }
+    }
+
+    // A stale cache can carry a completely foreign session ID, not just a
+    // foreign path. When this configuration has a private history for the
+    // workdir, it is the only safe automatic recovery candidate. Do not scan
+    // global or sibling configuration homes before using it.
+    if let Some((private_session_id, private_path)) =
+        find_latest_config_owned_session_binding(&owned_homes, endpoint)
+    {
+        return store.set_bound_session_id(binding, &private_session_id, Some(&private_path));
+    }
+
+    match bound_path {
+        // No private history exists yet. Retain an ID-only binding so the
+        // configured source home can complete the older migration path below.
+        None => Ok(()),
+        Some(path)
+            if path_is_within(&path, &config.codex_home)
+                && codex_session_file_matches(&path, &endpoint.workdir, &session_id) =>
+        {
+            Ok(())
+        }
+        // No configuration-owned history exists and this explicit path is
+        // stale or belongs to a different profile. Start fresh instead of
+        // importing an untrusted branch.
+        Some(_) => store.delete_bound_session_id(binding),
+    }
+}
+
+fn find_latest_config_owned_session_binding(
+    homes: &[PathBuf],
+    endpoint: &EndpointConfig,
+) -> Option<(String, PathBuf)> {
+    let (first, rest) = homes.split_first()?;
+    CodexSessionIndex::new(first.clone())
+        .with_additional_homes(rest.to_vec())
+        .find_latest_session_for_workdir(&endpoint.workdir, None)
+}
+
+fn prefer_config_owned_session_binding_from_home(
+    legacy_home: &Path,
+    endpoint: &EndpointConfig,
+    store: &mut SessionStore,
+    binding: &SessionBindingKey,
+    session_id: &str,
+) -> Result<bool> {
+    let Some(private_path) = CodexSessionIndex::new(legacy_home.to_path_buf())
+        .find_latest_session_file_for_workdir(&endpoint.workdir, Some(session_id))
+    else {
+        return Ok(false);
+    };
+    if store
+        .get_bound_session_path(binding)
+        .as_deref()
+        .is_some_and(|path| paths_equivalent(path, &private_path))
+    {
+        return Ok(true);
+    }
+    store.set_bound_session_id(binding, session_id, Some(&private_path))?;
+    Ok(true)
 }
 
 fn claude_resume_session_id(
@@ -1355,13 +1658,15 @@ fn resume_session_id(
     index: &CodexSessionIndex,
     force_new_session: bool,
     missing_policy: MissingSessionPolicy,
+    allow_config_scoped_duplicate: bool,
 ) -> Result<Option<String>> {
     if !config.restore_sessions || force_new_session {
         return Ok(None);
     }
     let binding = session_binding_key(config, endpoint);
     if let Some(session_id) = store.get_bound_session_id(&binding) {
-        if store.session_id_bound_to_other(&binding, &session_id) {
+        if !allow_config_scoped_duplicate && store.session_id_bound_to_other(&binding, &session_id)
+        {
             store.delete_bound_session_id(&binding)?;
             return Ok(None);
         }
@@ -1483,6 +1788,71 @@ fn codex_resume_command(
     }
 }
 
+fn codex_fork_command(
+    command: &AgentCommand,
+    workdir: &Path,
+    source_session_id: &str,
+) -> Result<AgentCommand> {
+    match command {
+        AgentCommand::Args(items) => {
+            let Some(first) = items.first() else {
+                anyhow::bail!("Codex 分叉失败：agent_command 不能为空");
+            };
+            let mut out = Vec::new();
+            out.push(first.clone());
+            out.push("fork".to_string());
+            out.push("-C".to_string());
+            out.push(workdir.to_string_lossy().to_string());
+            out.extend(strip_codex_cd_args(items.iter().skip(1)));
+            out.push(source_session_id.to_string());
+            Ok(AgentCommand::Args(out))
+        }
+        AgentCommand::Shell(_) => {
+            anyhow::bail!("Codex 分叉要求 agent_command 使用数组命令，不能使用 shell 字符串")
+        }
+    }
+}
+
+fn claude_fork_command(command: &AgentCommand, source_session_id: &str) -> Result<AgentCommand> {
+    match normalize_agent_shell_command(command.clone(), "claude-code") {
+        AgentCommand::Args(items) => {
+            if items.is_empty() {
+                anyhow::bail!("Claude 分叉失败：agent_command 不能为空");
+            }
+            let mut out = strip_claude_session_args(&items);
+            out.extend([
+                "--resume".to_string(),
+                source_session_id.to_string(),
+                "--fork-session".to_string(),
+            ]);
+            Ok(AgentCommand::Args(out))
+        }
+        AgentCommand::Shell(_) => {
+            anyhow::bail!("Claude 分叉要求 agent_command 使用数组命令，不能使用 shell 字符串")
+        }
+    }
+}
+
+fn opencode_fork_command(command: &AgentCommand, source_session_id: &str) -> Result<AgentCommand> {
+    match normalize_agent_shell_command(command.clone(), "opencode") {
+        AgentCommand::Args(items) => {
+            if items.is_empty() {
+                anyhow::bail!("OpenCode 分叉失败：agent_command 不能为空");
+            }
+            let mut out = strip_opencode_session_args(&items);
+            out.extend([
+                "--session".to_string(),
+                source_session_id.to_string(),
+                "--fork".to_string(),
+            ]);
+            Ok(AgentCommand::Args(out))
+        }
+        AgentCommand::Shell(_) => {
+            anyhow::bail!("OpenCode 分叉要求 agent_command 使用数组命令，不能使用 shell 字符串")
+        }
+    }
+}
+
 fn strip_codex_cd_args<'a>(items: impl Iterator<Item = &'a String>) -> Vec<String> {
     let mut out = Vec::new();
     let mut skip_next = false;
@@ -1507,14 +1877,11 @@ fn claude_resume_command(command: &AgentCommand, session_id: Option<&str>) -> Ag
     let Some(session_id) = session_id else {
         return command.clone();
     };
-    match command {
+    match normalize_agent_shell_command(command.clone(), "claude-code") {
         AgentCommand::Args(items) => {
-            let mut out = Vec::new();
-            if let Some(first) = items.first() {
-                out.push(first.clone());
-                out.push("--resume".to_string());
-                out.push(session_id.to_string());
-                out.extend(items.iter().skip(1).cloned());
+            let mut out = strip_claude_session_args(&items);
+            if !out.is_empty() {
+                out.extend(["--resume".to_string(), session_id.to_string()]);
             }
             AgentCommand::Args(out)
         }
@@ -1523,9 +1890,9 @@ fn claude_resume_command(command: &AgentCommand, session_id: Option<&str>) -> Ag
 }
 
 fn opencode_command(command: &AgentCommand, session_id: Option<&str>) -> AgentCommand {
-    match command {
+    match normalize_agent_shell_command(command.clone(), "opencode") {
         AgentCommand::Args(items) => {
-            let mut out = items.clone();
+            let mut out = strip_opencode_session_args(&items);
             if let Some(session_id) = session_id {
                 out.push("--session".to_string());
                 out.push(session_id.to_string());
@@ -1538,6 +1905,296 @@ fn opencode_command(command: &AgentCommand, session_id: Option<&str>) -> AgentCo
     }
 }
 
+fn strip_claude_session_args(items: &[String]) -> Vec<String> {
+    strip_agent_session_args(
+        items,
+        "claude-code",
+        &["--resume", "-r", "--session-id"],
+        &["--continue", "-c", "--fork-session"],
+        &["--resume=", "--session-id="],
+    )
+}
+
+fn strip_opencode_session_args(items: &[String]) -> Vec<String> {
+    strip_agent_session_args(
+        items,
+        "opencode",
+        &["--session", "-s"],
+        &["--continue", "-c", "--fork"],
+        &["--session="],
+    )
+}
+
+fn strip_agent_session_args(
+    items: &[String],
+    driver: &str,
+    options_with_value: &[&str],
+    flags: &[&str],
+    option_prefixes: &[&str],
+) -> Vec<String> {
+    let agent_args_start = agent_cli_insert_index(items, driver);
+    let mut out = items[..agent_args_start].to_vec();
+    let mut skip_next = false;
+    for item in items.iter().skip(agent_args_start) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if options_with_value.contains(&item.as_str()) {
+            skip_next = true;
+            continue;
+        }
+        if flags.contains(&item.as_str())
+            || option_prefixes
+                .iter()
+                .any(|prefix| item.starts_with(prefix))
+        {
+            continue;
+        }
+        out.push(item.clone());
+    }
+    out
+}
+
+fn normalize_agent_shell_command(command: AgentCommand, driver: &str) -> AgentCommand {
+    let AgentCommand::Shell(text) = command else {
+        return command;
+    };
+    let items = split_shell_like_command(&text);
+    let targets_agent = items
+        .first()
+        .is_some_and(|item| agent_driver_from_command_part(item) == Some(driver))
+        || shell_wrapper_command_start(&items).is_some_and(|start| {
+            items
+                .get(start)
+                .is_some_and(|item| agent_driver_from_command_part(item) == Some(driver))
+        });
+    if targets_agent {
+        AgentCommand::Args(items)
+    } else {
+        AgentCommand::Shell(text)
+    }
+}
+
+fn command_with_required_agent_flag(
+    command: AgentCommand,
+    driver: &str,
+    required_flag: &str,
+) -> AgentCommand {
+    let mut items = match normalize_agent_shell_command(command, driver) {
+        AgentCommand::Args(items) => items,
+        AgentCommand::Shell(text) => return AgentCommand::Shell(text),
+    };
+    if items.is_empty() {
+        return AgentCommand::Args(items);
+    }
+    items.retain(|item| item != required_flag);
+    let insert_at = if agent_driver_from_command_part(&items[0]) == Some(driver) {
+        1
+    } else if let Some(start) = shell_wrapper_command_start(&items) {
+        if items
+            .get(start)
+            .is_some_and(|item| agent_driver_from_command_part(item) == Some(driver))
+        {
+            start + 1
+        } else {
+            1
+        }
+    } else {
+        1
+    };
+    items.insert(insert_at.min(items.len()), required_flag.to_string());
+    AgentCommand::Args(items)
+}
+
+fn command_with_agent_option_override(
+    command: AgentCommand,
+    driver: &str,
+    long_option: &str,
+    short_option: Option<&str>,
+    value: &str,
+) -> AgentCommand {
+    let mut items = match normalize_agent_shell_command(command, driver) {
+        AgentCommand::Args(items) => items,
+        AgentCommand::Shell(text) => return AgentCommand::Shell(text),
+    };
+    if items.is_empty() {
+        return AgentCommand::Args(items);
+    }
+    let mut filtered = Vec::with_capacity(items.len() + 2);
+    let mut skip_next = false;
+    for item in items.drain(..) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if item == long_option || short_option.is_some_and(|short| item == short) {
+            skip_next = true;
+            continue;
+        }
+        if item.starts_with(&format!("{long_option}=")) {
+            continue;
+        }
+        filtered.push(item);
+    }
+    if filtered.is_empty() {
+        return AgentCommand::Args(filtered);
+    }
+    let insert_at = agent_cli_insert_index(&filtered, driver);
+    filtered.splice(
+        insert_at..insert_at,
+        [long_option.to_string(), value.to_string()],
+    );
+    AgentCommand::Args(filtered)
+}
+
+fn agent_cli_insert_index(items: &[String], driver: &str) -> usize {
+    if items
+        .first()
+        .is_some_and(|item| agent_driver_from_command_part(item) == Some(driver))
+    {
+        return 1;
+    }
+    if let Some(start) = shell_wrapper_command_start(items) {
+        if items
+            .get(start)
+            .is_some_and(|item| agent_driver_from_command_part(item) == Some(driver))
+        {
+            return (start + 1).min(items.len());
+        }
+    }
+    1.min(items.len())
+}
+
+fn claude_command_with_endpoint_overrides(
+    command: AgentCommand,
+    endpoint: &EndpointConfig,
+) -> AgentCommand {
+    let command = command_with_agent_option_override(
+        command,
+        "claude-code",
+        "--model",
+        None,
+        &endpoint.model,
+    );
+    let command = match endpoint
+        .reasoning_effort
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "minimal" | "low" => {
+            command_with_agent_option_override(command, "claude-code", "--effort", None, "low")
+        }
+        effort @ ("medium" | "high" | "xhigh" | "max") => {
+            command_with_agent_option_override(command, "claude-code", "--effort", None, effort)
+        }
+        _ => command,
+    };
+    command_with_required_agent_flag(command, "claude-code", "--dangerously-skip-permissions")
+}
+
+fn opencode_command_with_endpoint_overrides(
+    command: AgentCommand,
+    endpoint: &EndpointConfig,
+) -> AgentCommand {
+    let model = format!("watchapi-runtime/{}", endpoint.model);
+    let command =
+        command_with_agent_option_override(command, "opencode", "--model", Some("-m"), &model);
+    command_with_required_agent_flag(command, "opencode", "--auto")
+}
+
+fn anthropic_base_url(base_url: &str) -> String {
+    let base = base_url.trim().trim_end_matches('/');
+    base.strip_suffix("/v1").unwrap_or(base).to_string()
+}
+
+fn opencode_endpoint_config_content(
+    endpoint: &EndpointConfig,
+    probe_path: &str,
+    model_context_window: Option<usize>,
+) -> String {
+    let normalized_probe_path = probe_path.trim_matches('/').to_ascii_lowercase();
+    let responses_api =
+        normalized_probe_path == "responses" || normalized_probe_path.ends_with("/responses");
+    let provider_npm = if responses_api {
+        "@ai-sdk/openai"
+    } else {
+        "@ai-sdk/openai-compatible"
+    };
+    let mut model = serde_json::json!({
+        "name": endpoint.model,
+        "attachment": true,
+        "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+        }
+    });
+    if responses_api {
+        let mut options = serde_json::Map::new();
+        let effort = endpoint.reasoning_effort.trim().to_ascii_lowercase();
+        if matches!(
+            effort.as_str(),
+            "minimal" | "low" | "medium" | "high" | "xhigh"
+        ) {
+            options.insert("reasoningEffort".to_string(), serde_json::json!(effort));
+        }
+        if let Some(service_tier) = endpoint
+            .service_tier
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            options.insert("serviceTier".to_string(), serde_json::json!(service_tier));
+        }
+        if !options.is_empty() {
+            model["options"] = serde_json::Value::Object(options);
+        }
+    }
+    if let Some(context) = model_context_window.filter(|context| *context > 0) {
+        model["limit"] = serde_json::json!({"context": context});
+    }
+    let mut models = serde_json::Map::new();
+    models.insert(endpoint.model.clone(), model);
+    serde_json::json!({
+        "model": format!("watchapi-runtime/{}", endpoint.model),
+        "provider": {
+            "watchapi-runtime": {
+                "name": "WatchApi Runtime",
+                "npm": provider_npm,
+                "options": {
+                    "baseURL": opencode_provider_base_url(&endpoint.base_url, probe_path),
+                    "apiKey": endpoint.api_key
+                },
+                "models": serde_json::Value::Object(models)
+            }
+        }
+    })
+    .to_string()
+}
+
+fn opencode_provider_base_url(base_url: &str, probe_path: &str) -> String {
+    let base = base_url.trim().trim_end_matches('/');
+    let path = format!("/{}", probe_path.trim_matches('/'));
+    let endpoint_suffix = if path.to_ascii_lowercase().ends_with("/responses") {
+        "/responses"
+    } else if path.to_ascii_lowercase().ends_with("/chat/completions") {
+        "/chat/completions"
+    } else {
+        return base.to_string();
+    };
+    let full_url = if base.to_ascii_lowercase().ends_with("/v1")
+        && path.to_ascii_lowercase().starts_with("/v1/")
+    {
+        format!("{base}{}", &path[3..])
+    } else {
+        format!("{base}{path}")
+    };
+    full_url[..full_url.len().saturating_sub(endpoint_suffix.len())]
+        .trim_end_matches('/')
+        .to_string()
+}
+
 fn submit_sequence_text(sequence: &str) -> &'static str {
     match sequence {
         "crlf" => "\r\n",
@@ -1547,7 +2204,14 @@ fn submit_sequence_text(sequence: &str) -> &'static str {
 }
 
 fn prepare_isolated_codex_home(config: &AppConfig) -> Result<IsolatedCodexHome> {
-    let home = stable_isolated_codex_home_path(config);
+    prepare_isolated_codex_home_in(&app_runtime_dir(), config)
+}
+
+fn prepare_isolated_codex_home_in(
+    runtime_dir: &Path,
+    config: &AppConfig,
+) -> Result<IsolatedCodexHome> {
+    let home = stable_isolated_codex_home_path_in(runtime_dir, config);
     fs::create_dir_all(&home)
         .with_context(|| format!("create isolated Codex home {}", home.display()))?;
 
@@ -1567,35 +2231,80 @@ fn prepare_isolated_codex_home(config: &AppConfig) -> Result<IsolatedCodexHome> 
             home.join("auth.json").display()
         )
     })?;
-    copy_file_if_exists(
-        &config.codex_home.join(".codex-global-state.json"),
-        &home.join(".codex-global-state.json"),
-    )
-    .with_context(|| {
-        format!(
-            "copy Codex global state from {} to {}",
-            config.codex_home.join(".codex-global-state.json").display(),
-            home.join(".codex-global-state.json").display()
-        )
-    })?;
-    copy_file_if_exists(
-        &config.codex_home.join("state_5.sqlite"),
-        &home.join("state_5.sqlite"),
-    )?;
-    let session_baseline = collect_codex_session_baseline(&home);
-
-    Ok(IsolatedCodexHome {
-        home,
-        source_home: config.codex_home.clone(),
-        session_baseline,
-    })
+    Ok(IsolatedCodexHome { home })
 }
 
+#[cfg(test)]
 fn stable_isolated_codex_home_path(config: &AppConfig) -> PathBuf {
-    app_runtime_dir()
+    stable_isolated_codex_home_path_in(&app_runtime_dir(), config)
+}
+
+fn stable_isolated_codex_home_path_in(runtime_dir: &Path, config: &AppConfig) -> PathBuf {
+    isolated_codex_config_root_path_in(runtime_dir, config)
+        // Existing homes can contain a stale Codex SQLite projection that points
+        // at a global or another configuration's rollout. A new runtime root keeps
+        // those caches out of the process while preserving their sessions intact.
+        .join(CODEX_ISOLATED_RUNTIME_DIR)
+        .join(sanitize_path_segment(&config.agent_id))
+}
+
+fn legacy_isolated_codex_home_path_in(runtime_dir: &Path, config: &AppConfig) -> PathBuf {
+    isolated_codex_config_root_path_in(runtime_dir, config)
+        .join(sanitize_path_segment(&config.agent_id))
+}
+
+fn config_owned_codex_homes_in(runtime_dir: &Path, config: &AppConfig) -> Vec<PathBuf> {
+    let config_root = isolated_codex_config_root_path_in(runtime_dir, config);
+    let preferred = legacy_isolated_codex_home_path_in(runtime_dir, config);
+    let runtime_home = stable_isolated_codex_home_path_in(runtime_dir, config);
+    let mut homes = vec![runtime_home.clone(), preferred.clone()];
+    let historical_runtime_root = config_root.join(CODEX_ISOLATED_RUNTIME_DIR);
+    if let Ok(entries) = fs::read_dir(&historical_runtime_root) {
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            if !paths_equivalent(&path, &runtime_home) {
+                homes.push(path);
+            }
+        }
+    }
+    let Ok(entries) = fs::read_dir(&config_root) else {
+        return homes;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() || entry.file_name() == CODEX_ISOLATED_RUNTIME_DIR {
+            continue;
+        }
+        let path = entry.path();
+        if !paths_equivalent(&path, &preferred) {
+            homes.push(path);
+        }
+    }
+    homes
+}
+
+fn isolated_codex_config_root_path_in(runtime_dir: &Path, config: &AppConfig) -> PathBuf {
+    runtime_dir
         .join("codex-homes")
         .join(stable_config_key(config))
-        .join(sanitize_path_segment(&config.agent_id))
+}
+
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    if path.starts_with(root) {
+        return true;
+    }
+    match (path.canonicalize(), root.canonicalize()) {
+        (Ok(path), Ok(root)) => path.starts_with(root),
+        _ => false,
+    }
 }
 
 fn app_runtime_dir() -> PathBuf {
@@ -1604,10 +2313,6 @@ fn app_runtime_dir() -> PathBuf {
         .and_then(|path| path.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         .join("Runtime")
-}
-
-fn historical_isolated_codex_homes() -> Vec<PathBuf> {
-    discover_codex_session_homes(&app_runtime_dir().join("codex-homes"))
 }
 
 fn stable_config_key(config: &AppConfig) -> String {
@@ -1669,6 +2374,7 @@ fn codex_command_with_cli_overrides(
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| config.codex_provider_name.clone());
     let mut overrides = vec![
+        "--dangerously-bypass-approvals-and-sandbox".to_string(),
         "-c".to_string(),
         format!("model={}", toml_cli_string(&endpoint.model)),
         "-c".to_string(),
@@ -1737,6 +2443,7 @@ fn insert_codex_cli_overrides(mut parts: Vec<String>, mut overrides: Vec<String>
     if parts.is_empty() {
         return parts;
     }
+    parts.retain(|part| part != "--dangerously-bypass-approvals-and-sandbox");
     if is_codex_command_part(&parts[0]) {
         parts.splice(1..1, overrides);
         return parts;
@@ -1796,6 +2503,13 @@ fn copy_codex_resume_session_to_isolated_home(
     session_id: &str,
     source_session_path: Option<&Path>,
 ) -> Result<PathBuf> {
+    // A config-owned copy is authoritative, even when an older synchronization run
+    // stored the same session ID beneath a different dated filename.
+    if let Some(existing) = CodexSessionIndex::new(isolated_home.to_path_buf())
+        .find_latest_session_file_for_workdir(workdir, Some(session_id))
+    {
+        return Ok(existing);
+    }
     let source = if let Some(path) = source_session_path {
         if !codex_session_file_matches(path, workdir, session_id) {
             anyhow::bail!(
@@ -1820,6 +2534,9 @@ fn copy_codex_resume_session_to_isolated_home(
     let relative = codex_session_relative_path(&source, source_home)?;
     let target = isolated_home.join(relative);
     if paths_equivalent(&source, &target) {
+        return Ok(target);
+    }
+    if target.exists() {
         return Ok(target);
     }
     copy_file_if_exists(&source, &target).with_context(|| {
@@ -1869,97 +2586,6 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
         (Ok(left), Ok(right)) => left == right,
         _ => false,
     }
-}
-
-fn collect_codex_session_baseline(home: &Path) -> HashMap<PathBuf, SessionFileFingerprint> {
-    let mut out = HashMap::new();
-    for root_name in ["sessions", "archived_sessions"] {
-        let root = home.join(root_name);
-        for path in jsonl_files_under(&root) {
-            let relative = path
-                .strip_prefix(home)
-                .unwrap_or(path.as_path())
-                .to_path_buf();
-            if let Some(fingerprint) = session_file_fingerprint(&path) {
-                out.insert(relative, fingerprint);
-            }
-        }
-    }
-    out
-}
-
-fn add_codex_session_baseline_file(
-    baseline: &mut HashMap<PathBuf, SessionFileFingerprint>,
-    home: &Path,
-    path: &Path,
-) {
-    let relative = path.strip_prefix(home).unwrap_or(path).to_path_buf();
-    if let Some(fingerprint) = session_file_fingerprint(path) {
-        baseline.insert(relative, fingerprint);
-    }
-}
-
-fn session_file_fingerprint(path: &Path) -> Option<SessionFileFingerprint> {
-    let metadata = fs::metadata(path).ok()?;
-    let modified_millis = metadata
-        .modified()
-        .ok()
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis());
-    Some(SessionFileFingerprint {
-        len: metadata.len(),
-        modified_millis,
-    })
-}
-
-fn jsonl_files_under(root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    collect_jsonl_files_under(root, &mut out);
-    out
-}
-
-fn collect_jsonl_files_under(path: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(path) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_jsonl_files_under(&path, out);
-        } else if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
-            out.push(path);
-        }
-    }
-}
-
-fn merge_codex_sessions_back_with_baseline(
-    temp_home: &Path,
-    source_home: &Path,
-    baseline: &HashMap<PathBuf, SessionFileFingerprint>,
-) -> Result<()> {
-    for root_name in ["sessions", "archived_sessions"] {
-        let root = temp_home.join(root_name);
-        for path in jsonl_files_under(&root) {
-            let relative = path
-                .strip_prefix(temp_home)
-                .unwrap_or(path.as_path())
-                .to_path_buf();
-            let current = session_file_fingerprint(&path);
-            if current.is_some() && baseline.get(&relative).copied() == current {
-                continue;
-            }
-            copy_file_if_exists(&path, &source_home.join(&relative))?;
-        }
-    }
-    copy_file_if_exists(
-        &temp_home.join(".codex-global-state.json"),
-        &source_home.join(".codex-global-state.json"),
-    )?;
-    copy_file_if_exists(
-        &temp_home.join("state_5.sqlite"),
-        &source_home.join("state_5.sqlite"),
-    )?;
-    Ok(())
 }
 
 fn command_args(command: &AgentCommand) -> Vec<String> {
@@ -2132,6 +2758,21 @@ fn codex_repair_prompt_visible(text: &str) -> bool {
         && (lowered.contains("local database appears to be damaged")
             || lowered.contains("database disk image is malformed")
             || lowered.contains("failed to initialize state runtime"))
+}
+
+fn codex_command_approval_prompt_visible(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    let has_approval_choices = lowered.contains("1. yes, proceed")
+        && (lowered.contains("2. yes, and don't ask again")
+            || lowered.contains("2. yes, and do not ask again"))
+        && lowered.contains("3. no");
+    has_approval_choices
+        && text.lines().any(|line| {
+            let trimmed = line.trim_start();
+            (trimmed.starts_with('>') || trimmed.starts_with('❯') || trimmed.starts_with('➜'))
+                && trimmed.contains("2.")
+                && trimmed.to_ascii_lowercase().contains("don't ask again")
+        })
 }
 
 fn generic_first_option_prompt_visible(text: &str) -> bool {
@@ -2824,7 +3465,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_restore_lookup_uses_source_home_for_isolated_runtime() {
+    fn codex_restore_lookup_uses_global_home_only_for_a_bound_session() {
         let tmp = tempfile::tempdir().unwrap();
         let workdir = tmp.path().join("project");
         fs::create_dir_all(&workdir).unwrap();
@@ -2901,6 +3542,482 @@ mod tests {
     }
 
     #[test]
+    fn isolated_restore_does_not_resume_session_from_another_configuration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let global_home = tmp.path().join(".codex");
+        let other_home = tmp
+            .path()
+            .join("Runtime/codex-homes/other-config/codex-main");
+        let other_session = other_home.join("sessions/2026/05/17/other.jsonl");
+        fs::create_dir_all(other_session.parent().unwrap()).unwrap();
+        fs::write(
+            &other_session,
+            serde_json::json!({"type": "session_meta", "payload": {"id": "other-session", "cwd": workdir.to_string_lossy()}}).to_string() + "\n",
+        )
+        .unwrap();
+        let mut cfg = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Args(vec!["codex".to_string()]),
+            tmp.path().join("state.json"),
+            global_home,
+        );
+        cfg.config_path = Some(tmp.path().join("config.json"));
+        let isolated_home = tmp
+            .path()
+            .join("Runtime/codex-homes/current-config/codex-main");
+        let mut runtime_cfg = cfg.clone();
+        runtime_cfg.codex_home = isolated_home;
+        let endpoint = endpoint(workdir);
+        let mut store = SessionStore::new(cfg.session_state_path.clone());
+
+        let launch = build_agent_launch_for_codex_restore_home(
+            &runtime_cfg,
+            &cfg,
+            &endpoint,
+            &mut store,
+            false,
+            MissingSessionPolicy::New,
+        )
+        .unwrap();
+
+        assert!(!launch.resumed);
+        assert_eq!(launch.session_id, None);
+        assert_eq!(
+            launch.command,
+            AgentCommand::Args(vec!["codex".to_string()])
+        );
+    }
+
+    #[test]
+    fn isolated_restore_reclaims_a_global_binding_from_its_own_legacy_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_dir = tmp.path().join("Runtime");
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let global_home = tmp.path().join(".codex");
+        let global_file = global_home.join("sessions/2026/08/13/global-branch.jsonl");
+        fs::create_dir_all(global_file.parent().unwrap()).unwrap();
+        let session_id = "selected-session";
+        let metadata = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"id": session_id, "cwd": workdir.to_string_lossy()}
+        })
+        .to_string();
+        fs::write(&global_file, format!("{metadata}\nglobal branch\n")).unwrap();
+
+        let mut cfg = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Args(vec!["codex".to_string()]),
+            tmp.path().join("state.json"),
+            global_home.clone(),
+        );
+        cfg.config_path = Some(tmp.path().join("config.json"));
+        let legacy_home = legacy_isolated_codex_home_path_in(&runtime_dir, &cfg);
+        let private_file = legacy_home.join("sessions/2026/08/10/private-history.jsonl");
+        fs::create_dir_all(private_file.parent().unwrap()).unwrap();
+        fs::write(&private_file, format!("{metadata}\nprivate history\n")).unwrap();
+        let isolated_home = stable_isolated_codex_home_path_in(&runtime_dir, &cfg);
+        let mut runtime_cfg = cfg.clone();
+        runtime_cfg.codex_home = isolated_home.clone();
+        let endpoint = endpoint(workdir.clone());
+        let mut store = SessionStore::new(cfg.session_state_path.clone());
+        let binding = session_binding_key(&cfg, &endpoint);
+        store
+            .set_bound_session_id(&binding, session_id, Some(&global_file))
+            .unwrap();
+
+        let launch = build_agent_launch_for_codex_restore_home_in(
+            &runtime_dir,
+            &runtime_cfg,
+            &cfg,
+            &endpoint,
+            &mut store,
+            false,
+            MissingSessionPolicy::New,
+        )
+        .unwrap();
+        let copied = copy_codex_resume_session_to_isolated_home(
+            &global_home,
+            &isolated_home,
+            &workdir,
+            session_id,
+            store.get_bound_session_path(&binding).as_deref(),
+        )
+        .unwrap();
+
+        assert_eq!(launch.session_id, Some(session_id.to_string()));
+        assert!(launch.resumed);
+        assert_eq!(store.get_bound_session_path(&binding), Some(private_file));
+        assert_eq!(
+            fs::read_to_string(&copied).unwrap(),
+            format!("{metadata}\nprivate history\n")
+        );
+        assert!(!fs::read_to_string(&copied)
+            .unwrap()
+            .contains("global branch"));
+    }
+
+    #[test]
+    fn isolated_restore_reclaims_private_history_when_the_bound_session_id_is_foreign() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_dir = tmp.path().join("Runtime");
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let source_home = tmp.path().join(".codex");
+        let mut cfg = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Args(vec!["codex".to_string()]),
+            tmp.path().join("state.json"),
+            source_home,
+        );
+        cfg.config_path = Some(tmp.path().join("config.json"));
+        let endpoint = endpoint(workdir.clone());
+        let private_session_id = "private-session";
+        let private_file = legacy_isolated_codex_home_path_in(&runtime_dir, &cfg)
+            .join("sessions/2026/08/10/private-history.jsonl");
+        fs::create_dir_all(private_file.parent().unwrap()).unwrap();
+        fs::write(
+            &private_file,
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {"id": private_session_id, "cwd": workdir.to_string_lossy()}
+            })
+            .to_string()
+                + "\nprivate history\n",
+        )
+        .unwrap();
+        let foreign_home = tmp.path().join("foreign");
+        let foreign_file = foreign_home.join("sessions/2026/08/10/foreign-history.jsonl");
+        fs::create_dir_all(foreign_file.parent().unwrap()).unwrap();
+        fs::write(
+            &foreign_file,
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {"id": "foreign-session", "cwd": workdir.to_string_lossy()}
+            })
+            .to_string()
+                + "\nforeign history\n",
+        )
+        .unwrap();
+        let isolated_home = stable_isolated_codex_home_path_in(&runtime_dir, &cfg);
+        let mut runtime_cfg = cfg.clone();
+        runtime_cfg.codex_home = isolated_home;
+        let mut store = SessionStore::new(cfg.session_state_path.clone());
+        let binding = session_binding_key(&cfg, &endpoint);
+        store
+            .set_bound_session_id(&binding, "foreign-session", Some(&foreign_file))
+            .unwrap();
+
+        let launch = build_agent_launch_for_codex_restore_home_in(
+            &runtime_dir,
+            &runtime_cfg,
+            &cfg,
+            &endpoint,
+            &mut store,
+            false,
+            MissingSessionPolicy::New,
+        )
+        .unwrap();
+
+        assert_eq!(launch.session_id, Some(private_session_id.to_string()));
+        assert!(launch.resumed);
+        assert_eq!(store.get_bound_session_path(&binding), Some(private_file));
+    }
+
+    #[test]
+    fn isolated_restore_reclaims_private_history_without_a_saved_binding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_dir = tmp.path().join("Runtime");
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let source_home = tmp.path().join(".codex");
+        let mut cfg = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Args(vec!["codex".to_string()]),
+            tmp.path().join("state.json"),
+            source_home,
+        );
+        cfg.config_path = Some(tmp.path().join("config.json"));
+        let endpoint = endpoint(workdir.clone());
+        let private_session_id = "private-session";
+        let private_file = legacy_isolated_codex_home_path_in(&runtime_dir, &cfg)
+            .join("sessions/2026/08/10/private-history.jsonl");
+        fs::create_dir_all(private_file.parent().unwrap()).unwrap();
+        fs::write(
+            &private_file,
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {"id": private_session_id, "cwd": workdir.to_string_lossy()}
+            })
+            .to_string()
+                + "\nprivate history\n",
+        )
+        .unwrap();
+        let isolated_home = stable_isolated_codex_home_path_in(&runtime_dir, &cfg);
+        let mut runtime_cfg = cfg.clone();
+        runtime_cfg.codex_home = isolated_home;
+        let mut store = SessionStore::new(cfg.session_state_path.clone());
+        let binding = session_binding_key(&cfg, &endpoint);
+
+        let launch = build_agent_launch_for_codex_restore_home_in(
+            &runtime_dir,
+            &runtime_cfg,
+            &cfg,
+            &endpoint,
+            &mut store,
+            false,
+            MissingSessionPolicy::New,
+        )
+        .unwrap();
+
+        assert_eq!(launch.session_id, Some(private_session_id.to_string()));
+        assert!(launch.resumed);
+        assert_eq!(store.get_bound_session_path(&binding), Some(private_file));
+    }
+
+    #[test]
+    fn isolated_restore_reclaims_runtime_v2_history_without_a_saved_binding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_dir = tmp.path().join("Runtime");
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let source_home = tmp.path().join(".codex");
+        let mut cfg = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Args(vec!["codex".to_string()]),
+            tmp.path().join("state.json"),
+            source_home,
+        );
+        cfg.config_path = Some(tmp.path().join("config.json"));
+        let endpoint = endpoint(workdir.clone());
+        let private_session_id = "runtime-session";
+        let private_file = stable_isolated_codex_home_path_in(&runtime_dir, &cfg)
+            .join("sessions/2026/08/13/runtime-history.jsonl");
+        fs::create_dir_all(private_file.parent().unwrap()).unwrap();
+        fs::write(
+            &private_file,
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {"id": private_session_id, "cwd": workdir.to_string_lossy()}
+            })
+            .to_string()
+                + "\nruntime history\n",
+        )
+        .unwrap();
+        let mut runtime_cfg = cfg.clone();
+        runtime_cfg.codex_home = stable_isolated_codex_home_path_in(&runtime_dir, &cfg);
+        let mut store = SessionStore::new(cfg.session_state_path.clone());
+        let binding = session_binding_key(&cfg, &endpoint);
+
+        let launch = build_agent_launch_for_codex_restore_home_in(
+            &runtime_dir,
+            &runtime_cfg,
+            &cfg,
+            &endpoint,
+            &mut store,
+            false,
+            MissingSessionPolicy::New,
+        )
+        .unwrap();
+
+        assert_eq!(launch.session_id, Some(private_session_id.to_string()));
+        assert!(launch.resumed);
+        assert_eq!(store.get_bound_session_path(&binding), Some(private_file));
+    }
+
+    #[test]
+    fn isolated_restore_recovers_runtime_v2_history_after_agent_id_rename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_dir = tmp.path().join("Runtime");
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let source_home = tmp.path().join(".codex");
+        let mut old_cfg = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Args(vec!["codex".to_string()]),
+            tmp.path().join("state.json"),
+            source_home,
+        );
+        old_cfg.config_path = Some(tmp.path().join("config.json"));
+        old_cfg.agent_id = "codex-before-rename".to_string();
+        let endpoint = endpoint(workdir.clone());
+        let session_id = "session-created-before-rename";
+        let old_runtime_file = stable_isolated_codex_home_path_in(&runtime_dir, &old_cfg)
+            .join("sessions/2026/08/14/runtime-history.jsonl");
+        fs::create_dir_all(old_runtime_file.parent().unwrap()).unwrap();
+        fs::write(
+            &old_runtime_file,
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {"id": session_id, "cwd": workdir.to_string_lossy()}
+            })
+            .to_string()
+                + "\nlatest runtime history\n",
+        )
+        .unwrap();
+
+        let mut renamed_cfg = old_cfg.clone();
+        renamed_cfg.agent_id = "codex-after-rename".to_string();
+        let mut runtime_cfg = renamed_cfg.clone();
+        runtime_cfg.codex_home = stable_isolated_codex_home_path_in(&runtime_dir, &renamed_cfg);
+        let mut store = SessionStore::new(renamed_cfg.session_state_path.clone());
+        store
+            .set_bound_session_id(
+                &session_binding_key(&old_cfg, &endpoint),
+                session_id,
+                Some(&old_runtime_file),
+            )
+            .unwrap();
+        let renamed_binding = session_binding_key(&renamed_cfg, &endpoint);
+        assert_eq!(store.get_bound_session_id(&renamed_binding), None);
+
+        let launch = build_agent_launch_for_codex_restore_home_in(
+            &runtime_dir,
+            &runtime_cfg,
+            &renamed_cfg,
+            &endpoint,
+            &mut store,
+            false,
+            MissingSessionPolicy::New,
+        )
+        .unwrap();
+
+        assert_eq!(launch.session_id, Some(session_id.to_string()));
+        assert!(launch.resumed);
+        assert_eq!(
+            store.get_bound_session_path(&renamed_binding),
+            Some(old_runtime_file)
+        );
+    }
+
+    #[test]
+    fn isolated_restore_keeps_same_session_id_private_to_each_configuration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_dir = tmp.path().join("Runtime");
+        let workdir = tmp.path().join("project");
+        let source_home = tmp.path().join(".codex");
+        fs::create_dir_all(&workdir).unwrap();
+        let session_id = "shared-session";
+        let metadata = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"id": session_id, "cwd": workdir.to_string_lossy()}
+        })
+        .to_string();
+
+        let mut cfg_a = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Args(vec!["codex".to_string()]),
+            tmp.path().join("state.json"),
+            source_home.clone(),
+        );
+        cfg_a.config_path = Some(tmp.path().join("a.json"));
+        let mut cfg_b = cfg_a.clone();
+        cfg_b.config_path = Some(tmp.path().join("b.json"));
+        let endpoint = endpoint(workdir.clone());
+        let private_a = legacy_isolated_codex_home_path_in(&runtime_dir, &cfg_a)
+            .join("sessions/2026/08/10/a.jsonl");
+        let private_b = legacy_isolated_codex_home_path_in(&runtime_dir, &cfg_b)
+            .join("sessions/2026/08/10/b.jsonl");
+        fs::create_dir_all(private_a.parent().unwrap()).unwrap();
+        fs::create_dir_all(private_b.parent().unwrap()).unwrap();
+        fs::write(&private_a, format!("{metadata}\nconfiguration a\n")).unwrap();
+        fs::write(&private_b, format!("{metadata}\nconfiguration b\n")).unwrap();
+
+        let mut store = SessionStore::new(cfg_a.session_state_path.clone());
+        let binding_a = session_binding_key(&cfg_a, &endpoint);
+        let binding_b = session_binding_key(&cfg_b, &endpoint);
+        // Simulate stale bindings that were accidentally pointed at each other.
+        store
+            .set_bound_session_id(&binding_a, session_id, Some(&private_b))
+            .unwrap();
+        store
+            .set_bound_session_id(&binding_b, session_id, Some(&private_a))
+            .unwrap();
+
+        prefer_config_owned_legacy_session_binding_in(
+            &runtime_dir,
+            &cfg_a,
+            &endpoint,
+            &mut store,
+            &binding_a,
+        )
+        .unwrap();
+        prefer_config_owned_legacy_session_binding_in(
+            &runtime_dir,
+            &cfg_b,
+            &endpoint,
+            &mut store,
+            &binding_b,
+        )
+        .unwrap();
+
+        assert_eq!(store.get_bound_session_path(&binding_a), Some(private_a));
+        assert_eq!(store.get_bound_session_path(&binding_b), Some(private_b));
+    }
+
+    #[test]
+    fn isolated_restore_discards_binding_that_only_points_to_another_configuration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_dir = tmp.path().join("Runtime");
+        let workdir = tmp.path().join("project");
+        let source_home = tmp.path().join(".codex");
+        fs::create_dir_all(&workdir).unwrap();
+        let session_id = "other-session";
+        let metadata = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"id": session_id, "cwd": workdir.to_string_lossy()}
+        })
+        .to_string();
+
+        let mut cfg = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Args(vec!["codex".to_string()]),
+            tmp.path().join("state.json"),
+            source_home,
+        );
+        cfg.config_path = Some(tmp.path().join("current.json"));
+        let mut other_cfg = cfg.clone();
+        other_cfg.config_path = Some(tmp.path().join("other.json"));
+        let endpoint = endpoint(workdir);
+        let foreign_path = legacy_isolated_codex_home_path_in(&runtime_dir, &other_cfg)
+            .join("sessions/2026/08/10/foreign.jsonl");
+        fs::create_dir_all(foreign_path.parent().unwrap()).unwrap();
+        fs::write(
+            &foreign_path,
+            format!("{metadata}\nforeign configuration\n"),
+        )
+        .unwrap();
+
+        let mut store = SessionStore::new(cfg.session_state_path.clone());
+        let binding = session_binding_key(&cfg, &endpoint);
+        store
+            .set_bound_session_id(&binding, session_id, Some(&foreign_path))
+            .unwrap();
+
+        prefer_config_owned_legacy_session_binding_in(
+            &runtime_dir,
+            &cfg,
+            &endpoint,
+            &mut store,
+            &binding,
+        )
+        .unwrap();
+
+        assert_eq!(store.get_bound_session_id(&binding), None);
+        assert_eq!(store.get_bound_session_path(&binding), None);
+    }
+
+    #[test]
     fn resuming_from_source_home_copies_only_selected_session_to_isolated_home() {
         let tmp = tempfile::tempdir().unwrap();
         let workdir = tmp.path().join("project");
@@ -2944,20 +4061,81 @@ mod tests {
     }
 
     #[test]
-    fn bound_codex_session_path_outside_source_home_can_resume_and_copy_to_isolated_home() {
+    fn resuming_preserves_existing_isolated_session_history() {
         let tmp = tempfile::tempdir().unwrap();
         let workdir = tmp.path().join("project");
         fs::create_dir_all(&workdir).unwrap();
         let source_home = tmp.path().join(".codex");
-        let historical_home = tmp.path().join("Runtime/codex-homes/old-config/codex-main");
-        let historical_file = historical_home.join("sessions/2026/05/29/historical.jsonl");
-        fs::create_dir_all(historical_file.parent().unwrap()).unwrap();
-        fs::write(
-            &historical_file,
-            serde_json::json!({"type": "session_meta", "payload": {"id": "historical-session", "cwd": workdir.to_string_lossy()}}).to_string() + "\n",
+        let isolated_home = tmp.path().join("isolated");
+        let source = source_home.join("sessions/2026/05/17/selected.jsonl");
+        let target = isolated_home.join("sessions/2026/05/17/selected.jsonl");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let metadata = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"id": "selected-session", "cwd": workdir.to_string_lossy()}
+        })
+        .to_string();
+        fs::write(&source, format!("{metadata}\nsource continuation\n")).unwrap();
+        let isolated_history = format!("{metadata}\nisolated continuation\n");
+        fs::write(&target, &isolated_history).unwrap();
+
+        let copied = copy_codex_resume_session_to_isolated_home(
+            &source_home,
+            &isolated_home,
+            &workdir,
+            "selected-session",
+            Some(&source),
         )
         .unwrap();
+
+        assert_eq!(copied, target);
+        assert_eq!(fs::read_to_string(&target).unwrap(), isolated_history);
+    }
+
+    #[test]
+    fn resuming_prefers_existing_isolated_session_when_its_path_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let source_home = tmp.path().join(".codex");
         let isolated_home = tmp.path().join("isolated");
+        let source = source_home.join("sessions/2026/05/17/source-path.jsonl");
+        let existing = isolated_home.join("sessions/2026/05/18/private-path.jsonl");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        let metadata = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"id": "selected-session", "cwd": workdir.to_string_lossy()}
+        })
+        .to_string();
+        fs::write(&source, format!("{metadata}\nsource continuation\n")).unwrap();
+        let private_history = format!("{metadata}\nprivate continuation\n");
+        fs::write(&existing, &private_history).unwrap();
+
+        let copied = copy_codex_resume_session_to_isolated_home(
+            &source_home,
+            &isolated_home,
+            &workdir,
+            "selected-session",
+            Some(&source),
+        )
+        .unwrap();
+
+        assert_eq!(copied, existing);
+        assert_eq!(fs::read_to_string(&existing).unwrap(), private_history);
+        assert!(!isolated_home
+            .join("sessions/2026/05/17/source-path.jsonl")
+            .exists());
+    }
+
+    #[test]
+    fn config_owned_bound_codex_session_path_can_resume_and_copy_to_isolated_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_dir = tmp.path().join("Runtime");
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let source_home = tmp.path().join(".codex");
         let mut cfg = config(
             workdir.clone(),
             AgentDriver::Codex,
@@ -2966,6 +4144,15 @@ mod tests {
             source_home.clone(),
         );
         cfg.config_path = Some(tmp.path().join("config.json"));
+        let historical_file = legacy_isolated_codex_home_path_in(&runtime_dir, &cfg)
+            .join("sessions/2026/05/29/historical.jsonl");
+        fs::create_dir_all(historical_file.parent().unwrap()).unwrap();
+        fs::write(
+            &historical_file,
+            serde_json::json!({"type": "session_meta", "payload": {"id": "historical-session", "cwd": workdir.to_string_lossy()}}).to_string() + "\n",
+        )
+        .unwrap();
+        let isolated_home = stable_isolated_codex_home_path_in(&runtime_dir, &cfg);
         let mut runtime_cfg = cfg.clone();
         runtime_cfg.codex_home = isolated_home.clone();
         let endpoint = endpoint(workdir.clone());
@@ -2975,7 +4162,8 @@ mod tests {
             .set_bound_session_id(&binding, "historical-session", Some(&historical_file))
             .unwrap();
 
-        let launch = build_agent_launch_for_codex_restore_home(
+        let launch = build_agent_launch_for_codex_restore_home_in(
+            &runtime_dir,
             &runtime_cfg,
             &cfg,
             &endpoint,
@@ -3053,6 +4241,313 @@ mod tests {
             ])
         );
         assert!(launch.resumed);
+    }
+
+    #[test]
+    fn codex_fork_command_pins_workdir_and_rejects_shell_commands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let stale_workdir = tmp.path().join("old-project");
+        let command = AgentCommand::Args(vec![
+            "codex".to_string(),
+            "--no-alt-screen".to_string(),
+            "--cd".to_string(),
+            stale_workdir.to_string_lossy().to_string(),
+        ]);
+
+        let fork = codex_fork_command(&command, &workdir, "source-session").unwrap();
+
+        assert_eq!(
+            fork,
+            AgentCommand::Args(vec![
+                "codex".to_string(),
+                "fork".to_string(),
+                "-C".to_string(),
+                workdir.to_string_lossy().to_string(),
+                "--no-alt-screen".to_string(),
+                "source-session".to_string(),
+            ])
+        );
+        assert!(codex_fork_command(
+            &AgentCommand::Shell("codex --no-alt-screen".to_string()),
+            &workdir,
+            "source-session",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn claude_and_opencode_fork_commands_use_native_fork_flags() {
+        let claude = claude_fork_command(
+            &AgentCommand::Args(vec![
+                "claude".to_string(),
+                "--continue".to_string(),
+                "--model".to_string(),
+                "sonnet".to_string(),
+            ]),
+            "claude-source",
+        )
+        .unwrap();
+        assert_eq!(
+            claude,
+            AgentCommand::Args(vec![
+                "claude".to_string(),
+                "--model".to_string(),
+                "sonnet".to_string(),
+                "--resume".to_string(),
+                "claude-source".to_string(),
+                "--fork-session".to_string(),
+            ])
+        );
+
+        let opencode = opencode_fork_command(
+            &AgentCommand::Args(vec![
+                "opencode".to_string(),
+                "--session=old".to_string(),
+                "--auto".to_string(),
+            ]),
+            "opencode-source",
+        )
+        .unwrap();
+        assert_eq!(
+            opencode,
+            AgentCommand::Args(vec![
+                "opencode".to_string(),
+                "--auto".to_string(),
+                "--session".to_string(),
+                "opencode-source".to_string(),
+                "--fork".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn claude_and_opencode_session_args_follow_shell_wrapped_agent_command() {
+        let claude = claude_resume_command(
+            &AgentCommand::Args(vec![
+                "pwsh.exe".to_string(),
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "claude".to_string(),
+                "--continue".to_string(),
+                "--model".to_string(),
+                "sonnet".to_string(),
+            ]),
+            Some("claude-session"),
+        );
+        assert_eq!(
+            claude,
+            AgentCommand::Args(vec![
+                "pwsh.exe".to_string(),
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "claude".to_string(),
+                "--model".to_string(),
+                "sonnet".to_string(),
+                "--resume".to_string(),
+                "claude-session".to_string(),
+            ])
+        );
+
+        let opencode = opencode_command(
+            &AgentCommand::Args(vec![
+                "cmd.exe".to_string(),
+                "/d".to_string(),
+                "/c".to_string(),
+                "opencode".to_string(),
+                "--continue".to_string(),
+                "--session=old".to_string(),
+                "--auto".to_string(),
+            ]),
+            Some("opencode-session"),
+        );
+        assert_eq!(
+            opencode,
+            AgentCommand::Args(vec![
+                "cmd.exe".to_string(),
+                "/d".to_string(),
+                "/c".to_string(),
+                "opencode".to_string(),
+                "--auto".to_string(),
+                "--session".to_string(),
+                "opencode-session".to_string(),
+            ])
+        );
+
+        assert_eq!(
+            opencode_command(
+                &AgentCommand::Shell("opencode".to_string()),
+                Some("bound-session")
+            ),
+            AgentCommand::Args(vec![
+                "opencode".to_string(),
+                "--session".to_string(),
+                "bound-session".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn claude_and_opencode_runtime_commands_force_unattended_mode_once() {
+        let claude = command_with_required_agent_flag(
+            AgentCommand::Args(vec![
+                "claude".to_string(),
+                "--resume".to_string(),
+                "session-1".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+            ]),
+            "claude-code",
+            "--dangerously-skip-permissions",
+        );
+        let opencode = command_with_required_agent_flag(
+            AgentCommand::Args(vec![
+                "opencode".to_string(),
+                "--session".to_string(),
+                "session-1".to_string(),
+            ]),
+            "opencode",
+            "--auto",
+        );
+
+        let AgentCommand::Args(claude) = claude else {
+            panic!("expected args command");
+        };
+        let AgentCommand::Args(opencode) = opencode else {
+            panic!("expected args command");
+        };
+        assert_eq!(
+            claude
+                .iter()
+                .filter(|item| item.as_str() == "--dangerously-skip-permissions")
+                .count(),
+            1
+        );
+        assert_eq!(claude[1], "--dangerously-skip-permissions");
+        assert_eq!(opencode[1], "--auto");
+    }
+
+    #[test]
+    fn claude_and_opencode_endpoint_overrides_pin_selected_model() {
+        let endpoint = endpoint(PathBuf::from("D:/project"));
+        let claude = claude_command_with_endpoint_overrides(
+            AgentCommand::Args(vec![
+                "claude".to_string(),
+                "--model".to_string(),
+                "old-model".to_string(),
+            ]),
+            &endpoint,
+        );
+        let opencode = opencode_command_with_endpoint_overrides(
+            AgentCommand::Args(vec![
+                "opencode".to_string(),
+                "-m".to_string(),
+                "old-provider/old-model".to_string(),
+            ]),
+            &endpoint,
+        );
+
+        assert_eq!(
+            claude,
+            AgentCommand::Args(vec![
+                "claude".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "--effort".to_string(),
+                "high".to_string(),
+                "--model".to_string(),
+                "gpt-test".to_string(),
+            ])
+        );
+        assert_eq!(
+            opencode,
+            AgentCommand::Args(vec![
+                "opencode".to_string(),
+                "--auto".to_string(),
+                "--model".to_string(),
+                "watchapi-runtime/gpt-test".to_string(),
+            ])
+        );
+        assert_eq!(
+            opencode_command_with_endpoint_overrides(
+                AgentCommand::Shell("opencode".to_string()),
+                &endpoint,
+            ),
+            AgentCommand::Args(vec![
+                "opencode".to_string(),
+                "--auto".to_string(),
+                "--model".to_string(),
+                "watchapi-runtime/gpt-test".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn opencode_runtime_provider_is_process_local_and_uses_selected_endpoint() {
+        let endpoint = endpoint(PathBuf::from("D:/project"));
+
+        let config: serde_json::Value = serde_json::from_str(&opencode_endpoint_config_content(
+            &endpoint,
+            "/v1/responses",
+            Some(128_000),
+        ))
+        .unwrap();
+
+        assert_eq!(config["model"], "watchapi-runtime/gpt-test");
+        assert_eq!(
+            config["provider"]["watchapi-runtime"]["options"]["baseURL"],
+            "https://api.example.test/v1"
+        );
+        assert_eq!(
+            config["provider"]["watchapi-runtime"]["options"]["apiKey"],
+            endpoint.api_key
+        );
+        assert_eq!(
+            config["provider"]["watchapi-runtime"]["models"]["gpt-test"]["name"],
+            "gpt-test"
+        );
+        assert_eq!(
+            config["provider"]["watchapi-runtime"]["npm"],
+            "@ai-sdk/openai"
+        );
+        assert_eq!(
+            config["provider"]["watchapi-runtime"]["models"]["gpt-test"]["options"]
+                ["reasoningEffort"],
+            "high"
+        );
+        assert_eq!(
+            config["provider"]["watchapi-runtime"]["models"]["gpt-test"]["options"]["serviceTier"],
+            "fast"
+        );
+        assert_eq!(
+            config["provider"]["watchapi-runtime"]["models"]["gpt-test"]["limit"]["context"],
+            128_000
+        );
+
+        let chat_config: serde_json::Value = serde_json::from_str(
+            &opencode_endpoint_config_content(&endpoint, "/v1/chat/completions", None),
+        )
+        .unwrap();
+        assert_eq!(
+            chat_config["provider"]["watchapi-runtime"]["npm"],
+            "@ai-sdk/openai-compatible"
+        );
+        assert_eq!(
+            chat_config["provider"]["watchapi-runtime"]["options"]["baseURL"],
+            "https://api.example.test/v1"
+        );
+        assert!(
+            chat_config["provider"]["watchapi-runtime"]["models"]["gpt-test"]
+                .get("options")
+                .is_none()
+        );
+        assert_eq!(
+            opencode_provider_base_url("https://api.example.test/v1/", "/v1/responses"),
+            "https://api.example.test/v1"
+        );
+        assert_eq!(
+            anthropic_base_url("https://api.example.test/v1/"),
+            "https://api.example.test"
+        );
     }
 
     #[test]
@@ -3557,7 +5052,7 @@ mod tests {
     }
 
     #[test]
-    fn request_failure_success_evidence_uses_codex_session_assistant_message_only() {
+    fn request_failure_success_evidence_uses_agent_session_assistant_messages() {
         let source = include_str!("agent.rs");
         let helper = source
             .split("pub fn has_session_assistant_message_since_prompt")
@@ -3566,8 +5061,8 @@ mod tests {
             .expect("session assistant helper should be discoverable");
 
         assert!(
-            helper.contains("has_codex_assistant_message_since_wait_start"),
-            "清请求失败计数只能用 Codex 会话文件里的 assistant 回复，不能用终端输出或非 Codex 默认 true"
+            helper.contains("has_session_assistant_message_since_wait_start"),
+            "清请求失败计数必须使用 Agent 会话里的 assistant 回复，不能使用终端活动"
         );
         assert!(
             !helper.contains("terminal_had_activity_since_prompt"),
@@ -4396,7 +5891,7 @@ mod tests {
     }
 
     #[test]
-    fn isolated_codex_home_copies_config_and_merges_sessions_back() {
+    fn isolated_codex_home_keeps_runtime_state_and_sessions_private() {
         let tmp = tempfile::tempdir().unwrap();
         let workdir = tmp.path().join("project");
         fs::create_dir_all(&workdir).unwrap();
@@ -4445,56 +5940,38 @@ mod tests {
             .home
             .join("archived_sessions/2026/05/18/archived.jsonl")
             .exists());
-        assert_eq!(
-            fs::read_to_string(isolated.home.join("state_5.sqlite")).unwrap(),
-            "sqlite"
-        );
-        assert_eq!(
-            fs::read_to_string(isolated.home.join(".codex-global-state.json")).unwrap(),
-            "{\"provider\":\"custom\"}\n"
-        );
-        fs::write(isolated.home.join("config.toml"), "changed").unwrap();
+        assert!(!isolated.home.join("state_5.sqlite").exists());
+        assert!(!isolated.home.join("state_5.sqlite-wal").exists());
+        assert!(!isolated.home.join(".codex-global-state.json").exists());
         fs::create_dir_all(isolated.home.join("sessions/2026/05/19")).unwrap();
         fs::write(isolated.home.join("sessions/2026/05/19/new.jsonl"), "new\n").unwrap();
-        fs::create_dir_all(isolated.home.join("archived_sessions/2026/05/18")).unwrap();
-        fs::write(
-            isolated
-                .home
-                .join("archived_sessions/2026/05/18/new-archived.jsonl"),
-            "new archived\n",
-        )
-        .unwrap();
         fs::write(isolated.home.join("state_5.sqlite"), "updated sqlite").unwrap();
         fs::write(
             isolated.home.join(".codex-global-state.json"),
             "{\"provider\":\"custom\",\"visible\":true}\n",
         )
         .unwrap();
-        merge_codex_sessions_back_with_baseline(
-            &isolated.home,
-            &isolated.source_home,
-            &isolated.session_baseline,
-        )
-        .unwrap();
+        let isolated_home = isolated.home.clone();
+        let endpoint = endpoint(cfg.workdir.clone());
+        let mut agent = AgentProcess::new(cfg, endpoint, false);
+        agent.isolated_codex_home = Some(isolated);
+        agent.stop();
 
         assert_eq!(
             fs::read_to_string(codex_home.join("config.toml")).unwrap(),
             "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"old\"\n"
         );
         assert!(codex_home.join("sessions/2026/05/19/old.jsonl").exists());
-        assert!(codex_home.join("sessions/2026/05/19/new.jsonl").exists());
-        assert!(codex_home
-            .join("archived_sessions/2026/05/18/new-archived.jsonl")
-            .exists());
+        assert!(!codex_home.join("sessions/2026/05/19/new.jsonl").exists());
         assert_eq!(
             fs::read_to_string(codex_home.join("state_5.sqlite")).unwrap(),
-            "updated sqlite"
+            "sqlite"
         );
         assert_eq!(
             fs::read_to_string(codex_home.join(".codex-global-state.json")).unwrap(),
-            "{\"provider\":\"custom\",\"visible\":true}\n"
+            "{\"provider\":\"custom\"}\n"
         );
-        let _ = fs::remove_dir_all(isolated.home);
+        let _ = fs::remove_dir_all(isolated_home);
     }
 
     #[test]
@@ -4544,48 +6021,87 @@ mod tests {
     }
 
     #[test]
-    fn merge_codex_sessions_back_skips_unchanged_precopied_history() {
+    fn stopping_codex_does_not_export_isolated_history() {
         let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
         let isolated_home = tmp.path().join("isolated");
         let source_home = tmp.path().join("source");
-        let historical = isolated_home.join("sessions/2026/05/17/history.jsonl");
-        let changed = isolated_home.join("sessions/2026/05/17/changed.jsonl");
-        let created = isolated_home.join("sessions/2026/05/17/new.jsonl");
-        fs::create_dir_all(historical.parent().unwrap()).unwrap();
-        fs::write(&historical, "history\n").unwrap();
-        fs::write(&changed, "before\n").unwrap();
-        let baseline = collect_codex_session_baseline(&isolated_home);
-        fs::write(&changed, "after\n").unwrap();
-        fs::write(&created, "new\n").unwrap();
+        let private_session = isolated_home.join("sessions/2026/05/17/new.jsonl");
+        fs::create_dir_all(private_session.parent().unwrap()).unwrap();
+        fs::write(&private_session, "private\n").unwrap();
+        fs::write(isolated_home.join("state_5.sqlite"), "private sqlite").unwrap();
+        fs::write(
+            isolated_home.join(".codex-global-state.json"),
+            "private state\n",
+        )
+        .unwrap();
 
-        merge_codex_sessions_back_with_baseline(&isolated_home, &source_home, &baseline).unwrap();
+        let config = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Args(vec!["codex".to_string()]),
+            tmp.path().join("state.json"),
+            source_home.clone(),
+        );
+        let endpoint = endpoint(workdir);
+        let mut agent = AgentProcess::new(config, endpoint, false);
+        agent.isolated_codex_home = Some(IsolatedCodexHome {
+            home: isolated_home,
+        });
+        agent.stop();
 
-        assert!(!source_home
-            .join("sessions/2026/05/17/history.jsonl")
-            .exists());
-        assert_eq!(
-            fs::read_to_string(source_home.join("sessions/2026/05/17/changed.jsonl")).unwrap(),
-            "after\n"
-        );
-        assert_eq!(
-            fs::read_to_string(source_home.join("sessions/2026/05/17/new.jsonl")).unwrap(),
-            "new\n"
-        );
+        assert!(!source_home.join("sessions/2026/05/17/new.jsonl").exists());
+        assert!(!source_home.join("state_5.sqlite").exists());
+        assert!(!source_home.join(".codex-global-state.json").exists());
     }
 
     #[test]
-    fn codex_session_fingerprint_uses_metadata_instead_of_full_file_reads() {
-        let source = include_str!("agent.rs");
-        let block = source
-            .split("fn session_file_fingerprint")
-            .nth(1)
-            .and_then(|tail| tail.split("fn jsonl_files_under").next())
-            .expect("session fingerprint helper should be discoverable");
+    fn isolated_codex_runtime_v2_ignores_legacy_cache_without_touching_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy_home = tmp.path().join("Runtime/codex-homes/config/codex-main");
+        let legacy_session = legacy_home.join("sessions/2026/08/13/authoritative.jsonl");
+        fs::create_dir_all(legacy_session.parent().unwrap()).unwrap();
+        fs::write(&legacy_session, "authoritative history\n").unwrap();
+        fs::write(legacy_home.join("state_5.sqlite"), "stale state\n").unwrap();
+        fs::write(
+            legacy_home.join("thread_history_1.sqlite"),
+            "stale projection\n",
+        )
+        .unwrap();
 
-        assert!(block.contains("fs::metadata(path)"));
-        assert!(
-            !block.contains("fs::read(path)"),
-            "启动/退出时会遍历所有 Codex jsonl，会话文件不能整文件读入算指纹"
+        let config_home = tmp.path().join(".codex");
+        fs::create_dir_all(&config_home).unwrap();
+        fs::write(config_home.join("config.toml"), "model = \"test\"\n").unwrap();
+        fs::write(config_home.join("auth.json"), "{}\n").unwrap();
+        let mut cfg = config(
+            tmp.path().join("project"),
+            AgentDriver::Codex,
+            AgentCommand::Args(vec!["codex".to_string()]),
+            tmp.path().join("state.json"),
+            config_home.clone(),
+        );
+        cfg.config_path = Some(tmp.path().join("config.json"));
+        cfg.agent_id = "codex-main".to_string();
+        cfg.codex_config_path = config_home.join("config.toml");
+        cfg.codex_auth_path = config_home.join("auth.json");
+
+        let runtime = stable_isolated_codex_home_path(&cfg);
+        let expected_runtime_suffix = Path::new(CODEX_ISOLATED_RUNTIME_DIR).join("codex-main");
+        assert!(runtime.ends_with(expected_runtime_suffix));
+        let isolated = prepare_isolated_codex_home(&cfg).unwrap();
+
+        assert_eq!(isolated.home, runtime);
+        assert!(isolated.home.exists());
+        assert!(!isolated.home.join("state_5.sqlite").exists());
+        assert!(!isolated.home.join("thread_history_1.sqlite").exists());
+        assert_eq!(
+            fs::read_to_string(legacy_home.join("state_5.sqlite")).unwrap(),
+            "stale state\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&legacy_session).unwrap(),
+            "authoritative history\n"
         );
     }
 
@@ -4703,6 +6219,70 @@ mod tests {
         assert!(first.to_string_lossy().contains("我的_配置-"));
         assert!(first.ends_with("frontend_agent"));
         assert!(!first.starts_with(std::env::temp_dir()));
+    }
+
+    #[test]
+    fn codex_cli_overrides_force_full_access_for_every_launch_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let codex_home = tmp.path().join(".codex");
+        fs::create_dir_all(&codex_home).unwrap();
+        let config_path = codex_home.join("config.toml");
+        fs::write(
+            &config_path,
+            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"old\"\n",
+        )
+        .unwrap();
+        let mut cfg = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Args(vec!["codex".to_string()]),
+            tmp.path().join("state.json"),
+            codex_home,
+        );
+        cfg.codex_config_path = config_path;
+        let endpoint = endpoint(workdir.clone());
+        let commands = [
+            AgentCommand::Args(vec!["codex".to_string()]),
+            AgentCommand::Args(vec![
+                "codex".to_string(),
+                "resume".to_string(),
+                "session-1".to_string(),
+            ]),
+            AgentCommand::Args(vec![
+                "codex".to_string(),
+                "fork".to_string(),
+                "session-1".to_string(),
+            ]),
+        ];
+
+        for command in commands {
+            let AgentCommand::Args(items) =
+                codex_command_with_cli_overrides(command, &endpoint, &cfg)
+            else {
+                panic!("expected Codex command to remain an args command");
+            };
+            assert_eq!(
+                items
+                    .iter()
+                    .filter(|item| *item == "--dangerously-bypass-approvals-and-sandbox")
+                    .count(),
+                1,
+                "Codex launch must contain exactly one full-access flag: {items:?}"
+            );
+            let full_access_pos = items
+                .iter()
+                .position(|item| item == "--dangerously-bypass-approvals-and-sandbox")
+                .unwrap();
+            assert!(full_access_pos > 0);
+            if let Some(subcommand_pos) = items
+                .iter()
+                .position(|item| item == "resume" || item == "fork")
+            {
+                assert!(full_access_pos < subcommand_pos);
+            }
+        }
     }
 
     #[test]
@@ -5188,6 +6768,13 @@ mod tests {
         assert!(!generic_first_option_prompt_visible(
             "Output summary:\n› 1. This is just rendered text\n  2. Also rendered text"
         ));
+        let command_approval =
+            "$ Get-Location; Get-ChildItem -Force; Get-ChildItem -LiteralPath 'D:\\Works\\SelfWorks\\SimEngine' -Force | Select-Object Name,Mode,Length\n\n\
+             1. Yes, proceed (y)\n\
+             > 2. Yes, and don't ask again for commands that start with `Get-Location; Get-ChildItem -Force; Get-ChildItem -LiteralPath 'D:\\Works\\SelfWorks\\SimEngine' -Force | Select-Object Name,Mode,Length` (p)\n\
+             3. No, and tell Codex what to do differently (esc)";
+        assert!(codex_command_approval_prompt_visible(command_approval));
+        assert!(!generic_first_option_prompt_visible(command_approval));
     }
 
     #[test]

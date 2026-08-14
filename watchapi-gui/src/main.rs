@@ -18,6 +18,7 @@ use windows_sys::Win32::Graphics::Dwm::{
 mod app;
 mod gui_support;
 mod litellm_proxy;
+mod remote_bridge;
 mod tray;
 
 #[cfg(windows)]

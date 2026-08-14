@@ -1,17 +1,17 @@
 # WatchApi Rust
 
-WatchApi Rust 是一个当前主要面向 Codex 的接口管理和自动续航工具。
+WatchApi Rust 是一个面向 Codex、Claude Code 和 OpenCode 的接口管理和自动续航工具。
 它可以统一管理多个 OpenAI 兼容接口，自动探测可用性、按权重选择线路、处理冷却/限流，并在 Agent 中断或无进展时按配置继续任务。
 
-> 兼容性说明：作者目前只使用 Codex 做过完整测试；Claude Code、OpenCode 等其它 Agent 的适配仍在完善中，暂不保证达到 Codex 同等体验。
+> 兼容性说明：Codex、Claude Code 和 OpenCode 均已接入统一的配置、接口探测、会话恢复/分叉、自动续航和无批准启动流程；各 Agent 的原生 CLI 功能仍以对应版本实际支持的参数为准。
 
 用户使用说明见 [docs/USER_MANUAL.md](docs/USER_MANUAL.md)。
 
 ## 功能概览
 
-- `watchapi-core`：配置读取、HTTP 探测、models 缓存、最便宜探测模型选择、健康状态、权重选择、污染阈值、额度识别、token/费用格式化、Codex 配置写入、session 基础恢复、终端 PTY 抽象、运行循环。
+- `watchapi-core`：配置读取、HTTP 探测、models 缓存、最便宜探测模型选择、健康状态、权重选择、污染阈值、额度识别、token/费用格式化、Codex/Claude Code/OpenCode 启动参数、会话恢复与分叉、终端 PTY 抽象、运行循环。
 - `watchapi-core` 的 Codex 启动会使用临时隔离的 `CODEX_HOME`，并通过 CLI `-c` 覆盖模型、provider、base_url、权限、审批策略和 TUI 状态栏信息，避免多个 Codex 会话互相改同一个真实 `~/.codex/config.toml` / `auth.json`；停止时会把临时 session 记录合并回真实 Codex Home。
-- `watchapi-gui`：`eframe/egui` 轻量 GUI，可选择/加载/编辑 JSON 配置、保存到 exe 同级 `Configs`、维护提示词库、配置列表/别名/克隆/移除/自启动、启动/停止/全部启动/全部停止、暂停/继续自动续航、立即触发、日志写入/搜索、显示接口组表格、显示终端输出，并把用户输入直接写入 PTY。
+- `watchapi-gui`：`eframe/egui` 轻量 GUI，可选择/加载/编辑 JSON 配置、保存到 exe 同级 `Configs`、维护提示词库、配置列表/别名/克隆/移除/自启动、启动/停止/终止 Agent 进程/全部启动/全部停止、暂停/继续自动续航、立即触发、日志写入/搜索、显示接口组表格、显示终端输出，并把用户输入直接写入 PTY。
 - `watchapi-gui` 的“聚合代理”页支持多个本地 LiteLLM 代理端口、多个上游 URL、批量 txt/csv Key、模型路由、生成 LiteLLM 配置、启动/停止代理，并在 GUI 退出时清理代理进程。
 - GUI 关闭窗口时会先询问：进入系统托盘后台运行、直接关闭、取消。托盘菜单支持“显示 WatchApi”和“退出 WatchApi”；托盘不可用时会降级为最小化到任务栏。
 - `watchapi-cli`：提供命令行 watch 模式和本地 HTTP/HTTPS upstream 中转代理；`Ctrl+C` 会先停止运行时并恢复 Codex 配置/key。

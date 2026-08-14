@@ -12,6 +12,7 @@ egui.workspace = true
 egui_extras.workspace = true
 image.workspace = true
 parking_lot.workspace = true
+rand.workspace = true
 raw-window-handle.workspace = true
 rfd.workspace = true
 reqwest.workspace = true

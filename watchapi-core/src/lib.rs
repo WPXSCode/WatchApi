@@ -19,8 +19,9 @@ pub mod terminal_emulator;
 pub mod tokens;
 
 pub use config::{
-    AgentCommand, AgentDriver, AppConfig, ContinuationTriggerRule, EndpointConfig,
-    EndpointProviderConfig, EndpointProviderLibrary, GuardDetectionMode, PROVIDER_LIBRARY_FILENAME,
+    split_shell_like_command, AgentCommand, AgentDriver, AppConfig, ContinuationTriggerRule,
+    EndpointConfig, EndpointProviderConfig, EndpointProviderLibrary, GuardDetectionMode,
+    PROVIDER_LIBRARY_FILENAME,
 };
 pub use health::{EndpointHealth, EndpointHealthTracker};
 pub use http_probe::{
@@ -36,7 +37,8 @@ pub use selector::choose_best_endpoint;
 pub use sessions::{
     binding_key_text, discover_codex_session_homes, latest_codex_session_goal,
     latest_codex_session_goal_record, recent_session_detail_summary, ClaudeSessionIndex,
-    CodexSessionGoalRecord, CodexSessionIndex, SessionBindingKey, SessionCandidate, SessionStore,
+    CodexSessionGoalRecord, CodexSessionIndex, OpenCodeSessionIndex, SessionBindingKey,
+    SessionCandidate, SessionStore,
 };
 pub use terminal::{
     InputSource, TerminalActivityWakeup, TerminalEvent, TerminalSession, TerminalSnapshot,

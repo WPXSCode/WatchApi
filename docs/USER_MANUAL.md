@@ -135,6 +135,12 @@ WatchApi 用来管理多个 OpenAI 兼容接口，并让 Codex、Claude Code、O
 
 Codex 会话启动时，WatchApi 会在隔离的 `CODEX_HOME` 中强制写入 TUI 状态栏配置，并通过启动参数再次覆盖，状态栏包含模型与推理强度、上下文窗口、剩余上下文、当前目录、Git 分支和已用上下文。
 
+Claude Code 启动时会在当前进程中注入选中接口的 `ANTHROPIC_BASE_URL`、认证信息、模型与推理强度，并默认启用免批准模式。接口本身必须提供 Anthropic Messages 兼容路径；仅支持 OpenAI Responses 的接口不能由 Claude Code 直接调用。
+
+OpenCode 启动时会通过进程级 `OPENCODE_CONFIG_CONTENT` 注入临时 provider，不修改用户全局 OpenCode 配置。探测路径为 `/v1/responses` 时使用 Responses provider，Chat Completions 路径则使用 OpenAI-compatible provider；推理强度、service tier 和已配置的上下文长度会一并传入。
+
+Claude Code 和 OpenCode 都支持按工作目录扫描、绑定、恢复及分叉会话。WatchApi 会区分工具调用和最终回复，只有最终回复完成后才允许自动续航，并把本轮 token 用量计入运行页统计。
+
 配置保存后，如果当前配置正在运行，软件只会落盘，不会自动重启当前任务。改动会在下次启动或手动重启后完整生效。
 
 ## 6. 工作区参数继承

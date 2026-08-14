@@ -150,6 +150,8 @@ pub struct RuntimeCore {
     goal_request_clear_failed_signature: Option<String>,
     trigger_now_clear_failed: bool,
     force_new_session_once: bool,
+    direct_endpoint_once: Option<String>,
+    fork_source_session_once: Option<(String, Option<PathBuf>)>,
     force_current_probe_once: bool,
     confirm_current_probe_once: bool,
     force_full_probe_once: bool,
@@ -228,6 +230,8 @@ impl RuntimeCore {
             goal_request_clear_failed_signature: None,
             trigger_now_clear_failed: false,
             force_new_session_once: false,
+            direct_endpoint_once: None,
+            fork_source_session_once: None,
             force_current_probe_once: false,
             confirm_current_probe_once: false,
             force_full_probe_once: false,
@@ -236,6 +240,30 @@ impl RuntimeCore {
 
     pub async fn tick(&mut self, probe: &HttpProbe) -> Option<EndpointConfig> {
         self.sync_control_state();
+        if let Some(endpoint_name) = self.direct_endpoint_once.take() {
+            let Some(endpoint) = self
+                .endpoint_by_name_including_disabled(&endpoint_name)
+                .cloned()
+            else {
+                self.state =
+                    RuntimeState::Error(format!("直接启动失败：未找到接口组：{endpoint_name}"));
+                self.publish_snapshot_event();
+                return None;
+            };
+            match self.switch_to(endpoint.clone()) {
+                Ok(()) => {
+                    self.maybe_drive_prompt(&endpoint);
+                    self.record_agent_usage(&endpoint);
+                    self.publish_snapshot_event();
+                    return Some(endpoint);
+                }
+                Err(err) => {
+                    self.state = RuntimeState::Error(format!("直接启动失败：{err}"));
+                    self.publish_snapshot_event();
+                    return None;
+                }
+            }
+        }
         let auto_paused = self.auto_paused();
         let mut current_failed = false;
         let mut skip_current = false;
@@ -556,6 +584,7 @@ impl RuntimeCore {
     pub fn stop(&mut self) {
         self.stop_agent();
         self.current_endpoint = None;
+        self.direct_endpoint_once = None;
         self.state = RuntimeState::Stopped;
         self.probing_endpoint = None;
         self.counted_probe_inflight.clear();
@@ -565,6 +594,7 @@ impl RuntimeCore {
     pub fn restart_agent(&mut self) {
         self.stop_agent();
         self.current_endpoint = None;
+        self.direct_endpoint_once = None;
         self.force_current_probe_once = false;
         self.confirm_current_probe_once = false;
         self.force_full_probe_once = false;
@@ -762,6 +792,8 @@ impl RuntimeCore {
 
     pub fn force_new_conversation_next_start(&mut self) {
         self.force_new_session_once = true;
+        self.direct_endpoint_once = None;
+        self.fork_source_session_once = None;
         self.stop_agent();
         self.current_endpoint = None;
         self.pending_initial_prompt = None;
@@ -777,6 +809,73 @@ impl RuntimeCore {
         self.probing_endpoint = None;
         self.counted_probe_inflight.clear();
         self.publish_snapshot_event();
+    }
+
+    pub fn force_start_endpoint_next_tick(&mut self, name: String) -> Result<(), String> {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err("直接启动失败：接口名称为空".to_string());
+        }
+        if self.endpoint_by_name_including_disabled(&name).is_none() {
+            return Err(format!("直接启动失败：未找到接口组：{name}"));
+        }
+        self.set_fixed_endpoint(Some(name.clone()));
+        self.direct_endpoint_once = Some(name);
+        self.publish_snapshot_event();
+        Ok(())
+    }
+
+    pub fn fork_session_next_start(
+        &mut self,
+        source_session_id: String,
+        source_session_path: Option<PathBuf>,
+    ) -> Result<(), String> {
+        if self.config.agent_driver == AgentDriver::Generic {
+            return Err("Generic 配置不支持分叉会话".to_string());
+        }
+        if source_session_id.trim().is_empty() {
+            return Err("无法分叉：源会话 ID 为空".to_string());
+        }
+        self.fork_source_session_once = Some((source_session_id, source_session_path));
+        self.force_new_session_once = false;
+        self.stop_agent();
+        self.current_endpoint = None;
+        self.pending_initial_prompt = None;
+        self.pending_goal_prompt = None;
+        self.last_prompt_at = None;
+        self.last_auto_prompt_signature = None;
+        self.waiting_for_assistant_progress = false;
+        self.goal_synced_this_run = false;
+        self.goal_request_clear_failed_signature = None;
+        self.trigger_now_clear_failed = false;
+        self.manual_prompt_requeue_error = None;
+        self.state = RuntimeState::Stopped;
+        self.probing_endpoint = None;
+        self.counted_probe_inflight.clear();
+        self.publish_snapshot_event();
+        Ok(())
+    }
+
+    pub fn fork_codex_session_next_start(
+        &mut self,
+        source_session_id: String,
+        source_session_path: Option<PathBuf>,
+    ) -> Result<(), String> {
+        if self.config.agent_driver != AgentDriver::Codex {
+            return Err("只有 Codex 配置支持此兼容接口".to_string());
+        }
+        self.fork_session_next_start(source_session_id, source_session_path)
+    }
+
+    pub fn active_session(&self) -> Option<(String, Option<PathBuf>)> {
+        self.agent.as_ref().and_then(AgentProcess::active_session)
+    }
+
+    pub fn active_codex_session(&self) -> Option<(String, Option<PathBuf>)> {
+        if self.config.agent_driver != AgentDriver::Codex {
+            return None;
+        }
+        self.active_session()
     }
 
     pub fn config(&self) -> &AppConfig {
@@ -1470,6 +1569,7 @@ impl RuntimeCore {
     fn switch_to(&mut self, endpoint: EndpointConfig) -> Result<(), String> {
         self.stop_agent();
         let force_new_session = std::mem::take(&mut self.force_new_session_once);
+        let fork_source = self.fork_source_session_once.clone();
         let mut launch_endpoint = endpoint.clone();
         if endpoint.guard_proxy.enabled {
             let guard = start_guard_proxy_with_stable_port(&self.config, &endpoint)?;
@@ -1478,11 +1578,20 @@ impl RuntimeCore {
                 .remove(&endpoint.name);
             self.guard_proxy = Some(guard);
         }
-        let mut agent = AgentProcess::new(
-            self.config.clone(),
-            launch_endpoint.clone(),
-            force_new_session,
-        );
+        let mut agent = if let Some((source_session_id, source_session_path)) = &fork_source {
+            AgentProcess::new_fork(
+                self.config.clone(),
+                launch_endpoint.clone(),
+                source_session_id.clone(),
+                source_session_path.clone(),
+            )
+        } else {
+            AgentProcess::new(
+                self.config.clone(),
+                launch_endpoint.clone(),
+                force_new_session,
+            )
+        };
         if let Err(err) = agent.start() {
             if let Some(mut guard) = self.guard_proxy.take() {
                 self.guard_audit_by_endpoint
@@ -1491,14 +1600,19 @@ impl RuntimeCore {
             }
             return Err(err.to_string());
         }
+        self.fork_source_session_once = None;
         let now = Instant::now();
         self.current_endpoint = Some(endpoint.name.clone());
         self.started_at_by_endpoint
             .insert(endpoint.name.clone(), now);
-        self.pending_goal_prompt = agent
-            .launch
-            .as_ref()
-            .and_then(|launch| self.goal_prompt_for_new_session(launch.resumed));
+        self.pending_goal_prompt = (!fork_source.is_some())
+            .then(|| {
+                agent
+                    .launch
+                    .as_ref()
+                    .and_then(|launch| self.goal_prompt_for_new_session(launch.resumed))
+            })
+            .flatten();
         self.pending_initial_prompt = if self.pending_goal_prompt.is_some() {
             None
         } else {
@@ -2091,6 +2205,13 @@ impl RuntimeCore {
             .endpoints
             .iter()
             .find(|endpoint| endpoint.enabled && endpoint.name == name)
+    }
+
+    fn endpoint_by_name_including_disabled(&self, name: &str) -> Option<&EndpointConfig> {
+        self.config
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.name == name)
     }
 
     fn enabled_by_weight(&self) -> Vec<EndpointConfig> {
@@ -3990,6 +4111,58 @@ mod tests {
     }
 
     #[test]
+    fn fork_codex_session_prepares_only_the_next_agent_start() {
+        let mut runtime = RuntimeCore::new(config());
+        runtime.current_endpoint = Some("high".to_string());
+        runtime.pending_initial_prompt = Some("old prompt".to_string());
+        runtime.force_new_session_once = true;
+        let session_path = PathBuf::from("Runtime/codex-homes/source/session.jsonl");
+
+        runtime
+            .fork_codex_session_next_start("source-session".to_string(), Some(session_path.clone()))
+            .unwrap();
+
+        assert_eq!(
+            runtime.fork_source_session_once,
+            Some(("source-session".to_string(), Some(session_path)))
+        );
+        assert!(!runtime.force_new_session_once);
+        assert_eq!(runtime.current_endpoint, None);
+        assert_eq!(runtime.pending_initial_prompt, None);
+        assert_eq!(runtime.state, RuntimeState::Stopped);
+
+        runtime.force_new_conversation_next_start();
+
+        assert_eq!(runtime.fork_source_session_once, None);
+        assert!(runtime.force_new_session_once);
+    }
+
+    #[test]
+    fn fork_session_accepts_claude_and_opencode_but_rejects_generic() {
+        for driver in [AgentDriver::ClaudeCode, AgentDriver::OpenCode] {
+            let mut cfg = config();
+            cfg.agent_driver = driver;
+            let mut runtime = RuntimeCore::new(cfg);
+
+            runtime
+                .fork_session_next_start("source-session".to_string(), None)
+                .unwrap();
+
+            assert_eq!(
+                runtime.fork_source_session_once,
+                Some(("source-session".to_string(), None))
+            );
+        }
+
+        let mut cfg = config();
+        cfg.agent_driver = AgentDriver::Generic;
+        let mut runtime = RuntimeCore::new(cfg);
+        assert!(runtime
+            .fork_session_next_start("source-session".to_string(), None)
+            .is_err());
+    }
+
+    #[test]
     fn fixed_endpoint_overrides_weight() {
         let mut runtime = RuntimeCore::new(config());
         runtime.set_fixed_endpoint(Some("low".to_string()));
@@ -4000,6 +4173,43 @@ mod tests {
 
         assert_eq!(selected.unwrap().name, "low");
         assert!(runtime.rows()[1].fixed);
+    }
+
+    #[test]
+    fn direct_endpoint_start_bypasses_probe_and_enabled_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let workdir = temp.path().join("workspace");
+        fs::create_dir_all(&workdir).unwrap();
+        let mut cfg = config();
+        cfg.agent_driver = crate::config::AgentDriver::Generic;
+        cfg.agent_command = long_running_test_command();
+        cfg.workdir = workdir.clone();
+        cfg.session_state_path = temp.path().join("session-state.json");
+        for endpoint in &mut cfg.endpoints {
+            endpoint.workdir = workdir.clone();
+            endpoint.base_url = "http://127.0.0.1:1/unavailable".to_string();
+        }
+        cfg.endpoints[1].enabled = false;
+        let mut runtime = RuntimeCore::new(cfg);
+        let probe = HttpProbe::new(0.1).unwrap();
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime
+            .force_start_endpoint_next_tick("low".to_string())
+            .unwrap();
+        let selected = tokio.block_on(runtime.tick(&probe));
+
+        assert_eq!(
+            selected.as_ref().map(|endpoint| endpoint.name.as_str()),
+            Some("low")
+        );
+        assert_eq!(runtime.current_endpoint.as_deref(), Some("low"));
+        assert_eq!(runtime.fixed_endpoint.as_deref(), Some("low"));
+        assert!(runtime.last_availability.is_empty());
+        runtime.stop();
     }
 
     #[test]
@@ -5861,10 +6071,17 @@ mod tests {
                 && tick_block.contains(".is_some_and(|result| result.available)"),
             "同接口跳过重启必须基于本轮探测/选择结果可用，不能复用旧状态误判"
         );
-        assert!(
-            tick_block.find("changed = false") < tick_block.find("match self.switch_to"),
-            "同接口且仍可用时应在 switch_to 前清除 changed，避免重启 agent"
-        );
+        let selection_block = tick_block
+            .split("let mut selected = selected;")
+            .nth(1)
+            .expect("接口选择分支应存在");
+        let changed_reset = selection_block
+            .find("changed = false")
+            .expect("同接口且仍可用时应在 switch_to 前清除 changed，避免重启 agent");
+        let switch = selection_block
+            .find("match self.switch_to")
+            .expect("切换接口分支应存在");
+        assert!(changed_reset < switch);
     }
 
     #[test]

@@ -6,7 +6,11 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, ExitStatus, MasterP
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
+#[cfg(windows)]
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -168,8 +172,7 @@ impl TerminalControl {
     pub fn stop_process(&self) {
         let mut guard = self.child.lock();
         if let Some(mut child) = guard.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            stop_child_process(child.as_mut());
         }
         wake_terminal_activity(&self.activity_wakeup);
     }
@@ -466,8 +469,7 @@ impl TerminalSession {
             TerminalBackend::Pty { child, .. } => {
                 let mut guard = child.lock();
                 if let Some(mut child) = guard.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    stop_child_process(child.as_mut());
                 }
             }
         }
@@ -546,6 +548,32 @@ fn wake_terminal_activity(activity_wakeup: &Arc<Mutex<Option<TerminalActivityWak
     if let Some(wakeup) = wakeup {
         wakeup();
     }
+}
+
+fn stop_child_process(child: &mut (dyn Child + Send + Sync)) {
+    #[cfg(windows)]
+    if let Some(process_id) = child.process_id() {
+        terminate_windows_process_tree(process_id);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(windows)]
+fn terminate_windows_process_tree(process_id: u32) {
+    if process_id == 0 || process_id == std::process::id() {
+        return;
+    }
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let process_id = process_id.to_string();
+    let mut command = Command::new("taskkill");
+    command
+        .args(["/PID", process_id.as_str(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW);
+    let _ = command.status();
 }
 
 impl Drop for TerminalSession {
@@ -1233,6 +1261,32 @@ mod tests {
 
         assert_eq!(control.process_id(), None);
         assert!(!session.is_running());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_terminal_stop_force_kills_the_entire_process_tree_without_a_console() {
+        let source = include_str!("terminal.rs");
+        let helper = source
+            .split("fn terminate_windows_process_tree")
+            .nth(1)
+            .and_then(|tail| tail.split("impl Drop for TerminalSession").next())
+            .expect("Windows process-tree termination helper should be discoverable");
+
+        assert!(helper.contains("Command::new(\"taskkill\")"));
+        assert!(helper.contains("[\"/PID\", process_id.as_str(), \"/T\", \"/F\"]"));
+        assert!(helper.contains("creation_flags(CREATE_NO_WINDOW)"));
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("terminal production source should be discoverable");
+        assert_eq!(
+            production
+                .matches("stop_child_process(child.as_mut());")
+                .count(),
+            2,
+            "TerminalControl and TerminalSession must share process-tree termination"
+        );
     }
 
     #[test]

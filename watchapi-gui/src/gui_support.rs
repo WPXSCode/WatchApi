@@ -40,6 +40,74 @@ pub struct GuiExternalApplication {
     pub name: String,
     #[serde(default)]
     pub path: PathBuf,
+    #[serde(default)]
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuiNotificationSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub notify_on_completion: bool,
+    #[serde(default = "default_true")]
+    pub notify_on_failure: bool,
+    #[serde(default = "default_true")]
+    pub notify_on_attention: bool,
+    #[serde(default = "default_true")]
+    pub only_when_background: bool,
+}
+
+impl Default for GuiNotificationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            notify_on_completion: true,
+            notify_on_failure: true,
+            notify_on_attention: true,
+            only_when_background: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuiAgentLaunchProfile {
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub arguments: String,
+    #[serde(default = "default_true")]
+    pub full_access: bool,
+}
+
+impl Default for GuiAgentLaunchProfile {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            arguments: String::new(),
+            full_access: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuiAgentLaunchSettings {
+    #[serde(default = "default_codex_launch_profile")]
+    pub codex: GuiAgentLaunchProfile,
+    #[serde(default = "default_claude_launch_profile")]
+    pub claude: GuiAgentLaunchProfile,
+    #[serde(default = "default_opencode_launch_profile")]
+    pub opencode: GuiAgentLaunchProfile,
+}
+
+impl Default for GuiAgentLaunchSettings {
+    fn default() -> Self {
+        Self {
+            codex: default_codex_launch_profile(),
+            claude: default_claude_launch_profile(),
+            opencode: default_opencode_launch_profile(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -54,6 +122,7 @@ pub struct GuiConfigRegistry {
     pub selected_workspace_id: Option<String>,
     pub theme: GuiTheme,
     pub external_apps: Vec<GuiExternalApplication>,
+    pub notifications: GuiNotificationSettings,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +135,7 @@ pub struct GuiWorkspace {
     pub config_paths: Vec<PathBuf>,
     pub pinned_config_paths: HashSet<String>,
     pub config_defaults: serde_json::Value,
+    pub agent_launch: GuiAgentLaunchSettings,
     pub last_used_at: u64,
 }
 
@@ -87,6 +157,8 @@ struct RegistryState {
     theme: GuiTheme,
     #[serde(default)]
     external_apps: Vec<GuiExternalApplication>,
+    #[serde(default)]
+    notifications: GuiNotificationSettings,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -105,7 +177,34 @@ struct RegistryWorkspaceState {
     #[serde(default = "default_workspace_config_defaults")]
     config_defaults: serde_json::Value,
     #[serde(default)]
+    agent_launch: GuiAgentLaunchSettings,
+    #[serde(default)]
     last_used_at: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_codex_launch_profile() -> GuiAgentLaunchProfile {
+    GuiAgentLaunchProfile {
+        command: default_codex_command_name().to_string(),
+        ..GuiAgentLaunchProfile::default()
+    }
+}
+
+fn default_claude_launch_profile() -> GuiAgentLaunchProfile {
+    GuiAgentLaunchProfile {
+        command: "claude".to_string(),
+        ..GuiAgentLaunchProfile::default()
+    }
+}
+
+fn default_opencode_launch_profile() -> GuiAgentLaunchProfile {
+    GuiAgentLaunchProfile {
+        command: "opencode".to_string(),
+        ..GuiAgentLaunchProfile::default()
+    }
 }
 
 fn default_workspace_expanded() -> bool {
@@ -191,6 +290,7 @@ impl GuiConfigRegistry {
             .collect();
         self.theme = state.theme;
         self.external_apps = normalize_external_apps(state.external_apps);
+        self.notifications = state.notifications;
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -222,6 +322,7 @@ impl GuiConfigRegistry {
             selected_workspace: self.selected_workspace_id.clone(),
             theme: self.theme,
             external_apps: self.external_apps.clone(),
+            notifications: self.notifications.clone(),
         };
         write_text_atomic(
             &self.state_path,
@@ -269,6 +370,7 @@ impl GuiConfigRegistry {
                 config_paths: Vec::new(),
                 pinned_config_paths: HashSet::new(),
                 config_defaults: default_workspace_config_defaults(),
+                agent_launch: GuiAgentLaunchSettings::default(),
                 last_used_at: now,
             });
         }
@@ -500,9 +602,11 @@ impl GuiConfigRegistry {
         &mut self,
         theme: GuiTheme,
         external_apps: Vec<GuiExternalApplication>,
+        notifications: GuiNotificationSettings,
     ) {
         self.theme = theme;
         self.external_apps = normalize_external_apps(external_apps);
+        self.notifications = notifications;
     }
 }
 
@@ -526,6 +630,7 @@ fn normalize_external_apps(apps: Vec<GuiExternalApplication>) -> Vec<GuiExternal
             }
             app.path = PathBuf::from(path_text);
             app.name = app.name.trim().to_string();
+            app.arguments = app.arguments.trim().to_string();
             if app.name.is_empty() {
                 app.name = app
                     .path
@@ -570,6 +675,7 @@ fn registry_workspace_from_state(state: RegistryWorkspaceState) -> Option<GuiWor
             .map(|path| path.to_string_lossy().to_string())
             .collect(),
         config_defaults: state.config_defaults,
+        agent_launch: state.agent_launch,
         last_used_at: state.last_used_at,
     };
     dedup_paths(&mut workspace.config_paths);
@@ -596,6 +702,7 @@ fn registry_workspace_to_state(workspace: &GuiWorkspace) -> RegistryWorkspaceSta
             .collect(),
         pinned_config_paths: pinned,
         config_defaults: workspace.config_defaults.clone(),
+        agent_launch: workspace.agent_launch.clone(),
         last_used_at: workspace.last_used_at,
     }
 }
@@ -997,6 +1104,13 @@ pub fn default_agent_home_for_driver(driver: &str, home: &Path) -> Option<String
     match driver.trim().to_ascii_lowercase().as_str() {
         "codex" => Some(home.join(".codex").to_string_lossy().to_string()),
         "claude-code" => Some(home.join(".claude").to_string_lossy().to_string()),
+        "opencode" => Some(
+            home.join(".local")
+                .join("share")
+                .join("opencode")
+                .to_string_lossy()
+                .to_string(),
+        ),
         _ => None,
     }
 }
@@ -1062,22 +1176,30 @@ mod tests {
         let state = tmp.path().join("gui.json");
         let app_path = tmp.path().join("tools").join("agent.exe");
         let mut registry = GuiConfigRegistry::new(state.clone());
+        let notifications = GuiNotificationSettings {
+            notify_on_attention: false,
+            ..GuiNotificationSettings::default()
+        };
         registry.set_system_settings(
             GuiTheme::Light,
             vec![
                 GuiExternalApplication {
                     name: "Agent".to_string(),
                     path: app_path.clone(),
+                    arguments: "--workspace {workspace}".to_string(),
                 },
                 GuiExternalApplication {
                     name: "重复路径".to_string(),
                     path: app_path.clone(),
+                    arguments: String::new(),
                 },
                 GuiExternalApplication {
                     name: String::new(),
                     path: tmp.path().join("tools").join("helper.exe"),
+                    arguments: String::new(),
                 },
             ],
+            notifications,
         );
         registry.save().unwrap();
 
@@ -1088,7 +1210,10 @@ mod tests {
         assert_eq!(loaded.external_apps.len(), 2);
         assert_eq!(loaded.external_apps[0].name, "Agent");
         assert_eq!(loaded.external_apps[0].path, app_path);
+        assert_eq!(loaded.external_apps[0].arguments, "--workspace {workspace}");
         assert_eq!(loaded.external_apps[1].name, "helper");
+        assert!(loaded.notifications.enabled);
+        assert!(!loaded.notifications.notify_on_attention);
     }
 
     #[test]
@@ -1097,15 +1222,18 @@ mod tests {
         let state = tmp.path().join("gui.json");
         let mut registry = GuiConfigRegistry::new(state.clone());
         let workspace_id = registry.open_workspace(tmp.path().join("Workspace"));
-        registry
+        let workspace = registry
             .workspaces
             .iter_mut()
             .find(|workspace| workspace.id == workspace_id)
-            .unwrap()
-            .config_defaults = json!({
+            .unwrap();
+        workspace.config_defaults = json!({
             "probe_interval_seconds": 40,
             "auto_prompt": "继续"
         });
+        workspace.agent_launch.codex.command = "custom-codex.cmd".to_string();
+        workspace.agent_launch.codex.arguments = "--model gpt-custom".to_string();
+        workspace.agent_launch.opencode.full_access = false;
         registry.save().unwrap();
 
         let mut loaded = GuiConfigRegistry::new(state);
@@ -1121,6 +1249,21 @@ mod tests {
             json!(40)
         );
         assert_eq!(workspace.config_defaults["auto_prompt"], json!("继续"));
+        assert_eq!(workspace.agent_launch.codex.command, "custom-codex.cmd");
+        assert_eq!(workspace.agent_launch.codex.arguments, "--model gpt-custom");
+        assert!(!workspace.agent_launch.opencode.full_access);
+    }
+
+    #[test]
+    fn missing_agent_launch_settings_default_to_no_approval_mode() {
+        let settings: GuiAgentLaunchSettings = serde_json::from_value(json!({})).unwrap();
+
+        assert!(settings.codex.full_access);
+        assert!(settings.claude.full_access);
+        assert!(settings.opencode.full_access);
+        assert_eq!(settings.codex.command, default_codex_command_name());
+        assert_eq!(settings.claude.command, "claude");
+        assert_eq!(settings.opencode.command, "opencode");
     }
 
     #[test]

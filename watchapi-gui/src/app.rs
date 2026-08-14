@@ -3,8 +3,8 @@
 use crate::gui_support::{
     add_config_initial_dir, append_session_log, close_action_prompt_text,
     default_agent_command_for_driver, default_agent_home_for_driver, format_pause_state_label,
-    normalize_config_path, tray_status_label, GuiConfigRegistry, GuiExternalApplication, GuiTheme,
-    GuiWorkspace,
+    normalize_config_path, tray_status_label, GuiAgentLaunchProfile, GuiAgentLaunchSettings,
+    GuiConfigRegistry, GuiExternalApplication, GuiNotificationSettings, GuiTheme, GuiWorkspace,
 };
 use crate::litellm_proxy::SmartProxyKeyRow;
 use crate::litellm_proxy::{
@@ -12,6 +12,9 @@ use crate::litellm_proxy::{
     prune_missing_route_upstreams, rename_upstream_references, write_litellm_config,
     KeyBatchConfig, KeyBatchFormat, ProxyConfig, ProxyEngine, ProxyRegistry, ProxySummary,
     RouteConfig, SmartProxyServer, UpstreamConfig,
+};
+use crate::remote_bridge::{
+    workspace_id_for_identity, RemoteBridge, RemoteWorkspaceAction, WorkspaceCandidate,
 };
 use crate::tray::{install_event_wakeup, TrayAction, WatchApiTray};
 use chrono::Local;
@@ -36,7 +39,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use url::Url;
 use watchapi_core::aggregate_egress::AggregateFingerprint;
 use watchapi_core::control::{read_control_state, update_control_state};
@@ -46,9 +49,10 @@ use watchapi_core::terminal_emulator::{
 };
 use watchapi_core::{
     discover_codex_session_homes, latest_codex_session_goal_record, recent_session_detail_summary,
-    AppConfig, ClaudeSessionIndex, CodexSessionGoalRecord, CodexSessionIndex, EndpointConfig,
-    EndpointRow, HttpProbe, ProbeResult, RuntimeCore, RuntimeEvent, RuntimeEventWakeup,
-    SessionBindingKey, SessionCandidate, SessionStore,
+    split_shell_like_command, AgentCommand, AppConfig, ClaudeSessionIndex, CodexSessionGoalRecord,
+    CodexSessionIndex, EndpointConfig, EndpointRow, HttpProbe, OpenCodeSessionIndex, ProbeResult,
+    RuntimeCore, RuntimeEvent, RuntimeEventWakeup, SessionBindingKey, SessionCandidate,
+    SessionStore,
 };
 
 pub struct WatchApiApp {
@@ -85,6 +89,7 @@ pub struct WatchApiApp {
     workspace_editor_open: bool,
     workspace_editor_id: Option<String>,
     workspace_editor_json: Value,
+    workspace_editor_agent_launch: GuiAgentLaunchSettings,
     provider_json: Value,
     add_endpoint_dialog_open: bool,
     add_endpoint_dialog_page: usize,
@@ -104,8 +109,12 @@ pub struct WatchApiApp {
     system_settings_external_apps: Vec<GuiExternalApplication>,
     system_settings_new_name: String,
     system_settings_new_path: String,
+    system_settings_new_arguments: String,
+    system_settings_notifications: GuiNotificationSettings,
     system_settings_status: String,
     sessions: HashMap<String, GuiRuntimeSession>,
+    config_driver_cache: HashMap<String, ConfigDriverCacheEntry>,
+    agent_driver_icons: Option<AgentDriverIconTextures>,
     close_dialog_open: bool,
     allow_exit: bool,
     hidden_to_tray: bool,
@@ -113,11 +122,21 @@ pub struct WatchApiApp {
     last_error_count: usize,
     shutdown_done: bool,
     sent_notifications: HashSet<String>,
+    notification_states: HashMap<String, SessionNotificationState>,
     rename_dialog_open: bool,
     rename_input: String,
     auto_restart_attempts: HashMap<String, u32>,
     auto_restart_due: HashMap<String, Instant>,
     main_page: MainPage,
+    tool_page: ToolPage,
+    codex_repair_home: String,
+    codex_repair_rx: Option<Receiver<Result<String, String>>>,
+    codex_repair_loading: bool,
+    codex_repair_status: String,
+    codex_repair_output: String,
+    agent_tool_states: HashMap<AgentToolKind, AgentToolState>,
+    agent_tool_rx: Option<Receiver<AgentToolTaskResult>>,
+    agent_tool_active: Option<(AgentToolKind, AgentToolOperation)>,
     proxy_registry: ProxyRegistry,
     selected_proxy: usize,
     selected_upstream: usize,
@@ -160,11 +179,19 @@ pub struct WatchApiApp {
     control_state_cache: Mutex<HashMap<String, CachedControlState>>,
     control_state_cache_enabled: AtomicBool,
     applied_native_theme: Option<GuiTheme>,
+    remote_bridge: Option<RemoteBridge>,
+    last_remote_bridge_sync_at: Instant,
 }
 
 #[derive(Debug, Clone)]
 struct CachedControlState {
     value: Value,
+}
+
+#[derive(Debug, Clone)]
+struct ConfigDriverCacheEntry {
+    modified_at: Option<SystemTime>,
+    driver: watchapi_core::AgentDriver,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -224,6 +251,7 @@ enum DeleteConfirmTarget {
 #[derive(Debug, Clone)]
 struct SessionCandidateScanContext {
     driver: watchapi_core::AgentDriver,
+    agent_command: Vec<String>,
     codex_home: PathBuf,
     additional_codex_homes: Vec<PathBuf>,
     agent_home: Option<PathBuf>,
@@ -373,6 +401,76 @@ enum MainPage {
     Watch,
     Proxy,
     Provider,
+    Tools,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolPage {
+    CodexRepair,
+    AgentUpdates,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AgentToolKind {
+    Codex,
+    Claude,
+    OpenCode,
+}
+
+const AGENT_TOOL_KINDS: [AgentToolKind; 3] = [
+    AgentToolKind::Codex,
+    AgentToolKind::Claude,
+    AgentToolKind::OpenCode,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentToolOperation {
+    CheckVersion,
+    Update,
+}
+
+#[derive(Debug, Clone)]
+struct AgentToolState {
+    version: String,
+    status: String,
+    output: String,
+}
+
+impl Default for AgentToolState {
+    fn default() -> Self {
+        Self {
+            version: "未检测".to_string(),
+            status: String::new(),
+            output: String::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AgentToolTaskResult {
+    kind: AgentToolKind,
+    operation: AgentToolOperation,
+    result: Result<AgentToolCommandResult, String>,
+}
+
+#[derive(Debug)]
+struct AgentToolCommandResult {
+    version: String,
+    output: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionNotificationKind {
+    Normal,
+    Completed,
+    Failed,
+    NeedsAttention,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionNotificationState {
+    kind: SessionNotificationKind,
+    status: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,6 +519,7 @@ enum RuntimeCommand {
     SetEndpointGuardProxyEnabled { name: String, enabled: bool },
     SetForceProbeEndpoint(Option<String>),
     SetFixedEndpoint(Option<String>),
+    ForceStartEndpoint(String),
     WriteTerminalInput(String),
     ResizeTerminal { rows: u16, cols: u16 },
     ScrollTerminal(i32),
@@ -508,6 +607,15 @@ fn handle_runtime_worker_command(
         RuntimeCommand::SetFixedEndpoint(name) => {
             Arc::as_ref(runtime).lock().set_fixed_endpoint(name);
             RuntimeWorkerCommandAction::Continue
+        }
+        RuntimeCommand::ForceStartEndpoint(name) => {
+            let mut guard = Arc::as_ref(runtime).lock();
+            if let Err(err) = guard.force_start_endpoint_next_tick(name) {
+                guard.mark_control_command_failed(err);
+                RuntimeWorkerCommandAction::Continue
+            } else {
+                RuntimeWorkerCommandAction::TickNow
+            }
         }
         RuntimeCommand::WriteTerminalInput(text) => {
             let mut guard = Arc::as_ref(runtime).lock();
@@ -882,6 +990,9 @@ const INNER_SCROLLBAR_GUTTER: f32 = 8.0;
 const RUN_PAGE_RIGHT_GUTTER: f32 = 7.0;
 const TERMINAL_SCROLLBAR_WIDTH: f32 = 10.0;
 const TERMINAL_SCROLLBAR_RIGHT_INSET: f32 = 3.0;
+const TERMINAL_OVERLAY_CONTROL_GAP: f32 = 4.0;
+const TERMINAL_OVERLAY_CONTROL_RIGHT_GAP: f32 = 8.0;
+const TERMINAL_OVERLAY_CONTROL_BOTTOM_INSET: f32 = 8.0;
 const TOP_BAR_HEIGHT: f32 = 48.0;
 const TOP_BAR_CONTENT_HEIGHT: f32 = 36.0;
 const TOP_NAV_BUTTON_W: f32 = 78.0;
@@ -906,6 +1017,8 @@ const CONFIG_TREE_BRANCH_END_X: f32 = 16.0;
 const CONFIG_TREE_WORKSPACE_TOGGLE_X: f32 = 8.0;
 const CONFIG_TREE_WORKSPACE_LABEL_X: f32 = 20.0;
 const CONFIG_TREE_LABEL_X: f32 = 34.0;
+const CONFIG_TREE_AGENT_ICON_SIZE: f32 = 14.0;
+const CONFIG_TREE_AGENT_ICON_GAP: f32 = 4.0;
 const CONFIG_STATUS_BADGE_W: f32 = 58.0;
 const CONFIG_STATUS_BADGE_H: f32 = 18.0;
 const CONFIG_STATUS_BADGE_PADDING_X: f32 = 6.0;
@@ -1086,6 +1199,7 @@ impl WatchApiApp {
         registry.load();
         let system_settings_theme = registry.theme;
         let system_settings_external_apps = registry.external_apps.clone();
+        let system_settings_notifications = registry.notifications.clone();
         let initial_config_path = config_path
             .or_else(|| {
                 registry
@@ -1128,6 +1242,7 @@ impl WatchApiApp {
             workspace_editor_open: false,
             workspace_editor_id: None,
             workspace_editor_json: workspace_default_config_data(),
+            workspace_editor_agent_launch: GuiAgentLaunchSettings::default(),
             provider_json: load_global_provider_json(),
             add_endpoint_dialog_open: false,
             add_endpoint_dialog_page: 0,
@@ -1147,8 +1262,12 @@ impl WatchApiApp {
             system_settings_external_apps,
             system_settings_new_name: String::new(),
             system_settings_new_path: String::new(),
+            system_settings_new_arguments: String::new(),
+            system_settings_notifications,
             system_settings_status: String::new(),
             sessions: HashMap::new(),
+            config_driver_cache: HashMap::new(),
+            agent_driver_icons: None,
             close_dialog_open: false,
             allow_exit: false,
             hidden_to_tray: false,
@@ -1156,11 +1275,24 @@ impl WatchApiApp {
             last_error_count: 0,
             shutdown_done: false,
             sent_notifications: HashSet::new(),
+            notification_states: HashMap::new(),
             rename_dialog_open: false,
             rename_input: String::new(),
             auto_restart_attempts: HashMap::new(),
             auto_restart_due: HashMap::new(),
             main_page: MainPage::Watch,
+            tool_page: ToolPage::CodexRepair,
+            codex_repair_home: home_dir().join(".codex").to_string_lossy().into_owned(),
+            codex_repair_rx: None,
+            codex_repair_loading: false,
+            codex_repair_status: "未执行".to_string(),
+            codex_repair_output: String::new(),
+            agent_tool_states: AGENT_TOOL_KINDS
+                .into_iter()
+                .map(|kind| (kind, AgentToolState::default()))
+                .collect(),
+            agent_tool_rx: None,
+            agent_tool_active: None,
             proxy_registry: ProxyRegistry::load(&proxy_registry_path()),
             selected_proxy: 0,
             selected_upstream: 0,
@@ -1203,6 +1335,8 @@ impl WatchApiApp {
             control_state_cache: Mutex::new(HashMap::new()),
             control_state_cache_enabled: AtomicBool::new(false),
             applied_native_theme: None,
+            remote_bridge: RemoteBridge::start(&app_root()).ok(),
+            last_remote_bridge_sync_at: Instant::now() - Duration::from_secs(1),
         };
         if !app.config_path.is_empty() {
             app.load_config();
@@ -1230,13 +1364,20 @@ impl eframe::App for WatchApiApp {
         self.handle_window_lifecycle(ctx);
         self.poll_session_candidate_result();
         self.poll_connection_test_result();
+        self.poll_codex_repair_result();
+        self.poll_agent_tool_result();
         self.flush_terminal_log_buffer_if_due();
         self.ensure_runtime_event_wakeup(ctx);
         set_gui_theme(self.registry.theme);
         self.apply_native_theme_if_changed();
         configure_visuals(ctx);
+        if self.agent_driver_icons.is_none() {
+            self.agent_driver_icons = Some(AgentDriverIconTextures::load(ctx));
+        }
         paint_app_background(ctx);
         self.refresh_runtime_snapshot();
+        self.process_system_notifications(ctx);
+        self.sync_remote_bridge();
         self.ensure_terminal_repaint_ticker(ctx);
 
         let root_available_width = ctx.available_rect().width();
@@ -1275,6 +1416,7 @@ impl eframe::App for WatchApiApp {
                     MainPage::Watch => self.render_run_page(ui),
                     MainPage::Proxy => self.render_proxy_page(ui),
                     MainPage::Provider => self.render_provider_page(ui),
+                    MainPage::Tools => self.render_tools_page(ui),
                 };
             });
         self.render_config_editor_window(ctx);
@@ -1416,8 +1558,10 @@ impl WatchApiApp {
     fn open_system_settings(&mut self) {
         self.system_settings_theme = self.registry.theme;
         self.system_settings_external_apps = self.registry.external_apps.clone();
+        self.system_settings_notifications = self.registry.notifications.clone();
         self.system_settings_new_name.clear();
         self.system_settings_new_path.clear();
+        self.system_settings_new_arguments.clear();
         self.system_settings_status.clear();
         self.system_settings_open = true;
     }
@@ -1427,6 +1571,7 @@ impl WatchApiApp {
             MainPage::Proxy => 0,
             MainPage::Provider => 1,
             MainPage::Watch => 2,
+            MainPage::Tools => 3,
         };
         if let Some(clicked) = render_top_nav_segmented(
             ui,
@@ -1444,6 +1589,10 @@ impl WatchApiApp {
                     label: "工作台",
                     page: MainPage::Watch,
                 },
+                TopNavSegment {
+                    label: "工具",
+                    page: MainPage::Tools,
+                },
             ],
             selected,
         ) {
@@ -1452,6 +1601,7 @@ impl WatchApiApp {
                 MainPage::Proxy => self.main_page = MainPage::Proxy,
                 MainPage::Provider => self.open_provider_page_from_current(),
                 MainPage::Watch => self.main_page = MainPage::Watch,
+                MainPage::Tools => self.main_page = MainPage::Tools,
             }
             self.handle_main_page_changed(previous_page);
         }
@@ -1597,6 +1747,247 @@ impl WatchApiApp {
             ui.set_max_width(ui.available_width());
             self.render_endpoint_editor(ui);
         });
+    }
+
+    fn render_tools_page(&mut self, ui: &mut egui::Ui) {
+        let content_width = (ui.available_width() - RUN_PAGE_RIGHT_GUTTER).max(320.0);
+        let content_height = ui.available_height().max(0.0);
+        ui.set_width(content_width);
+        ui.set_max_width(content_width);
+        panel_frame().show(ui, |ui| {
+            ui.set_min_height(content_height);
+            ui.set_width(content_width);
+            ui.set_max_width(content_width);
+            let spacing = ui.spacing().item_spacing.x.max(10.0);
+            let left_width = (content_width * 0.24).clamp(170.0, 230.0);
+            let right_width = (content_width - left_width - spacing).max(120.0);
+            let body_height = ui.available_height().max(320.0);
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    vec2(left_width, body_height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_width(left_width);
+                        ui.label(RichText::new("工具").strong().color(accent()));
+                        ui.add_space(6.0);
+                        let selected = self.tool_page == ToolPage::CodexRepair;
+                        if ui.selectable_label(selected, "修复 Codex 状态").clicked() {
+                            self.tool_page = ToolPage::CodexRepair;
+                        }
+                        let selected = self.tool_page == ToolPage::AgentUpdates;
+                        if ui.selectable_label(selected, "Agent 更新").clicked() {
+                            self.tool_page = ToolPage::AgentUpdates;
+                        }
+                    },
+                );
+                ui.separator();
+                ui.allocate_ui_with_layout(
+                    vec2(right_width, body_height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| match self.tool_page {
+                        ToolPage::CodexRepair => self.render_codex_repair_tool(ui),
+                        ToolPage::AgentUpdates => self.render_agent_updates_tool(ui),
+                    },
+                );
+            });
+        });
+    }
+
+    fn render_codex_repair_tool(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            RichText::new("修复 Codex 状态数据库")
+                .strong()
+                .color(accent()),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("将关闭残留 Codex 进程，先备份 state_5.sqlite，再修复 backfill_state。")
+                .small()
+                .color(muted()),
+        );
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [110.0, 28.0],
+                egui::Label::new(RichText::new("Codex 目录").strong()),
+            );
+            let browse_width = 34.0;
+            let edit_width =
+                (ui.available_width() - browse_width - ui.spacing().item_spacing.x).max(100.0);
+            ui.add_sized(
+                [edit_width, 28.0],
+                egui::TextEdit::singleline(&mut self.codex_repair_home)
+                    .hint_text("例如 C:\\Users\\用户名\\.codex"),
+            );
+            if circular_tool_button(ui, "选择 Codex 目录", ToolButtonIcon::Folder, true).clicked()
+            {
+                let start = resolve_codex_home_path(&self.codex_repair_home);
+                let mut dialog = rfd::FileDialog::new();
+                if start.exists() {
+                    dialog = dialog.set_directory(start);
+                } else if let Some(parent) = start.parent().filter(|parent| parent.exists()) {
+                    dialog = dialog.set_directory(parent);
+                }
+                if let Some(path) = dialog.pick_folder() {
+                    self.codex_repair_home = path.to_string_lossy().into_owned();
+                }
+            }
+        });
+        ui.add_space(8.0);
+        let resolved_home = resolve_codex_home_path(&self.codex_repair_home);
+        let db_path = resolved_home.join("state_5.sqlite");
+        ui.label(
+            RichText::new(format!("数据库：{}", db_path.display()))
+                .small()
+                .color(muted()),
+        );
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            let enabled = !self.codex_repair_loading;
+            if circular_tool_button(ui, "开始修复", ToolButtonIcon::Apply, enabled).clicked() {
+                self.start_codex_repair();
+            }
+            if self.codex_repair_loading {
+                ui.add(egui::Spinner::new());
+                ui.label(RichText::new("正在修复").color(muted()));
+            }
+            let status_color = if self.codex_repair_status.contains("失败") {
+                md_error()
+            } else if self.codex_repair_status.contains("完成") {
+                md_success()
+            } else {
+                muted()
+            };
+            ui.label(
+                RichText::new(&self.codex_repair_status)
+                    .small()
+                    .color(status_color),
+            );
+        });
+        if !self.codex_repair_output.is_empty() {
+            ui.add_space(12.0);
+            ui.label(RichText::new("执行结果").strong());
+            let mut output = self.codex_repair_output.clone();
+            ui.add_sized(
+                [ui.available_width(), 190.0],
+                egui::TextEdit::multiline(&mut output)
+                    .font(egui::TextStyle::Monospace)
+                    .interactive(false),
+            );
+        }
+    }
+
+    fn render_agent_updates_tool(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Agent 检测与更新").strong().color(accent()));
+        ui.add_space(10.0);
+        let busy = self.agent_tool_active.is_some();
+        let mut requested_action = None;
+        egui::ScrollArea::vertical()
+            .id_salt("agent_updates_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let width = (ui.available_width() - INNER_SCROLLBAR_GUTTER).max(260.0);
+                ui.set_width(width);
+                ui.set_max_width(width);
+                for kind in AGENT_TOOL_KINDS {
+                    let state = self
+                        .agent_tool_states
+                        .get(&kind)
+                        .cloned()
+                        .unwrap_or_default();
+                    let active_operation = self
+                        .agent_tool_active
+                        .filter(|(active_kind, _)| *active_kind == kind)
+                        .map(|(_, operation)| operation);
+                    Frame::default()
+                        .fill(md_surface_dim())
+                        .stroke(Stroke::new(0.7, md_outline_faint()))
+                        .corner_radius(egui::CornerRadius::same(4))
+                        .inner_margin(Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            ui.set_width((width - 20.0).max(220.0));
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [96.0, 28.0],
+                                    egui::Label::new(
+                                        RichText::new(kind.label()).strong().color(accent()),
+                                    ),
+                                );
+                                ui.label(
+                                    RichText::new(state.version.as_str())
+                                        .monospace()
+                                        .color(md_text()),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if circular_tool_button(
+                                            ui,
+                                            &format!("更新 {}", kind.label()),
+                                            ToolButtonIcon::Apply,
+                                            !busy,
+                                        )
+                                        .clicked()
+                                        {
+                                            requested_action =
+                                                Some((kind, AgentToolOperation::Update));
+                                        }
+                                        if circular_tool_button(
+                                            ui,
+                                            &format!("检测 {} 版本", kind.label()),
+                                            ToolButtonIcon::Refresh,
+                                            !busy,
+                                        )
+                                        .clicked()
+                                        {
+                                            requested_action =
+                                                Some((kind, AgentToolOperation::CheckVersion));
+                                        }
+                                        if active_operation.is_some() {
+                                            ui.add(egui::Spinner::new());
+                                        }
+                                    },
+                                );
+                            });
+                            ui.label(
+                                RichText::new(format!(
+                                    "更新命令：{}",
+                                    format_command_for_display(&kind.update_command())
+                                ))
+                                .small()
+                                .monospace()
+                                .color(muted()),
+                            );
+                            if !state.status.is_empty() {
+                                let color = if state.status.contains("失败") {
+                                    md_error()
+                                } else if state.status.contains("完成")
+                                    || state.status.contains("已检测")
+                                {
+                                    md_success()
+                                } else {
+                                    muted()
+                                };
+                                ui.label(RichText::new(&state.status).small().color(color));
+                            }
+                            if !state.output.is_empty() {
+                                ui.collapsing("执行输出", |ui| {
+                                    let mut output = state.output.clone();
+                                    ui.add_sized(
+                                        [ui.available_width(), 120.0],
+                                        egui::TextEdit::multiline(&mut output)
+                                            .font(egui::TextStyle::Monospace)
+                                            .interactive(false),
+                                    );
+                                });
+                            }
+                        });
+                    ui.add_space(8.0);
+                }
+            });
+        if let Some((kind, operation)) = requested_action {
+            self.start_agent_tool_task(kind, operation);
+        }
     }
 
     fn render_proxy_list(&mut self, ui: &mut egui::Ui) {
@@ -2546,6 +2937,145 @@ impl WatchApiApp {
         self.last_error_count = error_count;
     }
 
+    fn process_system_notifications(&mut self, ctx: &egui::Context) {
+        let settings = self.registry.notifications.clone();
+        let app_is_background = self.hidden_to_tray || ctx.input(|input| !input.focused);
+        let paths = self.registry.paths.clone();
+        let mut snapshots = Vec::with_capacity(paths.len());
+        for path in paths {
+            let key = session_key_for_path(&path);
+            let (running, terminal_running, raw_status) = self.raw_session_state_for_path(&path);
+            let display_status = self.session_status_for_path(&path);
+            let kind = classify_session_notification(
+                running,
+                terminal_running,
+                &raw_status,
+                &display_status,
+            );
+            snapshots.push((
+                key,
+                self.registry.display_name(path),
+                raw_status,
+                display_status,
+                kind,
+            ));
+        }
+
+        let active_keys = snapshots
+            .iter()
+            .map(|(key, ..)| key.clone())
+            .collect::<HashSet<_>>();
+        self.notification_states
+            .retain(|key, _| active_keys.contains(key));
+
+        for (key, name, raw_status, display_status, kind) in snapshots {
+            let previous_kind = self.notification_states.get(&key).map(|state| state.kind);
+            self.notification_states.insert(
+                key,
+                SessionNotificationState {
+                    kind,
+                    status: raw_status.clone(),
+                },
+            );
+            if previous_kind.is_none() || previous_kind == Some(kind) {
+                continue;
+            }
+            let enabled_for_kind = match kind {
+                SessionNotificationKind::Normal => false,
+                SessionNotificationKind::Completed => settings.notify_on_completion,
+                SessionNotificationKind::Failed => settings.notify_on_failure,
+                SessionNotificationKind::NeedsAttention => settings.notify_on_attention,
+            };
+            if !settings.enabled
+                || !enabled_for_kind
+                || (settings.only_when_background && !app_is_background)
+            {
+                continue;
+            }
+            let title = match kind {
+                SessionNotificationKind::Completed => "WatchApi · 任务完成",
+                SessionNotificationKind::Failed => "WatchApi · 运行失败",
+                SessionNotificationKind::NeedsAttention => "WatchApi · 需要处理",
+                SessionNotificationKind::Normal => continue,
+            };
+            let detail = if raw_status.trim().is_empty() {
+                display_status
+            } else {
+                raw_status
+            };
+            let body = format!("{name}：{detail}");
+            let _ = send_system_notification(title, &body);
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                egui::UserAttentionType::Informational,
+            ));
+        }
+    }
+
+    fn raw_session_state_for_path(&self, path: &Path) -> (bool, bool, String) {
+        let key = session_key_for_path(path);
+        if self
+            .config_path_path()
+            .as_deref()
+            .map(session_key_for_path)
+            .as_deref()
+            == Some(key.as_str())
+        {
+            return (self.running, self.terminal_running, self.status.clone());
+        }
+        self.sessions
+            .get(&key)
+            .map(|session| {
+                (
+                    session.running,
+                    session.terminal_running,
+                    session.status.clone(),
+                )
+            })
+            .unwrap_or((false, false, "已停止".to_string()))
+    }
+
+    fn agent_driver_for_config_path(&mut self, path: &Path) -> watchapi_core::AgentDriver {
+        let key = session_key_for_path(path);
+        if self
+            .config_path_path()
+            .as_deref()
+            .map(session_key_for_path)
+            .as_deref()
+            == Some(key.as_str())
+        {
+            if let Some(config) = self.config.as_ref() {
+                return config.agent_driver.clone();
+            }
+        }
+        if let Some(driver) = self
+            .sessions
+            .get(&key)
+            .and_then(|session| session.config.as_ref())
+            .map(|config| config.agent_driver.clone())
+        {
+            return driver;
+        }
+
+        let modified_at = std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        if let Some(cached) = self.config_driver_cache.get(&key) {
+            if cached.modified_at == modified_at {
+                return cached.driver.clone();
+            }
+        }
+
+        let driver = load_agent_driver_for_path(path);
+        self.config_driver_cache.insert(
+            key,
+            ConfigDriverCacheEntry {
+                modified_at,
+                driver: driver.clone(),
+            },
+        );
+        driver
+    }
+
     fn render_config_list(&mut self, ui: &mut egui::Ui) {
         let workspaces = self.registry.sorted_workspaces();
         ui.horizontal(|ui| {
@@ -2687,6 +3217,24 @@ impl WatchApiApp {
                 self.open_path_in_system(&workspace.path.clone());
                 ui.close_menu();
             }
+            if ui.button("在此处打开终端").clicked() {
+                self.open_terminal_in_directory(&workspace.path);
+                ui.close_menu();
+            }
+            ui.menu_button("Agent", |ui| {
+                if ui.button("Codex").clicked() {
+                    self.open_agent_in_directory(&workspace.path, "codex");
+                    ui.close_menu();
+                }
+                if ui.button("OpenCode").clicked() {
+                    self.open_agent_in_directory(&workspace.path, "opencode");
+                    ui.close_menu();
+                }
+                if ui.button("Claude").clicked() {
+                    self.open_agent_in_directory(&workspace.path, "claude-code");
+                    ui.close_menu();
+                }
+            });
             if ui.button("编辑工作区参数").clicked() {
                 self.open_workspace_defaults_editor(workspace.id.clone());
                 ui.close_menu();
@@ -2729,6 +3277,11 @@ impl WatchApiApp {
         let status_is_error = config_status_label_is_error(&status);
         let terminal_running = self.session_terminal_running(path);
         let name = self.registry.display_name(path.to_path_buf());
+        let driver = self.agent_driver_for_config_path(path);
+        let icon_texture = self
+            .agent_driver_icons
+            .as_ref()
+            .and_then(|icons| icons.texture_id(&driver, self.registry.theme));
         let key = normalize_config_path(path.to_path_buf())
             .to_string_lossy()
             .to_string();
@@ -2756,7 +3309,18 @@ impl WatchApiApp {
                 let painter = ui.painter().with_clip_rect(content_rect);
                 paint_config_tree_connector(ui, content_rect, is_last_config);
                 let label_x = content_rect.left() + CONFIG_TREE_LABEL_X;
-                let badge_left = (content_rect.right() - status_width - 4.0).max(label_x + 48.0);
+                let icon_rect = Rect::from_center_size(
+                    pos2(
+                        label_x + CONFIG_TREE_AGENT_ICON_SIZE * 0.5,
+                        content_rect.center().y,
+                    ),
+                    vec2(CONFIG_TREE_AGENT_ICON_SIZE, CONFIG_TREE_AGENT_ICON_SIZE),
+                );
+                if let Some(texture_id) = icon_texture {
+                    paint_agent_driver_icon_image(&painter, icon_rect, texture_id);
+                }
+                let name_x = label_x + CONFIG_TREE_AGENT_ICON_SIZE + CONFIG_TREE_AGENT_ICON_GAP;
+                let badge_left = (content_rect.right() - status_width - 4.0).max(name_x + 48.0);
                 let text_y =
                     content_rect.center().y - ui.text_style_height(&egui::TextStyle::Body) * 0.5;
                 let pin = if pinned { "★ " } else { "" };
@@ -2765,11 +3329,11 @@ impl WatchApiApp {
                 let name_galley =
                     ui.fonts(|fonts| fonts.layout_no_wrap(name_text, font_id.clone(), md_text()));
                 let name_clip = Rect::from_min_max(
-                    pos2(label_x, content_rect.top()),
-                    pos2((badge_left - 6.0).max(label_x), content_rect.bottom()),
+                    pos2(name_x, content_rect.top()),
+                    pos2((badge_left - 6.0).max(name_x), content_rect.bottom()),
                 );
                 painter.with_clip_rect(name_clip).galley(
-                    pos2(label_x, text_y),
+                    pos2(name_x, text_y),
                     name_galley,
                     md_text(),
                 );
@@ -2783,7 +3347,11 @@ impl WatchApiApp {
             })
             .response
             .interact(egui::Sense::click())
-            .on_hover_text(path.to_string_lossy());
+            .on_hover_text(format!(
+                "{} · {}",
+                agent_driver_label(&driver),
+                path.to_string_lossy()
+            ));
         if response.clicked() {
             self.select_config_path(path.to_path_buf(), true);
         }
@@ -2832,6 +3400,10 @@ impl WatchApiApp {
             }
             if ui.button("强制新对话").clicked() {
                 self.force_new_conversation_for_config(path.to_path_buf());
+                ui.close_menu();
+            }
+            if ui.button("分叉会话").clicked() {
+                self.fork_conversation_for_config(path.to_path_buf());
                 ui.close_menu();
             }
             if ui.button("打开对话文件").clicked() {
@@ -2900,6 +3472,20 @@ impl WatchApiApp {
         _row_h: f32,
         control_state: Option<&Value>,
     ) {
+        let terminate_enabled = self.running
+            || self.terminal_running
+            || self.terminal_control.is_some()
+            || self.stop_tx.is_some();
+        if circular_tool_button(
+            ui,
+            "终止 Agent 进程",
+            ToolButtonIcon::Terminate,
+            terminate_enabled,
+        )
+        .clicked()
+        {
+            self.terminate_current_agent();
+        }
         if circular_tool_button(ui, "重启 Agent", ToolButtonIcon::Refresh, true).clicked() {
             self.restart_current_agent();
         }
@@ -4770,6 +5356,28 @@ impl WatchApiApp {
                         );
                     });
                 }
+                editor_section_frame(ui, "Agent 启动", |ui| {
+                    render_agent_launch_profile(
+                        ui,
+                        "Codex",
+                        &mut self.workspace_editor_agent_launch.codex,
+                        "codex.cmd",
+                    );
+                    ui.add_space(8.0);
+                    render_agent_launch_profile(
+                        ui,
+                        "Claude",
+                        &mut self.workspace_editor_agent_launch.claude,
+                        "claude",
+                    );
+                    ui.add_space(8.0);
+                    render_agent_launch_profile(
+                        ui,
+                        "OpenCode",
+                        &mut self.workspace_editor_agent_launch.opencode,
+                        "opencode",
+                    );
+                });
                 editor_section_frame(ui, "提示词", |ui| {
                     render_workspace_default_prompt_field(
                         ui,
@@ -4840,7 +5448,7 @@ impl WatchApiApp {
         let mut close_requested = false;
         ctx.show_viewport_immediate(
             ViewportId::from_hash_of(SYSTEM_SETTINGS_VIEWPORT),
-            child_viewport_builder("系统设置", [800.0, 560.0], [560.0, 400.0]),
+            child_viewport_builder("系统设置", [860.0, 660.0], [620.0, 460.0]),
             |child_ctx, _class| {
                 configure_visuals(child_ctx);
                 if child_ctx.input(|input| input.viewport().close_requested()) {
@@ -4877,196 +5485,291 @@ impl WatchApiApp {
     }
 
     fn render_system_settings(&mut self, ui: &mut egui::Ui) {
-        editor_section_frame(ui, "主题", |ui| {
-            ui.horizontal(|ui| {
-                ui.radio_value(&mut self.system_settings_theme, GuiTheme::Dark, "深色");
-                ui.radio_value(&mut self.system_settings_theme, GuiTheme::Light, "浅色");
-            });
-        });
+        egui::ScrollArea::vertical()
+            .id_salt("system_settings_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let width = (ui.available_width() - INNER_SCROLLBAR_GUTTER).max(420.0);
+                ui.set_width(width);
+                ui.set_max_width(width);
+                editor_section_frame(ui, "主题", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut self.system_settings_theme, GuiTheme::Dark, "深色");
+                        ui.radio_value(&mut self.system_settings_theme, GuiTheme::Light, "浅色");
+                    });
+                });
 
-        editor_section_frame(ui, "外部应用", |ui| {
-            let spacing = ui.spacing().item_spacing.x;
-            let actions_width = CIRCULAR_ADD_BUTTON_SIZE * 2.0 + spacing;
-            let name_width = (ui.available_width() * 0.25).clamp(110.0, 180.0);
-            let path_width =
-                (ui.available_width() - name_width - actions_width - spacing * 3.0).max(140.0);
-            ui.horizontal(|ui| {
-                ui.add_sized(
-                    [name_width, 28.0],
-                    centered_singleline(&mut self.system_settings_new_name).hint_text("名称"),
-                );
-                ui.add_sized(
-                    [path_width, 28.0],
-                    centered_singleline(&mut self.system_settings_new_path).hint_text("应用路径"),
-                );
-                if circular_tool_button(ui, "选择应用", ToolButtonIcon::Folder, true).clicked()
-                {
-                    let mut dialog = rfd::FileDialog::new();
-                    let current = PathBuf::from(self.system_settings_new_path.trim());
-                    if current.exists() {
-                        if current.is_dir() {
-                            dialog = dialog.set_directory(current);
-                        } else if let Some(parent) = current.parent() {
-                            dialog = dialog.set_directory(parent);
-                        }
-                    }
-                    if let Some(path) = dialog.pick_file() {
-                        if self.system_settings_new_name.trim().is_empty() {
-                            self.system_settings_new_name = external_application_name(&path);
-                        }
-                        self.system_settings_new_path = path.to_string_lossy().to_string();
-                    }
-                }
-                let can_add = !self.system_settings_new_path.trim().is_empty();
-                if circular_tool_button(ui, "添加外部应用", ToolButtonIcon::Add, can_add).clicked()
-                {
-                    self.system_settings_external_apps
-                        .push(GuiExternalApplication {
-                            name: std::mem::take(&mut self.system_settings_new_name),
-                            path: PathBuf::from(
-                                self.system_settings_new_path
-                                    .trim()
-                                    .trim_matches('"')
-                                    .trim(),
-                            ),
+                editor_section_frame(ui, "系统通知", |ui| {
+                    ui.checkbox(
+                        &mut self.system_settings_notifications.enabled,
+                        "启用系统通知",
+                    );
+                    ui.add_enabled_ui(self.system_settings_notifications.enabled, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.checkbox(
+                                &mut self.system_settings_notifications.notify_on_completion,
+                                "任务完成",
+                            );
+                            ui.checkbox(
+                                &mut self.system_settings_notifications.notify_on_failure,
+                                "运行失败",
+                            );
+                            ui.checkbox(
+                                &mut self.system_settings_notifications.notify_on_attention,
+                                "需要处理",
+                            );
+                            ui.checkbox(
+                                &mut self.system_settings_notifications.only_when_background,
+                                "仅在后台时通知",
+                            );
                         });
-                    self.system_settings_new_path.clear();
-                    self.system_settings_status.clear();
-                }
-            });
-            ui.add_space(8.0);
+                    });
+                });
 
-            let mut browse_index = None;
-            let mut remove_index = None;
-            let mut launch = None;
-            egui::ScrollArea::vertical()
-                .id_salt("system_settings_external_app_list")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    let width = (ui.available_width() - INNER_SCROLLBAR_GUTTER).max(320.0);
-                    ui.set_width(width);
-                    ui.set_max_width(width);
+                editor_section_frame(ui, "外部应用", |ui| {
+                    let spacing = ui.spacing().item_spacing.x;
+                    let actions_width = CIRCULAR_ADD_BUTTON_SIZE * 2.0 + spacing;
+                    let name_width = (ui.available_width() * 0.22).clamp(105.0, 170.0);
+                    let path_width =
+                        (ui.available_width() - name_width - actions_width - spacing * 3.0)
+                            .max(140.0);
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [name_width, 28.0],
+                            centered_singleline(&mut self.system_settings_new_name)
+                                .hint_text("名称"),
+                        );
+                        ui.add_sized(
+                            [path_width, 28.0],
+                            centered_singleline(&mut self.system_settings_new_path)
+                                .hint_text("应用路径"),
+                        );
+                        if circular_tool_button(ui, "选择应用", ToolButtonIcon::Folder, true)
+                            .clicked()
+                        {
+                            let mut dialog = rfd::FileDialog::new();
+                            let current = PathBuf::from(self.system_settings_new_path.trim());
+                            if current.exists() {
+                                if current.is_dir() {
+                                    dialog = dialog.set_directory(current);
+                                } else if let Some(parent) = current.parent() {
+                                    dialog = dialog.set_directory(parent);
+                                }
+                            }
+                            if let Some(path) = dialog.pick_file() {
+                                if self.system_settings_new_name.trim().is_empty() {
+                                    self.system_settings_new_name =
+                                        external_application_name(&path);
+                                }
+                                self.system_settings_new_path = path.to_string_lossy().to_string();
+                            }
+                        }
+                        let can_add = !self.system_settings_new_path.trim().is_empty();
+                        if circular_tool_button(ui, "添加外部应用", ToolButtonIcon::Add, can_add)
+                            .clicked()
+                        {
+                            self.system_settings_external_apps
+                                .push(GuiExternalApplication {
+                                    name: std::mem::take(&mut self.system_settings_new_name),
+                                    path: PathBuf::from(
+                                        self.system_settings_new_path
+                                            .trim()
+                                            .trim_matches('"')
+                                            .trim(),
+                                    ),
+                                    arguments: std::mem::take(
+                                        &mut self.system_settings_new_arguments,
+                                    ),
+                                });
+                            self.system_settings_new_path.clear();
+                            self.system_settings_status.clear();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [name_width, 28.0],
+                            egui::Label::new(RichText::new("参数模板").small().color(muted())),
+                        );
+                        ui.add_sized(
+                            [(ui.available_width() - spacing).max(140.0), 28.0],
+                            centered_singleline(&mut self.system_settings_new_arguments)
+                                .hint_text("例如 --project {workspace}"),
+                        )
+                        .on_hover_text(external_application_template_help());
+                    });
+                    ui.add_space(8.0);
+
+                    let mut browse_index = None;
+                    let mut remove_index = None;
+                    let mut launch = None;
                     if self.system_settings_external_apps.is_empty() {
                         ui.label(RichText::new("暂无外部应用").color(muted()));
                     }
                     for (index, app) in self.system_settings_external_apps.iter_mut().enumerate() {
-                        ui.horizontal(|ui| {
-                            let spacing = ui.spacing().item_spacing.x;
-                            let actions_width = CIRCULAR_ADD_BUTTON_SIZE * 3.0 + spacing * 2.0;
-                            let name_width = (ui.available_width() * 0.25).clamp(110.0, 180.0);
-                            let path_width =
-                                (ui.available_width() - name_width - actions_width - spacing)
-                                    .max(140.0);
-                            ui.add_sized([name_width, 28.0], centered_singleline(&mut app.name));
-                            let mut path_text = app.path.to_string_lossy().to_string();
-                            if ui
-                                .add_sized([path_width, 28.0], centered_singleline(&mut path_text))
-                                .changed()
-                            {
-                                app.path = PathBuf::from(path_text.trim().trim_matches('"').trim());
+                        Frame::default()
+                            .fill(md_surface_dim())
+                            .stroke(Stroke::new(0.7, md_outline_faint()))
+                            .corner_radius(egui::CornerRadius::same(4))
+                            .inner_margin(Margin::symmetric(8, 6))
+                            .show(ui, |ui| {
+                                ui.set_width((width - 18.0).max(380.0));
+                                ui.horizontal(|ui| {
+                                    let spacing = ui.spacing().item_spacing.x;
+                                    let actions_width =
+                                        CIRCULAR_ADD_BUTTON_SIZE * 3.0 + spacing * 2.0;
+                                    let name_width =
+                                        (ui.available_width() * 0.22).clamp(105.0, 170.0);
+                                    let path_width = (ui.available_width()
+                                        - name_width
+                                        - actions_width
+                                        - spacing)
+                                        .max(140.0);
+                                    ui.add_sized(
+                                        [name_width, 28.0],
+                                        centered_singleline(&mut app.name),
+                                    );
+                                    let mut path_text = app.path.to_string_lossy().to_string();
+                                    if ui
+                                        .add_sized(
+                                            [path_width, 28.0],
+                                            centered_singleline(&mut path_text),
+                                        )
+                                        .changed()
+                                    {
+                                        app.path = PathBuf::from(
+                                            path_text.trim().trim_matches('"').trim(),
+                                        );
+                                    }
+                                    if circular_tool_button(
+                                        ui,
+                                        "选择应用路径",
+                                        ToolButtonIcon::Folder,
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
+                                        browse_index = Some(index);
+                                    }
+                                    if circular_tool_button(
+                                        ui,
+                                        "启动此应用",
+                                        ToolButtonIcon::Play,
+                                        !app.path.as_os_str().is_empty(),
+                                    )
+                                    .clicked()
+                                    {
+                                        launch = Some(app.clone());
+                                    }
+                                    if circular_tool_button(
+                                        ui,
+                                        "移除此应用",
+                                        ToolButtonIcon::Delete,
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
+                                        remove_index = Some(index);
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.add_sized(
+                                        [name_width, 28.0],
+                                        egui::Label::new(
+                                            RichText::new("参数模板").small().color(muted()),
+                                        ),
+                                    );
+                                    ui.add_sized(
+                                        [ui.available_width().max(140.0), 28.0],
+                                        centered_singleline(&mut app.arguments)
+                                            .hint_text("启动参数"),
+                                    )
+                                    .on_hover_text(external_application_template_help());
+                                });
+                            });
+                        ui.add_space(6.0);
+                    }
+
+                    if let Some(index) = browse_index {
+                        let current = self.system_settings_external_apps[index].path.clone();
+                        let mut dialog = rfd::FileDialog::new();
+                        if current.exists() {
+                            if current.is_dir() {
+                                dialog = dialog.set_directory(current);
+                            } else if let Some(parent) = current.parent() {
+                                dialog = dialog.set_directory(parent);
                             }
-                            if circular_tool_button(
-                                ui,
-                                "选择应用路径",
-                                ToolButtonIcon::Folder,
-                                true,
-                            )
-                            .clicked()
-                            {
-                                browse_index = Some(index);
+                        }
+                        if let Some(path) = dialog.pick_file() {
+                            let app = &mut self.system_settings_external_apps[index];
+                            if app.name.trim().is_empty() {
+                                app.name = external_application_name(&path);
                             }
-                            if circular_tool_button(
-                                ui,
-                                "启动此应用",
-                                ToolButtonIcon::Play,
-                                !app.path.as_os_str().is_empty(),
-                            )
-                            .clicked()
-                            {
-                                launch = Some((app.name.clone(), app.path.clone()));
-                            }
-                            if circular_tool_button(ui, "移除此应用", ToolButtonIcon::Delete, true)
-                                .clicked()
-                            {
-                                remove_index = Some(index);
-                            }
-                        });
-                        ui.add_space(4.0);
+                            app.path = path;
+                        }
+                    }
+                    if let Some(index) = remove_index {
+                        self.system_settings_external_apps.remove(index);
+                    }
+                    if let Some(app) = launch {
+                        self.launch_external_application(&app);
                     }
                 });
 
-            if let Some(index) = browse_index {
-                let current = self.system_settings_external_apps[index].path.clone();
-                let mut dialog = rfd::FileDialog::new();
-                if current.exists() {
-                    if current.is_dir() {
-                        dialog = dialog.set_directory(current);
-                    } else if let Some(parent) = current.parent() {
-                        dialog = dialog.set_directory(parent);
-                    }
+                if !self.system_settings_status.is_empty() {
+                    let color = if self.system_settings_status.contains("失败")
+                        || self.system_settings_status.contains("不存在")
+                    {
+                        md_error()
+                    } else {
+                        md_success()
+                    };
+                    ui.label(
+                        RichText::new(self.system_settings_status.as_str())
+                            .small()
+                            .color(color),
+                    );
                 }
-                if let Some(path) = dialog.pick_file() {
-                    let app = &mut self.system_settings_external_apps[index];
-                    if app.name.trim().is_empty() {
-                        app.name = external_application_name(&path);
-                    }
-                    app.path = path;
-                }
-            }
-            if let Some(index) = remove_index {
-                self.system_settings_external_apps.remove(index);
-            }
-            if let Some((name, path)) = launch {
-                self.launch_external_application(&name, &path);
-            }
-            if !self.system_settings_status.is_empty() {
-                ui.add_space(4.0);
-                let color = if self.system_settings_status.contains("失败")
-                    || self.system_settings_status.contains("不存在")
-                {
-                    md_error()
-                } else {
-                    md_success()
-                };
-                ui.label(
-                    RichText::new(self.system_settings_status.as_str())
-                        .small()
-                        .color(color),
-                );
-            }
-        });
+            });
     }
 
     fn save_system_settings(&mut self) {
         let previous_theme = self.registry.theme;
         let previous_apps = self.registry.external_apps.clone();
+        let previous_notifications = self.registry.notifications.clone();
         self.registry.set_system_settings(
             self.system_settings_theme,
             self.system_settings_external_apps.clone(),
+            self.system_settings_notifications.clone(),
         );
         match self.registry.save() {
             Ok(()) => {
                 self.system_settings_theme = self.registry.theme;
                 self.system_settings_external_apps = self.registry.external_apps.clone();
+                self.system_settings_notifications = self.registry.notifications.clone();
                 self.system_settings_status = "设置已保存".to_string();
                 self.status = "系统设置已保存".to_string();
             }
             Err(err) => {
-                self.registry
-                    .set_system_settings(previous_theme, previous_apps);
+                self.registry.set_system_settings(
+                    previous_theme,
+                    previous_apps,
+                    previous_notifications,
+                );
                 self.system_settings_status = format!("保存设置失败：{err}");
                 self.status = self.system_settings_status.clone();
             }
         }
     }
 
-    fn launch_external_application(&mut self, name: &str, path: &Path) {
+    fn launch_external_application(&mut self, app: &GuiExternalApplication) {
+        let path = &app.path;
         if path.as_os_str().is_empty() || !path.is_file() {
             let message = format!("应用路径不存在：{}", path.display());
             self.system_settings_status = message.clone();
             self.status = message;
             return;
         }
+        let arguments = self.expanded_launch_arguments(&app.arguments, path.parent());
         let is_command_script = external_application_is_command_script(path);
         let mut command = if is_command_script {
             let mut command = Command::new("cmd.exe");
@@ -5075,6 +5778,7 @@ impl WatchApiApp {
         } else {
             Command::new(path)
         };
+        command.args(arguments);
         if let Some(parent) = path.parent() {
             command.current_dir(parent);
         }
@@ -5098,10 +5802,10 @@ impl WatchApiApp {
         }
         match command.spawn() {
             Ok(_) => {
-                let label = if name.trim().is_empty() {
+                let label = if app.name.trim().is_empty() {
                     external_application_name(path)
                 } else {
-                    name.trim().to_string()
+                    app.name.trim().to_string()
                 };
                 let message = format!("已启动：{label}");
                 self.system_settings_status = message.clone();
@@ -5112,6 +5816,66 @@ impl WatchApiApp {
                 self.system_settings_status = message.clone();
                 self.status = message;
             }
+        }
+    }
+
+    fn expanded_launch_arguments(
+        &self,
+        template: &str,
+        app_directory: Option<&Path>,
+    ) -> Vec<String> {
+        let context = self.launch_template_context(None, app_directory);
+        expand_argument_template(template, &context)
+    }
+
+    fn launch_template_context(
+        &self,
+        workspace_override: Option<&Path>,
+        app_directory: Option<&Path>,
+    ) -> LaunchTemplateContext {
+        let config = self.config_path_path().filter(|config_path| {
+            workspace_override.is_none_or(|workspace_path| {
+                self.registry
+                    .workspace_for_config(config_path)
+                    .is_some_and(|workspace| {
+                        normalize_config_path(workspace.path.clone())
+                            == normalize_config_path(workspace_path.to_path_buf())
+                    })
+            })
+        });
+        let workspace = workspace_override
+            .map(|path| path.to_string_lossy().into_owned())
+            .or_else(|| {
+                config
+                    .as_deref()
+                    .and_then(|path| self.registry.workspace_for_config(path))
+                    .or_else(|| self.registry.current_workspace())
+                    .map(|workspace| workspace.path.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default();
+        let config_text = config
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let config_directory = config
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| workspace.clone());
+        let session = config
+            .as_deref()
+            .and_then(|path| bound_session_file_for_config_path(path, self.selected_endpoint).ok())
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let app_directory = app_directory
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        LaunchTemplateContext {
+            workspace,
+            config: config_text,
+            config_directory,
+            session,
+            app_directory,
         }
     }
 
@@ -6298,6 +7062,16 @@ impl WatchApiApp {
         }
         row.col(|ui| {
             ui.horizontal(|ui| {
+                if circular_tool_button(
+                    ui,
+                    "直接启动 Agent（跳过探测）",
+                    ToolButtonIcon::Play,
+                    true,
+                )
+                .clicked()
+                {
+                    self.force_start_agent_on_endpoint(&endpoint_name);
+                }
                 if circular_edit_button(ui, "编辑接口").clicked() {
                     self.open_endpoint_editor(&endpoint_name);
                 }
@@ -6356,6 +7130,16 @@ impl WatchApiApp {
         let endpoint_name = endpoint.name.clone();
         row.col(|ui| {
             ui.horizontal(|ui| {
+                if circular_tool_button(
+                    ui,
+                    "直接启动 Agent（重启配置后可用）",
+                    ToolButtonIcon::Play,
+                    false,
+                )
+                .clicked()
+                {
+                    self.force_start_agent_on_endpoint(&endpoint_name);
+                }
                 if circular_edit_button(ui, "编辑接口").clicked() {
                     self.open_endpoint_editor(&endpoint_name);
                 }
@@ -6436,6 +7220,16 @@ impl WatchApiApp {
         });
         row_ui.col(|ui| {
             ui.horizontal(|ui| {
+                if circular_tool_button(
+                    ui,
+                    "直接启动 Agent（跳过探测）",
+                    ToolButtonIcon::Play,
+                    true,
+                )
+                .clicked()
+                {
+                    self.force_start_agent_on_endpoint(&endpoint_name);
+                }
                 if circular_edit_button(ui, "编辑接口").clicked() {
                     self.open_endpoint_editor(&endpoint_name);
                 }
@@ -6613,11 +7407,12 @@ impl WatchApiApp {
                             ui.label(short_session_id(&dialog.session_id))
                                 .on_hover_text(dialog.session_id.clone());
                             ui.separator();
-                            ui.label(
-                                RichText::new(dialog.path.to_string_lossy())
-                                    .small()
-                                    .color(muted()),
-                            );
+                            let path_label = if dialog.path.is_file() {
+                                dialog.path.to_string_lossy().into_owned()
+                            } else {
+                                "OpenCode 数据库会话，无独立会话文件".to_string()
+                            };
+                            ui.label(RichText::new(path_label).small().color(muted()));
                         });
                         ui.add_space(8.0);
                         let height = (ui.available_height() - 42.0).max(260.0);
@@ -6635,8 +7430,13 @@ impl WatchApiApp {
                             });
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            if circular_tool_button(ui, "打开会话文件", ToolButtonIcon::File, true)
-                                .clicked()
+                            if circular_tool_button(
+                                ui,
+                                "打开会话文件",
+                                ToolButtonIcon::File,
+                                dialog.path.is_file(),
+                            )
+                            .clicked()
                             {
                                 self.open_path_in_system(&dialog.path);
                             }
@@ -6891,7 +7691,12 @@ impl WatchApiApp {
                                             format!(
                                                 "{}\n{}",
                                                 candidate.reason,
-                                                candidate.path.to_string_lossy()
+                                                if candidate.path.is_file() {
+                                                    candidate.path.to_string_lossy().into_owned()
+                                                } else {
+                                                    "OpenCode 数据库会话，无独立会话文件"
+                                                        .to_string()
+                                                }
                                             ),
                                         );
                                     });
@@ -6925,7 +7730,7 @@ impl WatchApiApp {
                                                 ui,
                                                 "打开会话文件",
                                                 ToolButtonIcon::File,
-                                                true,
+                                                candidate.path.is_file(),
                                             )
                                             .clicked()
                                             {
@@ -6950,7 +7755,11 @@ impl WatchApiApp {
     }
 
     fn open_session_summary_dialog(&mut self, candidate: SessionCandidate) {
-        let detail = recent_session_detail_summary(&candidate.path);
+        let detail = candidate
+            .path
+            .is_file()
+            .then(|| recent_session_detail_summary(&candidate.path))
+            .unwrap_or_default();
         let summary = if detail.trim().is_empty() {
             candidate.summary
         } else {
@@ -7034,28 +7843,54 @@ impl WatchApiApp {
         terminal_rect: Rect,
         terminal_id: egui::Id,
     ) {
-        if terminal_rect.width() < 40.0 || terminal_rect.height() < 40.0 {
+        let controls_width = CIRCULAR_ADD_BUTTON_SIZE * 2.0 + TERMINAL_OVERLAY_CONTROL_GAP;
+        let scrollbar_left =
+            terminal_rect.right() - TERMINAL_SCROLLBAR_RIGHT_INSET - TERMINAL_SCROLLBAR_WIDTH;
+        let controls_right = scrollbar_left - TERMINAL_OVERLAY_CONTROL_RIGHT_GAP;
+        let controls_left = controls_right - controls_width;
+        if controls_left < terminal_rect.left() + 8.0
+            || terminal_rect.height()
+                < CIRCULAR_ADD_BUTTON_SIZE + TERMINAL_OVERLAY_CONTROL_BOTTOM_INSET + 8.0
+        {
             return;
         }
         let button_pos = pos2(
-            terminal_rect.left() + 8.0,
-            terminal_rect.bottom() - CIRCULAR_ADD_BUTTON_SIZE - 8.0,
+            controls_left,
+            terminal_rect.bottom()
+                - CIRCULAR_ADD_BUTTON_SIZE
+                - TERMINAL_OVERLAY_CONTROL_BOTTOM_INSET,
         );
         egui::Area::new(egui::Id::new("terminal_workbench_toggle"))
             .order(egui::Order::Foreground)
             .fixed_pos(button_pos)
             .show(ui.ctx(), |ui| {
-                let (hover_text, icon) = if self.terminal_workbench_expanded {
-                    ("缩小终端", ToolButtonIcon::Collapse)
-                } else {
-                    ("终端占满右侧工作台", ToolButtonIcon::Expand)
-                };
-                if circular_tool_button(ui, hover_text, icon, true).clicked() {
-                    self.terminal_workbench_expanded = !self.terminal_workbench_expanded;
-                    ui.ctx()
-                        .memory_mut(|memory| memory.request_focus(terminal_id));
-                    ui.ctx().request_repaint();
-                }
+                ui.spacing_mut().item_spacing.x = TERMINAL_OVERLAY_CONTROL_GAP;
+                ui.horizontal(|ui| {
+                    if circular_tool_button(
+                        ui,
+                        "滚动到终端底部",
+                        ToolButtonIcon::ScrollBottom,
+                        true,
+                    )
+                    .clicked()
+                    {
+                        self.scroll_terminal_bottom();
+                        ui.ctx()
+                            .memory_mut(|memory| memory.request_focus(terminal_id));
+                        ui.ctx().request_repaint();
+                    }
+                    let (hover_text, icon) = if self.terminal_workbench_expanded {
+                        ("缩小终端", ToolButtonIcon::Collapse)
+                    } else {
+                        ("终端占满右侧工作台", ToolButtonIcon::Expand)
+                    };
+                    if circular_tool_button(ui, hover_text, icon, true).clicked() {
+                        self.terminal_workbench_expanded = !self.terminal_workbench_expanded;
+                        ui.ctx()
+                            .memory_mut(|memory| memory.request_focus(terminal_id));
+                        ui.ctx().request_repaint();
+                    }
+                });
             });
     }
 
@@ -8087,6 +8922,39 @@ impl WatchApiApp {
     }
 
     fn start_runtime_with_restart_reset(&mut self, reset_restart_attempts: bool) {
+        self.start_runtime_with_restart_reset_and_options(reset_restart_attempts, None, None);
+    }
+
+    fn start_runtime_with_restart_reset_and_fork(
+        &mut self,
+        reset_restart_attempts: bool,
+        fork_source: Option<(String, Option<PathBuf>)>,
+    ) {
+        self.start_runtime_with_restart_reset_and_options(
+            reset_restart_attempts,
+            fork_source,
+            None,
+        );
+    }
+
+    fn start_runtime_with_restart_reset_and_direct_endpoint(
+        &mut self,
+        reset_restart_attempts: bool,
+        endpoint_name: String,
+    ) {
+        self.start_runtime_with_restart_reset_and_options(
+            reset_restart_attempts,
+            None,
+            Some(endpoint_name),
+        );
+    }
+
+    fn start_runtime_with_restart_reset_and_options(
+        &mut self,
+        reset_restart_attempts: bool,
+        fork_source: Option<(String, Option<PathBuf>)>,
+        direct_endpoint: Option<String>,
+    ) {
         if self.shutdown_done {
             self.status = "正在关闭，不能启动新运行态".to_string();
             return;
@@ -8106,6 +8974,22 @@ impl WatchApiApp {
         self.last_start_error = None;
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         let mut fresh_runtime = RuntimeCore::new(config.clone());
+        if let Some((source_session_id, source_session_path)) = fork_source {
+            if let Err(err) =
+                fresh_runtime.fork_session_next_start(source_session_id, source_session_path)
+            {
+                self.status = format!("准备分叉会话失败：{err}");
+                self.last_start_error = Some(self.status.clone());
+                return;
+            }
+        }
+        if let Some(endpoint_name) = direct_endpoint {
+            if let Err(err) = fresh_runtime.force_start_endpoint_next_tick(endpoint_name) {
+                self.status = err;
+                self.last_start_error = Some(self.status.clone());
+                return;
+            }
+        }
         fresh_runtime.set_event_wakeup(self.runtime_event_wakeup.clone());
         fresh_runtime.set_event_sender(Some(event_tx));
         self.last_rows = fresh_runtime.rows();
@@ -8282,6 +9166,131 @@ impl WatchApiApp {
         }
     }
 
+    fn poll_codex_repair_result(&mut self) {
+        let Some(rx) = &self.codex_repair_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.codex_repair_rx = None;
+                self.codex_repair_loading = false;
+                match result {
+                    Ok(output) => {
+                        self.codex_repair_status = "修复完成".to_string();
+                        self.codex_repair_output = output;
+                        self.status = "Codex 状态数据库修复完成".to_string();
+                    }
+                    Err(err) => {
+                        self.codex_repair_status = "修复失败".to_string();
+                        self.codex_repair_output = err.clone();
+                        self.status = format!("Codex 状态数据库修复失败：{err}");
+                    }
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.codex_repair_rx = None;
+                self.codex_repair_loading = false;
+                self.codex_repair_status = "修复失败".to_string();
+                self.codex_repair_output = "后台修复任务已退出".to_string();
+                self.status = "Codex 状态数据库修复失败：后台任务已退出".to_string();
+            }
+        }
+    }
+
+    fn start_codex_repair(&mut self) {
+        if self.codex_repair_loading {
+            return;
+        }
+        let home = resolve_codex_home_path(&self.codex_repair_home);
+        if home.as_os_str().is_empty() {
+            self.codex_repair_status = "修复失败".to_string();
+            self.codex_repair_output = "Codex 目录不能为空".to_string();
+            self.status = "Codex 状态数据库修复失败：目录不能为空".to_string();
+            return;
+        }
+        self.stop_all_configs();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let result = repair_codex_state_database(home);
+            let _ = tx.send(result);
+        });
+        self.codex_repair_rx = Some(rx);
+        self.codex_repair_loading = true;
+        self.codex_repair_status = "正在修复".to_string();
+        self.codex_repair_output.clear();
+        self.status = "正在修复 Codex 状态数据库".to_string();
+    }
+
+    fn poll_agent_tool_result(&mut self) {
+        let Some(rx) = &self.agent_tool_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(task) => {
+                self.agent_tool_rx = None;
+                self.agent_tool_active = None;
+                let state = self.agent_tool_states.entry(task.kind).or_default();
+                match task.result {
+                    Ok(result) => {
+                        state.version = result.version;
+                        state.output = result.output;
+                        state.status = match task.operation {
+                            AgentToolOperation::CheckVersion => "版本已检测".to_string(),
+                            AgentToolOperation::Update => "更新完成".to_string(),
+                        };
+                        self.status = format!("{} {}", task.kind.label(), state.status);
+                    }
+                    Err(err) => {
+                        state.output = err.clone();
+                        state.status = match task.operation {
+                            AgentToolOperation::CheckVersion => "版本检测失败".to_string(),
+                            AgentToolOperation::Update => "更新失败".to_string(),
+                        };
+                        self.status = format!("{}：{err}", state.status);
+                    }
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                if let Some((kind, operation)) = self.agent_tool_active.take() {
+                    let state = self.agent_tool_states.entry(kind).or_default();
+                    state.status = match operation {
+                        AgentToolOperation::CheckVersion => "版本检测失败".to_string(),
+                        AgentToolOperation::Update => "更新失败".to_string(),
+                    };
+                    state.output = "后台任务已退出".to_string();
+                    self.status = format!("{}：后台任务已退出", state.status);
+                }
+                self.agent_tool_rx = None;
+            }
+        }
+    }
+
+    fn start_agent_tool_task(&mut self, kind: AgentToolKind, operation: AgentToolOperation) {
+        if self.agent_tool_active.is_some() {
+            return;
+        }
+        let state = self.agent_tool_states.entry(kind).or_default();
+        state.status = match operation {
+            AgentToolOperation::CheckVersion => "正在检测版本".to_string(),
+            AgentToolOperation::Update => "正在更新".to_string(),
+        };
+        state.output.clear();
+        self.status = format!("{} {}", kind.label(), state.status);
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let result = run_agent_tool_operation(kind, operation);
+            let _ = tx.send(AgentToolTaskResult {
+                kind,
+                operation,
+                result,
+            });
+        });
+        self.agent_tool_rx = Some(rx);
+        self.agent_tool_active = Some((kind, operation));
+    }
+
     fn start_connection_test_for_selected_provider(&mut self) {
         let Some(provider) = self.selected_provider_value().cloned() else {
             self.status = "请先选择供应商".to_string();
@@ -8410,7 +9419,8 @@ impl WatchApiApp {
         };
         let mut store = SessionStore::new(config.session_state_path.clone());
         let key = session_binding_key_for_config(&config, endpoint);
-        match store.set_bound_session_id(&key, &candidate.session_id, Some(&candidate.path)) {
+        let session_path = candidate.path.is_file().then_some(candidate.path.as_path());
+        match store.set_bound_session_id(&key, &candidate.session_id, session_path) {
             Ok(()) => {
                 let goal_status = self.import_goal_from_bound_session(&config, source, candidate);
                 self.status = goal_status.unwrap_or_else(|| {
@@ -8947,6 +9957,7 @@ impl WatchApiApp {
         };
         self.workspace_editor_id = Some(workspace.id.clone());
         self.workspace_editor_json = workspace_defaults_with_fallbacks(&workspace.config_defaults);
+        self.workspace_editor_agent_launch = workspace.agent_launch.clone();
         self.workspace_editor_open = true;
     }
 
@@ -8966,6 +9977,7 @@ impl WatchApiApp {
             return;
         };
         workspace.config_defaults = defaults;
+        workspace.agent_launch = self.workspace_editor_agent_launch.clone();
         match next_registry.save() {
             Ok(()) => {
                 self.registry = next_registry;
@@ -9013,7 +10025,11 @@ impl WatchApiApp {
             self.status = "请先打开工作区文件夹".to_string();
             return;
         };
-        sync_editor_runtime_identity(&mut self.editor_json, &workspace.path);
+        sync_editor_runtime_identity(
+            &mut self.editor_json,
+            &workspace.path,
+            self.editor_creating_new_config,
+        );
         let path = if self.editor_creating_new_config {
             let Some(workspace_dir) = self.current_workspace_host_dir() else {
                 self.status = "请先打开工作区文件夹".to_string();
@@ -9878,6 +10894,7 @@ impl WatchApiApp {
                 if let Some(endpoint) = config.endpoints.get(self.selected_endpoint) {
                     return Some(SessionCandidateScanContext {
                         driver: config.agent_driver.clone(),
+                        agent_command: agent_command_parts(&config.agent_command),
                         codex_home: config.codex_home.clone(),
                         additional_codex_homes: historical_codex_session_homes(),
                         agent_home: config.agent_home.clone(),
@@ -9918,6 +10935,10 @@ impl WatchApiApp {
         }
         Some(SessionCandidateScanContext {
             driver,
+            agent_command: editor_agent_command_parts(
+                self.editor_json.get("agent_command"),
+                &driver_text,
+            ),
             codex_home: PathBuf::from(codex_home),
             additional_codex_homes: historical_codex_session_homes(),
             agent_home: (!agent_home.trim().is_empty()).then(|| PathBuf::from(agent_home)),
@@ -10631,6 +11652,169 @@ impl WatchApiApp {
             None
         } else {
             Some(PathBuf::from(text))
+        }
+    }
+
+    fn sync_remote_bridge(&mut self) {
+        if self.last_remote_bridge_sync_at.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        self.last_remote_bridge_sync_at = Instant::now();
+        let pending_commands = match self.remote_bridge.as_ref() {
+            Some(bridge) => bridge.drain_commands(),
+            None => return,
+        };
+        for command in pending_commands {
+            self.apply_remote_bridge_command(command.workspace_id, command.action);
+        }
+        let Some(bridge) = self.remote_bridge.as_ref() else {
+            return;
+        };
+        let current_key = self
+            .config_path_path()
+            .map(|path| session_key_for_path(&path));
+        let candidates = self
+            .registry
+            .paths
+            .iter()
+            .map(|path| {
+                let identity = session_key_for_path(path);
+                let config_name = self.registry.display_name(path.clone());
+                let workspace_name = self
+                    .registry
+                    .workspace_for_config(path)
+                    .and_then(|workspace| {
+                        workspace.name.clone().or_else(|| {
+                            workspace
+                                .path
+                                .file_name()
+                                .map(|value| value.to_string_lossy().into_owned())
+                        })
+                    })
+                    .unwrap_or_else(|| "工作区".to_string());
+                let label = format!("{workspace_name} / {config_name}");
+
+                if current_key.as_deref() == Some(identity.as_str()) {
+                    let submit_sequence = self
+                        .config
+                        .as_ref()
+                        .map(|config| config.prompt_submit_sequence.clone())
+                        .unwrap_or_else(|| "control-m".to_string());
+                    let running = self
+                        .terminal_control
+                        .as_ref()
+                        .is_some_and(TerminalControl::is_running);
+                    return WorkspaceCandidate {
+                        identity,
+                        label,
+                        status: if running {
+                            "运行中".to_string()
+                        } else if self.running {
+                            "启动中".to_string()
+                        } else {
+                            "已停止".to_string()
+                        },
+                        submit_sequence,
+                        control: self.terminal_control.clone(),
+                    };
+                }
+
+                let session = self.sessions.get(&identity);
+                let submit_sequence = session
+                    .and_then(|session| session.config.as_ref())
+                    .map(|config| config.prompt_submit_sequence.clone())
+                    .unwrap_or_else(|| "control-m".to_string());
+                let control = session.and_then(|session| session.terminal_control.clone());
+                let running = control.as_ref().is_some_and(TerminalControl::is_running);
+                WorkspaceCandidate {
+                    identity,
+                    label,
+                    status: if running {
+                        "运行中".to_string()
+                    } else if session.is_some_and(|session| session.running) {
+                        "启动中".to_string()
+                    } else {
+                        "已停止".to_string()
+                    },
+                    submit_sequence,
+                    control,
+                }
+            })
+            .collect();
+        bridge.sync(candidates);
+    }
+
+    fn apply_remote_bridge_command(&mut self, workspace_id: String, action: RemoteWorkspaceAction) {
+        let Some(path) = self
+            .registry
+            .paths
+            .iter()
+            .find(|path| workspace_id_for_identity(&session_key_for_path(path)) == workspace_id)
+            .cloned()
+        else {
+            return;
+        };
+        let key = session_key_for_path(&path);
+        let is_current = self
+            .config_path_path()
+            .as_deref()
+            .map(session_key_for_path)
+            .as_deref()
+            == Some(key.as_str());
+        match action {
+            RemoteWorkspaceAction::Start => {
+                if self.session_running(&path) {
+                    return;
+                }
+                if is_current {
+                    self.start_runtime_with_restart_reset(false);
+                } else if self.sessions.contains_key(&key) {
+                    self.start_stashed_runtime_with_restart_reset(&key, &path, false);
+                } else {
+                    let current = self.config_path_path();
+                    self.select_config_path(path.clone(), false);
+                    self.start_runtime_with_restart_reset(false);
+                    self.stash_current_session();
+                    if let Some(current) = current {
+                        self.select_config_path(current, false);
+                    }
+                }
+            }
+            RemoteWorkspaceAction::Stop => {
+                if is_current {
+                    self.stop_runtime();
+                } else if let Some(session) = self.sessions.get_mut(&key) {
+                    stop_stored_session(session);
+                }
+            }
+            RemoteWorkspaceAction::Restart => {
+                if is_current {
+                    if self.session_running(&path) {
+                        self.restart_current_config();
+                    } else {
+                        self.start_runtime_with_restart_reset(false);
+                    }
+                } else if self.session_running(&path) {
+                    if let Some(session) = self.sessions.get_mut(&key) {
+                        let cleanup = take_stored_session_cleanup(
+                            session,
+                            Some(EXIT_RUNTIME_WORKER_JOIN_TIMEOUT),
+                        );
+                        thread::spawn(move || stop_exit_runtime_cleanup(cleanup));
+                    }
+                    self.start_stashed_runtime_with_restart_reset(&key, &path, false);
+                } else if self.sessions.contains_key(&key) {
+                    self.start_stashed_runtime_with_restart_reset(&key, &path, false);
+                } else {
+                    let current = self.config_path_path();
+                    self.select_config_path(path.clone(), false);
+                    self.start_runtime_with_restart_reset(false);
+                    self.stash_current_session();
+                    if let Some(current) = current {
+                        self.select_config_path(current, false);
+                    }
+                }
+            }
         }
     }
 
@@ -11769,6 +12953,55 @@ impl WatchApiApp {
         self.status = "已发送 Esc 停止当前任务，自动续航已关闭".to_string();
     }
 
+    fn terminate_current_agent(&mut self) {
+        let active = self.running
+            || self.terminal_running
+            || self.terminal_control.is_some()
+            || self.stop_tx.is_some();
+        if !active {
+            self.status = "当前 Agent 已停止".to_string();
+            return;
+        }
+
+        self.flush_terminal_log_buffer();
+        let path = self.config_path_path();
+        let pause_error = path.as_deref().and_then(|path| {
+            self.update_control_state_cached(
+                path,
+                &[
+                    ("auto_paused", json!(true)),
+                    ("trigger_now", json!(false)),
+                    ("completion_pause_detected", json!(false)),
+                ],
+            )
+            .err()
+            .map(|err| err.to_string())
+        });
+        if let Some(path) = path.as_deref() {
+            let key = session_key_for_path(path);
+            self.auto_restart_due.remove(&key);
+            self.auto_restart_attempts.remove(&key);
+        }
+
+        let cleanup = self.take_current_runtime_cleanup();
+        if let Some(tx) = cleanup.stop_tx.as_ref() {
+            let _ = tx.send(RuntimeCommand::Stop);
+        }
+        if let Some(terminal_control) = cleanup.terminal_control.as_ref() {
+            terminal_control.stop_process();
+        }
+        self.clear_runtime_terminal_state();
+        self.last_start_error = None;
+        thread::spawn(move || stop_exit_runtime_cleanup(cleanup));
+
+        self.status = match pause_error {
+            Some(err) => format!(
+                "已强制终止 Agent，当前配置已停止，等待重新开启；保存续航暂停状态失败：{err}"
+            ),
+            None => "已强制终止 Agent，当前配置已停止，等待重新开启".to_string(),
+        };
+    }
+
     fn force_full_probe_current_runtime(&mut self) {
         if !self.running {
             self.start_runtime();
@@ -11776,6 +13009,41 @@ impl WatchApiApp {
         }
         if self.send_runtime_command(RuntimeCommand::ForceFullProbe, "按权重重新探测") {
             self.status = "已请求按权重重新探测".to_string();
+        }
+    }
+
+    fn force_start_agent_on_endpoint(&mut self, endpoint_name: &str) {
+        let endpoint_name = endpoint_name.trim();
+        if endpoint_name.is_empty() {
+            self.status = "直接启动失败：接口名称为空".to_string();
+            return;
+        }
+        if self.config.as_ref().is_none_or(|config| {
+            !config
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.name == endpoint_name)
+        }) {
+            self.status = format!("直接启动失败：未找到接口组：{endpoint_name}");
+            return;
+        }
+        if self.running {
+            if self.send_runtime_command(
+                RuntimeCommand::ForceStartEndpoint(endpoint_name.to_string()),
+                "直接启动 Agent",
+            ) {
+                self.terminal_control = None;
+                self.terminal_running = false;
+                self.status = format!("已请求直接使用接口 {endpoint_name} 启动 Agent");
+            }
+        } else {
+            self.start_runtime_with_restart_reset_and_direct_endpoint(
+                true,
+                endpoint_name.to_string(),
+            );
+            if self.running {
+                self.status = format!("正在直接使用接口 {endpoint_name} 启动 Agent");
+            }
         }
     }
 
@@ -11817,6 +13085,123 @@ impl WatchApiApp {
             Err(err) => format!("{base_status}；清除旧会话绑定失败：{err}"),
             _ => base_status,
         };
+    }
+
+    fn fork_conversation_for_config(&mut self, path: PathBuf) {
+        self.select_config_path(path.clone(), false);
+        let Some(source_config) = self.config.clone() else {
+            self.status = "无法分叉：源配置加载失败".to_string();
+            return;
+        };
+        if source_config.agent_driver == watchapi_core::AgentDriver::Generic {
+            self.status = "Generic 配置不支持分叉会话".to_string();
+            return;
+        }
+        let Some(fork_source) = self.resolve_current_agent_fork_source(&source_config) else {
+            self.status = format!(
+                "无法分叉：当前配置没有可用的 {} 会话",
+                agent_driver_label(&source_config.agent_driver)
+            );
+            return;
+        };
+        let mut cloned = load_json_or_default(&path);
+        let mut name = cloned
+            .get("config_name")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("配置")
+            })
+            .to_string();
+        name.push_str("_分叉");
+        cloned["config_name"] = json!(name.clone());
+        let driver = value_to_string(cloned.get("agent_driver")).if_empty("codex");
+        cloned["agent_id"] = json!(generated_agent_id(&driver, &name));
+        let Some(workspace_dir) = self.current_workspace_host_dir() else {
+            self.status = "请先打开工作区文件夹".to_string();
+            return;
+        };
+        let target = hosted_config_path_for_workspace(&workspace_dir, &name);
+        if let Some(parent) = target.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                self.status = format!("创建分叉配置目录失败：{err}");
+                return;
+            }
+        }
+        match serde_json::to_string_pretty(&cloned)
+            .map(|text| text + "\n")
+            .and_then(|text| write_text_atomic(&target, &text).map_err(serde_json::Error::io))
+        {
+            Ok(()) => match merge_global_provider_json_for_config(&target, &self.provider_json) {
+                Ok(()) => {
+                    self.select_config_path(target, false);
+                    self.start_runtime_with_restart_reset_and_fork(true, Some(fork_source));
+                    if self.running {
+                        self.status = format!("已创建分叉配置「{name}」，正在启动分叉会话");
+                    }
+                }
+                Err(err) => self.status = format!("创建分叉配置后同步供应商库失败：{err}"),
+            },
+            Err(err) => self.status = format!("创建分叉配置失败：{err}"),
+        }
+    }
+
+    fn resolve_current_agent_fork_source(
+        &mut self,
+        config: &AppConfig,
+    ) -> Option<(String, Option<PathBuf>)> {
+        if config.agent_driver == watchapi_core::AgentDriver::Generic {
+            return None;
+        }
+        if let Some(runtime) = &self.runtime {
+            if let Some(mut guard) = runtime.try_lock() {
+                guard.poll_terminal_events();
+                if let Some(source) = guard.active_session() {
+                    return Some(source);
+                }
+            }
+        }
+        let store = SessionStore::new(config.session_state_path.clone());
+        let mut endpoint_indexes = (0..config.endpoints.len()).collect::<Vec<_>>();
+        if self.selected_endpoint < endpoint_indexes.len() {
+            endpoint_indexes.swap(0, self.selected_endpoint);
+        }
+        for index in endpoint_indexes {
+            let endpoint = config.endpoints.get(index)?;
+            let key = session_binding_key_for_config(config, endpoint);
+            let Some(session_id) = store.get_bound_session_id(&key) else {
+                continue;
+            };
+            let session_path = store
+                .get_bound_session_path(&key)
+                .filter(|path| path.is_file())
+                .or_else(|| match config.agent_driver {
+                    watchapi_core::AgentDriver::Codex => {
+                        CodexSessionIndex::new(config.codex_home.clone())
+                            .with_additional_homes(historical_codex_session_homes())
+                            .find_latest_session_file_for_workdir(
+                                &endpoint.workdir,
+                                Some(&session_id),
+                            )
+                    }
+                    watchapi_core::AgentDriver::ClaudeCode => {
+                        let home = config
+                            .agent_home
+                            .clone()
+                            .unwrap_or_else(|| home_dir().join(".claude"));
+                        ClaudeSessionIndex::new(home).find_latest_session_file_for_workdir(
+                            &endpoint.workdir,
+                            Some(&session_id),
+                        )
+                    }
+                    watchapi_core::AgentDriver::OpenCode | watchapi_core::AgentDriver::Generic => {
+                        None
+                    }
+                });
+            return Some((session_id, session_path));
+        }
+        None
     }
 
     fn trigger_auto_prompt_now(&mut self) {
@@ -11873,6 +13258,7 @@ impl WatchApiApp {
             if current.trim().is_empty()
                 || current.contains(".codex")
                 || current.contains(".claude")
+                || current.replace('\\', "/").contains(".local/share/opencode")
             {
                 self.editor_json["agent_home"] = json!(home);
             }
@@ -12001,6 +13387,117 @@ impl WatchApiApp {
         match result {
             Ok(_) => self.status = open_command.success_status,
             Err(err) => self.status = format!("打开路径失败：{err}"),
+        }
+    }
+
+    fn open_terminal_in_directory(&mut self, path: &Path) {
+        self.open_terminal_in_directory_with_command(path, &[], "终端");
+    }
+
+    fn open_agent_in_directory(&mut self, path: &Path, driver: &str) {
+        let profile = self
+            .registry
+            .workspaces
+            .iter()
+            .find(|workspace| {
+                normalize_config_path(workspace.path.clone())
+                    == normalize_config_path(path.to_path_buf())
+            })
+            .and_then(|workspace| agent_launch_profile_for_driver(&workspace.agent_launch, driver))
+            .cloned()
+            .unwrap_or_default();
+        let context = self.launch_template_context(Some(path), None);
+        let Some(command) = build_agent_launch_command(driver, &profile, &context) else {
+            self.status = format!("不支持的 Agent：{driver}");
+            return;
+        };
+        let label = match driver {
+            "codex" => "Codex",
+            "opencode" => "OpenCode",
+            "claude-code" => "Claude",
+            _ => driver,
+        };
+        self.open_terminal_in_directory_with_command(path, &command, label);
+    }
+
+    fn open_terminal_in_directory_with_command(
+        &mut self,
+        path: &Path,
+        agent_command: &[String],
+        label: &str,
+    ) {
+        if !path.is_dir() {
+            self.status = format!("目录不存在：{}", path.display());
+            return;
+        }
+        let directory = system_open_target_path(path);
+
+        #[cfg(windows)]
+        {
+            let mut windows_terminal = Command::new("wt.exe");
+            windows_terminal.arg("-d").arg(&directory);
+            if !agent_command.is_empty() {
+                windows_terminal.args(["cmd.exe", "/d", "/k"]);
+                windows_terminal.args(agent_command);
+            }
+            windows_terminal.stdin(Stdio::null());
+            windows_terminal.stdout(Stdio::null());
+            windows_terminal.stderr(Stdio::null());
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            windows_terminal.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+            match windows_terminal.spawn() {
+                Ok(_) => {
+                    self.status = if agent_command.is_empty() {
+                        format!("已在终端中打开：{}", directory.display())
+                    } else {
+                        format!("已在终端中启动 {label}：{}", directory.display())
+                    };
+                    return;
+                }
+                Err(windows_terminal_error) => {
+                    let mut command_prompt = Command::new("cmd.exe");
+                    command_prompt.args(["/d", "/k"]);
+                    command_prompt.args(agent_command);
+                    command_prompt.current_dir(&directory);
+                    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+                    command_prompt.creation_flags(CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP);
+                    match command_prompt.spawn() {
+                        Ok(_) => {
+                            self.status = if agent_command.is_empty() {
+                                format!("已在命令提示符中打开：{}", directory.display())
+                            } else {
+                                format!("已在命令提示符中启动 {label}：{}", directory.display())
+                            };
+                        }
+                        Err(command_prompt_error) => {
+                            self.status = format!(
+                                "启动 {label} 失败：Windows Terminal: {windows_terminal_error}；命令提示符: {command_prompt_error}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            let mut terminal = Command::new("x-terminal-emulator");
+            terminal.arg("--working-directory").arg(&directory);
+            if !agent_command.is_empty() {
+                terminal.arg("-e").args(agent_command);
+            }
+            let result = terminal.spawn();
+            match result {
+                Ok(_) => {
+                    self.status = if agent_command.is_empty() {
+                        format!("已在终端中打开：{}", directory.display())
+                    } else {
+                        format!("已在终端中启动 {label}：{}", directory.display())
+                    };
+                }
+                Err(err) => self.status = format!("启动 {label} 失败：{err}"),
+            }
         }
     }
 
@@ -15317,6 +16814,7 @@ enum ToolButtonIcon {
     Play,
     Pause,
     Stop,
+    Terminate,
     Probe,
     Eye,
     EyeOff,
@@ -15324,6 +16822,7 @@ enum ToolButtonIcon {
     Unlink,
     Expand,
     Collapse,
+    ScrollBottom,
     Previous,
     Next,
 }
@@ -15351,11 +16850,17 @@ fn circular_tool_button(
     } else {
         md_surface()
     };
-    let icon_color = if enabled { accent() } else { muted() };
+    let icon_color = if !enabled {
+        muted()
+    } else if icon == ToolButtonIcon::Terminate {
+        md_error()
+    } else {
+        accent()
+    };
     let center = rect.center();
     ui.painter().circle_filled(center, 10.0, fill);
     let outline = if enabled && (response.hovered() || response.is_pointer_button_down_on()) {
-        accent()
+        icon_color
     } else {
         md_outline_soft()
     };
@@ -15848,6 +17353,23 @@ fn paint_tool_button_icon(
             let rect = Rect::from_center_size(center, vec2(8.0, 8.0));
             painter.rect_filled(rect, egui::CornerRadius::same(1), color);
         }
+        ToolButtonIcon::Terminate => {
+            painter.line_segment(
+                [
+                    pos2(center.x, center.y - 5.5),
+                    pos2(center.x, center.y + 0.3),
+                ],
+                stroke,
+            );
+            let points = (0..=16)
+                .map(|index| {
+                    let angle = -std::f32::consts::FRAC_PI_4
+                        + std::f32::consts::FRAC_PI_2 * 3.0 * index as f32 / 16.0;
+                    center + vec2(angle.cos(), angle.sin()) * 4.8
+                })
+                .collect();
+            painter.add(egui::Shape::line(points, stroke));
+        }
         ToolButtonIcon::Probe => {
             painter.circle_stroke(center, 4.8, Stroke::new(1.2, color));
             painter.line_segment(
@@ -15983,6 +17505,16 @@ fn paint_tool_button_icon(
                 );
             }
         }
+        ToolButtonIcon::ScrollBottom => {
+            paint_down_arrow(painter, center + vec2(0.0, -1.6), stroke);
+            painter.line_segment(
+                [
+                    pos2(center.x - 5.0, center.y + 5.0),
+                    pos2(center.x + 5.0, center.y + 5.0),
+                ],
+                stroke,
+            );
+        }
         ToolButtonIcon::Previous | ToolButtonIcon::Next => {
             let dir = if icon == ToolButtonIcon::Previous {
                 -1.0
@@ -16019,6 +17551,110 @@ fn paint_down_arrow(painter: &egui::Painter, center: egui::Pos2, stroke: Stroke)
             pos2(center.x + 3.4, center.y - 0.4),
         ],
         stroke,
+    );
+}
+
+const CODEX_AGENT_ICON_PNG: &[u8] = include_bytes!("../assets/agent-icons/codex.png");
+const CLAUDE_CODE_AGENT_ICON_PNG: &[u8] = include_bytes!("../assets/agent-icons/claude-code.png");
+const OPENCODE_DARK_AGENT_ICON_PNG: &[u8] =
+    include_bytes!("../assets/agent-icons/opencode-dark.png");
+const OPENCODE_LIGHT_AGENT_ICON_PNG: &[u8] =
+    include_bytes!("../assets/agent-icons/opencode-light.png");
+const AGENT_DRIVER_ICON_TEXTURE_SIZE: u32 = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentDriverIconAsset {
+    Codex,
+    ClaudeCode,
+    OpenCodeDark,
+    OpenCodeLight,
+}
+
+fn agent_driver_icon_asset(
+    driver: &watchapi_core::AgentDriver,
+    theme: GuiTheme,
+) -> Option<AgentDriverIconAsset> {
+    match (driver, theme) {
+        (watchapi_core::AgentDriver::Codex, _) => Some(AgentDriverIconAsset::Codex),
+        (watchapi_core::AgentDriver::ClaudeCode, _) => Some(AgentDriverIconAsset::ClaudeCode),
+        (watchapi_core::AgentDriver::OpenCode, GuiTheme::Dark) => {
+            Some(AgentDriverIconAsset::OpenCodeDark)
+        }
+        (watchapi_core::AgentDriver::OpenCode, GuiTheme::Light) => {
+            Some(AgentDriverIconAsset::OpenCodeLight)
+        }
+        (watchapi_core::AgentDriver::Generic, _) => None,
+    }
+}
+
+struct AgentDriverIconTextures {
+    codex: egui::TextureHandle,
+    claude_code: egui::TextureHandle,
+    opencode_dark: egui::TextureHandle,
+    opencode_light: egui::TextureHandle,
+}
+
+impl AgentDriverIconTextures {
+    fn load(ctx: &egui::Context) -> Self {
+        Self {
+            codex: load_embedded_agent_icon(ctx, "agent-icon-codex", CODEX_AGENT_ICON_PNG),
+            claude_code: load_embedded_agent_icon(
+                ctx,
+                "agent-icon-claude-code",
+                CLAUDE_CODE_AGENT_ICON_PNG,
+            ),
+            opencode_dark: load_embedded_agent_icon(
+                ctx,
+                "agent-icon-opencode-dark",
+                OPENCODE_DARK_AGENT_ICON_PNG,
+            ),
+            opencode_light: load_embedded_agent_icon(
+                ctx,
+                "agent-icon-opencode-light",
+                OPENCODE_LIGHT_AGENT_ICON_PNG,
+            ),
+        }
+    }
+
+    fn texture_id(
+        &self,
+        driver: &watchapi_core::AgentDriver,
+        theme: GuiTheme,
+    ) -> Option<egui::TextureId> {
+        match agent_driver_icon_asset(driver, theme)? {
+            AgentDriverIconAsset::Codex => Some(self.codex.id()),
+            AgentDriverIconAsset::ClaudeCode => Some(self.claude_code.id()),
+            AgentDriverIconAsset::OpenCodeDark => Some(self.opencode_dark.id()),
+            AgentDriverIconAsset::OpenCodeLight => Some(self.opencode_light.id()),
+        }
+    }
+}
+
+fn load_embedded_agent_icon(
+    ctx: &egui::Context,
+    name: &'static str,
+    png: &[u8],
+) -> egui::TextureHandle {
+    let rgba = image::load_from_memory(png)
+        .expect("embedded agent icon must be a valid image")
+        .into_rgba8();
+    let rgba = image::imageops::resize(
+        &rgba,
+        AGENT_DRIVER_ICON_TEXTURE_SIZE,
+        AGENT_DRIVER_ICON_TEXTURE_SIZE,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+    ctx.load_texture(name, image, egui::TextureOptions::LINEAR)
+}
+
+fn paint_agent_driver_icon_image(painter: &egui::Painter, rect: Rect, texture_id: egui::TextureId) {
+    painter.image(
+        texture_id,
+        rect,
+        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+        Color32::WHITE,
     );
 }
 
@@ -16929,6 +18565,329 @@ fn external_application_is_command_script(path: &Path) -> bool {
         })
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LaunchTemplateContext {
+    workspace: String,
+    config: String,
+    config_directory: String,
+    session: String,
+    app_directory: String,
+}
+
+fn external_application_template_help() -> &'static str {
+    "可用变量：{workspace}、{config}、{config_dir}、{session}、{app_dir}"
+}
+
+fn expand_argument_template(template: &str, context: &LaunchTemplateContext) -> Vec<String> {
+    split_shell_like_command(template)
+        .into_iter()
+        .map(|argument| expand_launch_template_token(&argument, context))
+        .collect()
+}
+
+fn expand_launch_template_token(token: &str, context: &LaunchTemplateContext) -> String {
+    token
+        .replace("{workspace}", &context.workspace)
+        .replace("{config}", &context.config)
+        .replace("{config_dir}", &context.config_directory)
+        .replace("{session}", &context.session)
+        .replace("{app_dir}", &context.app_directory)
+}
+
+fn agent_launch_profile_for_driver<'a>(
+    settings: &'a GuiAgentLaunchSettings,
+    driver: &str,
+) -> Option<&'a GuiAgentLaunchProfile> {
+    match driver.trim().to_ascii_lowercase().as_str() {
+        "codex" => Some(&settings.codex),
+        "claude-code" | "claude" => Some(&settings.claude),
+        "opencode" => Some(&settings.opencode),
+        _ => None,
+    }
+}
+
+fn full_access_argument_for_driver(driver: &str) -> Option<&'static str> {
+    match driver.trim().to_ascii_lowercase().as_str() {
+        "codex" => Some("--dangerously-bypass-approvals-and-sandbox"),
+        "claude-code" | "claude" => Some("--dangerously-skip-permissions"),
+        "opencode" => Some("--auto"),
+        _ => None,
+    }
+}
+
+fn build_agent_launch_command(
+    driver: &str,
+    profile: &GuiAgentLaunchProfile,
+    context: &LaunchTemplateContext,
+) -> Option<Vec<String>> {
+    let mut command = default_agent_command_for_driver(driver)?;
+    let configured_command = profile.command.trim().trim_matches('"').trim();
+    if !configured_command.is_empty() {
+        command[0] = expand_launch_template_token(configured_command, context);
+    }
+    let mut arguments = expand_argument_template(&profile.arguments, context);
+    if profile.full_access {
+        if let Some(full_access_argument) = full_access_argument_for_driver(driver) {
+            if !arguments
+                .iter()
+                .any(|argument| argument == full_access_argument)
+            {
+                arguments.insert(0, full_access_argument.to_string());
+            }
+        }
+    }
+    command.extend(arguments);
+    Some(command)
+}
+
+fn render_agent_launch_profile(
+    ui: &mut egui::Ui,
+    label: &str,
+    profile: &mut GuiAgentLaunchProfile,
+    command_hint: &str,
+) {
+    const LABEL_WIDTH: f32 = 82.0;
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [LABEL_WIDTH, 28.0],
+            egui::Label::new(RichText::new(label).strong()),
+        );
+        let full_access_width = 92.0;
+        let command_width =
+            (ui.available_width() - full_access_width - ui.spacing().item_spacing.x).max(140.0);
+        ui.add_sized(
+            [command_width, 28.0],
+            centered_singleline(&mut profile.command).hint_text(command_hint),
+        );
+        ui.checkbox(&mut profile.full_access, "完全权限");
+    });
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [LABEL_WIDTH, 28.0],
+            egui::Label::new(RichText::new("启动参数").small().color(muted())),
+        );
+        ui.add_sized(
+            [ui.available_width().max(140.0), 28.0],
+            centered_singleline(&mut profile.arguments).hint_text("参数模板"),
+        )
+        .on_hover_text(external_application_template_help());
+    });
+}
+
+fn classify_session_notification(
+    running: bool,
+    terminal_running: bool,
+    raw_status: &str,
+    display_status: &str,
+) -> SessionNotificationKind {
+    if config_runtime_status_is_error(running, terminal_running, raw_status) {
+        return SessionNotificationKind::Failed;
+    }
+    if display_status == "完成暂停" || raw_status == "已完成" || raw_status.starts_with("任务完成")
+    {
+        return SessionNotificationKind::Completed;
+    }
+    if status_requires_user_attention(raw_status) {
+        return SessionNotificationKind::NeedsAttention;
+    }
+    SessionNotificationKind::Normal
+}
+
+fn status_requires_user_attention(status: &str) -> bool {
+    [
+        "等待可输入",
+        "等待人工确认",
+        "等待审批",
+        "需要确认",
+        "需要处理",
+    ]
+    .iter()
+    .any(|marker| status.starts_with(marker) || status.contains(&format!("：{marker}")))
+}
+
+#[cfg(windows)]
+fn send_system_notification(title: &str, body: &str) -> std::io::Result<()> {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const TOAST_SCRIPT: &str = r#"
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+[Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+$template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+$nodes = $template.GetElementsByTagName('text')
+$nodes.Item(0).AppendChild($template.CreateTextNode($env:WATCHAPI_TOAST_TITLE)) | Out-Null
+$nodes.Item(1).AppendChild($template.CreateTextNode($env:WATCHAPI_TOAST_BODY)) | Out-Null
+$toast = [Windows.UI.Notifications.ToastNotification]::new($template)
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('WatchApi').Show($toast)
+"#;
+    let mut command = Command::new("powershell.exe");
+    command
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            TOAST_SCRIPT,
+        ])
+        .env("WATCHAPI_TOAST_TITLE", title)
+        .env("WATCHAPI_TOAST_BODY", body)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    command.spawn().map(|_| ())
+}
+
+#[cfg(not(windows))]
+fn send_system_notification(_title: &str, _body: &str) -> std::io::Result<()> {
+    Ok(())
+}
+
+impl AgentToolKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude",
+            Self::OpenCode => "OpenCode",
+        }
+    }
+
+    fn version_command(self) -> Vec<String> {
+        match self {
+            Self::Codex => default_agent_command_for_driver("codex")
+                .unwrap_or_else(|| vec!["codex".to_string()])
+                .into_iter()
+                .chain(["--version".to_string()])
+                .collect(),
+            Self::Claude => vec!["claude".to_string(), "--version".to_string()],
+            Self::OpenCode => vec!["opencode".to_string(), "--version".to_string()],
+        }
+    }
+
+    fn update_command(self) -> Vec<String> {
+        match self {
+            Self::Codex => default_agent_command_for_driver("codex")
+                .unwrap_or_else(|| vec!["codex".to_string()])
+                .into_iter()
+                .chain(["update".to_string()])
+                .collect(),
+            Self::Claude => vec!["claude".to_string(), "update".to_string()],
+            Self::OpenCode => vec!["opencode".to_string(), "upgrade".to_string()],
+        }
+    }
+}
+
+fn run_agent_tool_operation(
+    kind: AgentToolKind,
+    operation: AgentToolOperation,
+) -> Result<AgentToolCommandResult, String> {
+    match operation {
+        AgentToolOperation::CheckVersion => {
+            let output = run_agent_tool_command(&kind.version_command())?;
+            Ok(AgentToolCommandResult {
+                version: extract_agent_version(&output),
+                output,
+            })
+        }
+        AgentToolOperation::Update => {
+            let update_output = run_agent_tool_command(&kind.update_command())?;
+            let version_output = run_agent_tool_command(&kind.version_command())?;
+            Ok(AgentToolCommandResult {
+                version: extract_agent_version(&version_output),
+                output: format!("{update_output}\n\n{version_output}"),
+            })
+        }
+    }
+}
+
+fn run_agent_tool_command(command: &[String]) -> Result<String, String> {
+    let Some(program) = command.first() else {
+        return Err("命令为空".to_string());
+    };
+    #[cfg(windows)]
+    let mut process = {
+        let is_command_script = Path::new(program)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+            });
+        if is_command_script {
+            let mut process = Command::new("cmd.exe");
+            process.args(["/d", "/s", "/c"]).args(command);
+            process
+        } else {
+            let mut process = Command::new(program);
+            process.args(&command[1..]);
+            process
+        }
+    };
+    #[cfg(not(windows))]
+    let mut process = {
+        let mut process = Command::new(program);
+        process.args(&command[1..]);
+        process
+    };
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        process.creation_flags(CREATE_NO_WINDOW);
+    }
+    let display = format_command_for_display(command);
+    let output = process
+        .output()
+        .map_err(|err| format!("> {display}\n{err}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let mut detail = format!("> {display}");
+    if !stdout.is_empty() {
+        detail.push('\n');
+        detail.push_str(&stdout);
+    }
+    if !stderr.is_empty() {
+        detail.push('\n');
+        detail.push_str(&stderr);
+    }
+    if output.status.success() {
+        Ok(detail)
+    } else {
+        Err(format!(
+            "{detail}\n退出码：{}",
+            output
+                .status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "未知".to_string())
+        ))
+    }
+}
+
+fn format_command_for_display(command: &[String]) -> String {
+    command
+        .iter()
+        .map(|part| {
+            if part.contains(char::is_whitespace) {
+                format!("\"{}\"", part.replace('"', "\\\""))
+            } else {
+                part.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn extract_agent_version(output: &str) -> String {
+    output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('>'))
+        .unwrap_or("版本未知")
+        .to_string()
+}
+
 fn top_nav_button(text: impl Into<WidgetText>, selected: bool) -> egui::Button<'static> {
     let fill = if selected {
         md_button_active_fill()
@@ -17219,7 +19178,14 @@ fn session_candidates_for_config_data(
                 &store,
             )
         }
-        watchapi_core::AgentDriver::OpenCode | watchapi_core::AgentDriver::Generic => Vec::new(),
+        watchapi_core::AgentDriver::OpenCode => {
+            let index = opencode_session_index(
+                agent_command_parts(&config.agent_command),
+                config.agent_home.clone(),
+            );
+            index.ranked_candidates(&endpoint.workdir, &config_name, &config.agent_id, &store)
+        }
+        watchapi_core::AgentDriver::Generic => Vec::new(),
     }
 }
 
@@ -17247,7 +19213,50 @@ fn session_candidates_for_scan_context(
                 &store,
             )
         }
-        watchapi_core::AgentDriver::OpenCode | watchapi_core::AgentDriver::Generic => Vec::new(),
+        watchapi_core::AgentDriver::OpenCode => {
+            let index = opencode_session_index(context.agent_command, context.agent_home);
+            index.ranked_candidates(
+                &context.workdir,
+                &context.config_name,
+                &context.agent_id,
+                &store,
+            )
+        }
+        watchapi_core::AgentDriver::Generic => Vec::new(),
+    }
+}
+
+fn agent_command_parts(command: &AgentCommand) -> Vec<String> {
+    match command {
+        AgentCommand::Args(items) => items.clone(),
+        AgentCommand::Shell(text) => split_shell_like_command(text),
+    }
+}
+
+fn editor_agent_command_parts(value: Option<&Value>, driver: &str) -> Vec<String> {
+    let parts = match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Some(Value::String(text)) => split_shell_like_command(text),
+        _ => Vec::new(),
+    };
+    if parts.is_empty() {
+        default_agent_command_for_driver(driver).unwrap_or_default()
+    } else {
+        parts
+    }
+}
+
+fn opencode_session_index(command: Vec<String>, data_dir: Option<PathBuf>) -> OpenCodeSessionIndex {
+    let index = OpenCodeSessionIndex::new(command);
+    match data_dir {
+        Some(data_dir) => index.with_data_dir(data_dir),
+        None => index,
     }
 }
 
@@ -17268,6 +19277,60 @@ fn agent_driver_key(config: &AppConfig) -> String {
         watchapi_core::AgentDriver::Generic => "generic",
     }
     .to_string()
+}
+
+fn agent_driver_label(driver: &watchapi_core::AgentDriver) -> &'static str {
+    match driver {
+        watchapi_core::AgentDriver::Codex => "Codex",
+        watchapi_core::AgentDriver::ClaudeCode => "Claude",
+        watchapi_core::AgentDriver::OpenCode => "OpenCode",
+        watchapi_core::AgentDriver::Generic => "Generic",
+    }
+}
+
+fn load_agent_driver_for_path(path: &Path) -> watchapi_core::AgentDriver {
+    if let Some(driver) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| agent_driver_from_config_json(&value))
+    {
+        return driver;
+    }
+    AppConfig::load(path)
+        .map(|config| config.agent_driver)
+        .unwrap_or(watchapi_core::AgentDriver::Codex)
+}
+
+fn agent_driver_from_config_json(value: &Value) -> Option<watchapi_core::AgentDriver> {
+    if let Some(driver) = value.get("agent_driver").and_then(Value::as_str) {
+        return Some(session_scan_agent_driver(driver));
+    }
+
+    for key in ["agent_command", "codex_command"] {
+        let Some(command) = value.get(key) else {
+            continue;
+        };
+        let parts = match command {
+            Value::String(text) => split_shell_like_command(text),
+            Value::Array(items) => items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let command_text = parts.join(" ").to_ascii_lowercase();
+        if command_text.contains("claude") {
+            return Some(watchapi_core::AgentDriver::ClaudeCode);
+        }
+        if command_text.contains("opencode") || command_text.contains("open-code") {
+            return Some(watchapi_core::AgentDriver::OpenCode);
+        }
+        if command_text.contains("codex") {
+            return Some(watchapi_core::AgentDriver::Codex);
+        }
+    }
+    None
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -18078,7 +20141,7 @@ const GLOBAL_AGENT_FIELDS: &[GlobalFieldSpec] = &[
 const GLOBAL_CODEX_FIELDS: &[GlobalFieldSpec] = &[GlobalFieldSpec {
     key: "codex_model_context_window",
     label: "上下文长度",
-    hint: "写入 Codex 的 model_context_window；留空时使用模型默认上下文窗口。",
+    hint: "写入 Codex 的 model_context_window，并作为 OpenCode 自定义模型上下文；留空时使用 Agent 默认值。",
 }];
 
 const GLOBAL_PROBE_FIELDS: &[GlobalFieldSpec] = &[
@@ -18116,7 +20179,7 @@ const GLOBAL_FIELD_GROUPS: &[GlobalFieldGroup] = &[
         fields: GLOBAL_AGENT_FIELDS,
     },
     GlobalFieldGroup {
-        title: "Codex",
+        title: "Codex / OpenCode",
         fields: GLOBAL_CODEX_FIELDS,
     },
     GlobalFieldGroup {
@@ -18139,7 +20202,7 @@ const WORKSPACE_DEFAULT_FIELD_GROUPS: &[GlobalFieldGroup] = &[
         fields: GLOBAL_POLLUTION_FIELDS,
     },
     GlobalFieldGroup {
-        title: "Codex",
+        title: "Codex / OpenCode",
         fields: GLOBAL_CODEX_FIELDS,
     },
     GlobalFieldGroup {
@@ -18444,11 +20507,18 @@ fn paths_equal_ignore_case(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn sync_editor_runtime_identity(editor_json: &mut Value, workspace_path: &Path) {
+fn sync_editor_runtime_identity(
+    editor_json: &mut Value,
+    workspace_path: &Path,
+    creating_new_config: bool,
+) {
     let driver = value_to_string(editor_json.get("agent_driver")).if_empty("codex");
     let name = value_to_string(editor_json.get("config_name")).if_empty("新配置");
     editor_json["workdir"] = json!(workspace_path.to_string_lossy().to_string());
-    editor_json["agent_id"] = json!(generated_agent_id(&driver, &name));
+    let current_agent_id = value_to_string(editor_json.get("agent_id"));
+    if creating_new_config || current_agent_id.trim().is_empty() {
+        editor_json["agent_id"] = json!(generated_agent_id(&driver, &name));
+    }
 }
 
 fn unique_hosted_config_path(workspace_dir: &Path, source_name: &str) -> PathBuf {
@@ -18744,6 +20814,145 @@ fn home_dir() -> PathBuf {
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+const CODEX_REPAIR_PYTHON_SCRIPT: &str = r#"
+import os
+import shutil
+import sqlite3
+import time
+from pathlib import Path
+
+home = Path(os.environ["WATCHAPI_CODEX_HOME"]).expanduser()
+db_path = home / "state_5.sqlite"
+if not db_path.is_file():
+    print(f"未找到 {db_path}，无需修复")
+    raise SystemExit(0)
+
+backup_dir = home / "db-backups"
+backup_dir.mkdir(parents=True, exist_ok=True)
+backup_path = backup_dir / f"state_5-fix-{time.time_ns()}.sqlite"
+shutil.copy2(db_path, backup_path)
+print(f"已备份数据库 -> {backup_path}")
+
+conn = sqlite3.connect(str(db_path), timeout=30)
+try:
+    rows = conn.execute(
+        "SELECT id,status,last_watermark,last_success_at,updated_at "
+        "FROM backfill_state"
+    ).fetchall()
+    if not rows:
+        print("backfill_state 表为空，无需修复")
+    else:
+        print(f"修复前：{rows}")
+        conn.execute(
+            "UPDATE backfill_state SET status='complete', updated_at=? WHERE id=1",
+            (int(time.time()),),
+        )
+        conn.commit()
+        fixed = conn.execute(
+            "SELECT id,status,last_watermark,last_success_at,updated_at "
+            "FROM backfill_state"
+        ).fetchall()
+        print(f"修复后：{fixed}")
+finally:
+    conn.close()
+"#;
+
+fn resolve_codex_home_path(input: &str) -> PathBuf {
+    let text = input.trim();
+    if text.is_empty() {
+        return PathBuf::new();
+    }
+    if text == "~" {
+        return home_dir();
+    }
+    if text == ".codex" || text.starts_with(".codex\\") || text.starts_with(".codex/") {
+        return home_dir().join(text);
+    }
+    if let Some(relative) = text.strip_prefix("~/").or_else(|| text.strip_prefix("~\\")) {
+        return home_dir().join(relative);
+    }
+    PathBuf::from(text)
+}
+
+fn hide_child_window(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
+fn stop_codex_processes_for_repair() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("powershell.exe");
+        hide_child_window(&mut command);
+        let output = command
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$ErrorActionPreference='Stop'; $procs=@(Get-Process | Where-Object { $_.ProcessName -match '^codex' }); if ($procs.Count -gt 0) { $procs | Stop-Process -Force }; Start-Sleep -Seconds 2",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|err| format!("关闭 Codex 进程失败：{err}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "关闭 Codex 进程失败：{}",
+                child_output_text(&output)
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn child_output_text(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => format!("进程退出码 {}", output.status),
+        (false, true) => stdout,
+        (true, false) => stderr,
+        (false, false) => format!("{stdout}\n{stderr}"),
+    }
+}
+
+fn repair_codex_state_database(home: PathBuf) -> Result<String, String> {
+    let db_path = home.join("state_5.sqlite");
+    if !db_path.is_file() {
+        return Ok(format!("未找到 {}，无需修复", db_path.display()));
+    }
+    stop_codex_processes_for_repair()?;
+
+    let candidates = [("python", Vec::<&str>::new()), ("py", vec!["-3"])];
+    for (executable, prefix_args) in candidates {
+        let mut command = Command::new(executable);
+        hide_child_window(&mut command);
+        let output = match command
+            .args(prefix_args)
+            .arg("-c")
+            .arg(CODEX_REPAIR_PYTHON_SCRIPT)
+            .env("WATCHAPI_CODEX_HOME", &home)
+            .env("PYTHONIOENCODING", "utf-8")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+        {
+            Ok(output) => output,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(format!("启动 {executable} 失败：{err}")),
+        };
+        if output.status.success() {
+            return Ok(child_output_text(&output));
+        }
+        return Err(format!("Python 修复失败：{}", child_output_text(&output)));
+    }
+    Err("未找到 Python，请安装 Python 3 后重试".to_string())
 }
 
 fn load_json_or_default(path: &Path) -> Value {
@@ -20936,7 +23145,9 @@ mod tests {
         app.system_settings_external_apps = vec![GuiExternalApplication {
             name: "Helper".to_string(),
             path: app_path.clone(),
+            arguments: "--project {workspace}".to_string(),
         }];
+        app.system_settings_notifications.enabled = false;
 
         app.save_system_settings();
 
@@ -20948,6 +23159,8 @@ mod tests {
         assert_eq!(loaded.external_apps.len(), 1);
         assert_eq!(loaded.external_apps[0].name, "Helper");
         assert_eq!(loaded.external_apps[0].path, app_path);
+        assert_eq!(loaded.external_apps[0].arguments, "--project {workspace}");
+        assert!(!loaded.notifications.enabled);
     }
 
     #[test]
@@ -20986,6 +23199,104 @@ mod tests {
             "executables should remain detached from the GUI"
         );
         assert!(!launch_block.contains("CREATE_NO_WINDOW"));
+    }
+
+    #[test]
+    fn launch_argument_templates_preserve_each_expanded_value_as_one_argument() {
+        let context = LaunchTemplateContext {
+            workspace: r"C:\Work Trees\Demo".to_string(),
+            config: r"C:\Configs\main.json".to_string(),
+            config_directory: r"C:\Configs".to_string(),
+            session: r"C:\Sessions\rollout.jsonl".to_string(),
+            app_directory: r"C:\Program Files\Helper".to_string(),
+        };
+
+        let arguments = expand_argument_template(
+            r#"--project {workspace} --config "{config}" --session={session} --root {app_dir}"#,
+            &context,
+        );
+
+        assert_eq!(
+            arguments,
+            vec![
+                "--project",
+                r"C:\Work Trees\Demo",
+                "--config",
+                r"C:\Configs\main.json",
+                r"--session=C:\Sessions\rollout.jsonl",
+                "--root",
+                r"C:\Program Files\Helper",
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_launch_full_access_flags_match_each_cli() {
+        let settings = GuiAgentLaunchSettings::default();
+        let context = LaunchTemplateContext::default();
+        for (driver, profile, expected) in [
+            (
+                "codex",
+                &settings.codex,
+                "--dangerously-bypass-approvals-and-sandbox",
+            ),
+            (
+                "claude-code",
+                &settings.claude,
+                "--dangerously-skip-permissions",
+            ),
+            ("opencode", &settings.opencode, "--auto"),
+        ] {
+            assert!(profile.full_access);
+            let command = build_agent_launch_command(driver, profile, &context).unwrap();
+            assert!(command.iter().any(|argument| argument == expected));
+            assert_eq!(
+                command
+                    .iter()
+                    .filter(|argument| argument.as_str() == expected)
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn notification_classification_distinguishes_completion_failure_and_attention() {
+        assert_eq!(
+            classify_session_notification(true, true, "等待可输入：需要确认", "运行中"),
+            SessionNotificationKind::NeedsAttention
+        );
+        assert_eq!(
+            classify_session_notification(true, true, "运行中", "完成暂停"),
+            SessionNotificationKind::Completed
+        );
+        assert_eq!(
+            classify_session_notification(false, false, "启动 Agent 失败：missing", "异常"),
+            SessionNotificationKind::Failed
+        );
+        assert_eq!(
+            classify_session_notification(true, true, "运行中", "运行中"),
+            SessionNotificationKind::Normal
+        );
+    }
+
+    #[test]
+    fn agent_update_tool_uses_native_cli_update_commands() {
+        assert_eq!(
+            AgentToolKind::Codex.update_command().last().unwrap(),
+            "update"
+        );
+        assert_eq!(
+            AgentToolKind::Claude.update_command(),
+            vec!["claude", "update"]
+        );
+        assert_eq!(
+            AgentToolKind::OpenCode.update_command(),
+            vec!["opencode", "upgrade"]
+        );
+        for kind in AGENT_TOOL_KINDS {
+            assert_eq!(kind.version_command().last().unwrap(), "--version");
+        }
     }
 
     #[test]
@@ -21658,10 +23969,21 @@ mod tests {
             "停止态操作列必须有图标编辑按钮，并打开当前行编辑弹窗"
         );
         assert!(
+            stopped_row_block.contains("直接启动 Agent（跳过探测）")
+                && stopped_row_block.contains("self.force_start_agent_on_endpoint(&endpoint_name)"),
+            "停止态操作列必须提供跳过探测的直接启动按钮"
+        );
+        assert!(
             runtime_row_block.contains("circular_edit_button(ui, \"编辑接口\")")
                 && runtime_row_block.contains("self.open_endpoint_editor(&endpoint_name)"),
             "运行态操作列必须有图标编辑按钮，并打开当前行编辑弹窗"
         );
+        assert!(
+            runtime_row_block.contains("直接启动 Agent（跳过探测）")
+                && runtime_row_block.contains("self.force_start_agent_on_endpoint(&endpoint_name)"),
+            "运行态操作列必须提供跳过探测的直接启动按钮"
+        );
+        assert!(source.contains("ForceStartEndpoint(String)"));
         assert!(
             dialog_block.contains("\"保护层配置\"")
                 && dialog_block.contains("render_endpoint_ref_guard_proxy_block"),
@@ -21845,15 +24167,34 @@ mod tests {
             .contains("self.render_terminal_workbench_toggle(ui, terminal_rect, terminal_id);"));
         assert!(
             toggle.contains("egui::Order::Foreground")
-                && toggle.contains("terminal_rect.left()")
+                && toggle.contains("let scrollbar_left =")
+                && toggle.contains("let controls_right = scrollbar_left")
                 && toggle.contains("terminal_rect.bottom()")
                 && toggle.contains(
                     "self.terminal_workbench_expanded = !self.terminal_workbench_expanded"
                 ),
-            "小全屏按钮应覆盖在终端左下角并切换展开状态"
+            "小全屏按钮应覆盖在终端右下角、滚动条左侧并切换展开状态"
         );
         assert!(source.contains("ToolButtonIcon::Expand"));
         assert!(source.contains("ToolButtonIcon::Collapse"));
+    }
+
+    #[test]
+    fn terminal_overlay_controls_are_right_aligned_before_scrollbar_and_can_scroll_bottom() {
+        let source = include_str!("app.rs");
+        let toggle = source
+            .split("fn render_terminal_workbench_toggle")
+            .nth(1)
+            .and_then(|tail| tail.split("fn render_pty_terminal_output").next())
+            .expect("terminal overlay controls should be discoverable");
+
+        assert!(toggle.contains("TERMINAL_SCROLLBAR_RIGHT_INSET"));
+        assert!(toggle.contains("TERMINAL_SCROLLBAR_WIDTH"));
+        assert!(toggle.contains("let controls_right = scrollbar_left"));
+        assert!(toggle.contains("let button_pos = pos2(\n            controls_left,"));
+        assert!(toggle.contains("ToolButtonIcon::ScrollBottom"));
+        assert!(toggle.contains("self.scroll_terminal_bottom();"));
+        assert!(source.contains("ToolButtonIcon::ScrollBottom =>"));
     }
 
     #[test]
@@ -21924,7 +24265,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_run_controls_do_not_expose_stop_actions() {
+    fn runtime_controls_expose_hard_terminate_separately_from_task_interrupt() {
         let source = include_str!("app.rs");
         let top_menu = source
             .split("fn render_top_menu")
@@ -21943,8 +24284,11 @@ mod tests {
         assert!(!top_menu.contains("self.restart_running_configs();"));
         assert!(!action_buttons.contains("egui::Button::new(\"停止\")"));
         assert!(!action_buttons.contains("self.stop_runtime();"));
+        assert!(action_buttons.contains("ToolButtonIcon::Terminate"));
+        assert!(action_buttons.contains("self.terminate_current_agent();"));
         assert!(action_buttons.contains("ToolButtonIcon::Refresh"));
         assert!(action_buttons.contains("ToolButtonIcon::Stop"));
+        assert!(action_buttons.contains("self.interrupt_current_terminal_task();"));
         assert!(action_buttons.contains("runtime_switch("));
     }
 
@@ -21970,6 +24314,8 @@ mod tests {
             "启动/重启控制应放在当前配置标题行右侧，并在按钮前显示运行计时"
         );
         assert!(action_buttons.contains("runtime_switch("));
+        assert!(action_buttons.contains("ToolButtonIcon::Terminate"));
+        assert!(action_buttons.contains("self.terminate_current_agent();"));
         assert!(action_buttons.contains("ToolButtonIcon::Refresh"));
         assert!(action_buttons.contains("self.restart_current_agent();"));
         assert!(action_buttons.contains("ToolButtonIcon::Stop"));
@@ -21977,13 +24323,15 @@ mod tests {
         assert!(action_buttons.contains("ToolButtonIcon::Probe"));
         assert!(action_buttons.contains("self.force_full_probe_current_runtime();"));
         assert!(
-            action_buttons.find("self.restart_current_agent();")
+            action_buttons.find("self.terminate_current_agent();")
+                < action_buttons.find("self.restart_current_agent();")
+                && action_buttons.find("self.restart_current_agent();")
                 < action_buttons.find("self.interrupt_current_terminal_task();")
                 && action_buttons.find("self.interrupt_current_terminal_task();")
                     < action_buttons.find("self.force_full_probe_current_runtime();")
                 && action_buttons.find("self.force_full_probe_current_runtime();")
                     < action_buttons.find("runtime_switch("),
-            "停止当前任务按钮应放在重启按钮右侧，强制重新探测按钮应放在停止按钮右侧、自动/Goal 开关左侧"
+            "右到左布局中，终止 Agent 应追加到现有三个圆形按钮最右侧，同时保留重启、Esc 中断和重新探测"
         );
         assert!(!action_buttons.contains("egui::Button::new(\"\\u{21bb}\")"));
         assert!(!action_buttons.contains("egui::Button::new(\"重启\")"));
@@ -22070,7 +24418,7 @@ mod tests {
             .and_then(|tail| tail.split("#[derive(Debug, Clone, PartialEq, Eq)]").next())
             .expect("session restore block should be discoverable");
         let start_block = source
-            .split("fn start_runtime_with_restart_reset")
+            .split("fn start_runtime_with_restart_reset_and_options")
             .nth(1)
             .and_then(|tail| tail.split("fn stop_runtime").next())
             .expect("start runtime block should be discoverable");
@@ -22150,7 +24498,7 @@ mod tests {
         let helper = source
             .split("fn interrupt_current_terminal_task")
             .nth(1)
-            .and_then(|tail| tail.split("fn force_full_probe_current_runtime").next())
+            .and_then(|tail| tail.split("fn terminate_current_agent").next())
             .expect("interrupt current task helper should be discoverable");
 
         assert!(
@@ -22168,6 +24516,46 @@ mod tests {
         );
         assert!(!helper.contains("RuntimeCommand::Stop"));
         assert!(!helper.contains("RestartAgent"));
+    }
+
+    #[test]
+    fn hard_terminate_pauses_continuation_cancels_restart_and_restores_stopped_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        update_control_state(
+            &config_path,
+            &[
+                ("auto_paused", json!(false)),
+                ("trigger_now", json!(true)),
+                ("completion_pause_detected", json!(true)),
+            ],
+        )
+        .unwrap();
+        let mut app = WatchApiApp::new(Some(String::new()));
+        app.registry = GuiConfigRegistry::new(temp.path().join(".watchapi-gui.json"));
+        app.config_path = config_path.to_string_lossy().into_owned();
+        app.running = true;
+        app.terminal_running = true;
+        app.runtime_started_at = Some(Instant::now());
+        app.terminal_output = "old terminal output".to_string();
+        let key = session_key_for_path(&config_path);
+        app.auto_restart_due
+            .insert(key.clone(), Instant::now() + Duration::from_secs(5));
+        app.auto_restart_attempts.insert(key.clone(), 2);
+
+        app.terminate_current_agent();
+
+        let state = read_control_state(&config_path);
+        assert_eq!(state["auto_paused"], true);
+        assert_eq!(state["trigger_now"], false);
+        assert_eq!(state["completion_pause_detected"], false);
+        assert!(!app.running);
+        assert!(!app.terminal_running);
+        assert!(app.runtime_started_at.is_none());
+        assert!(app.terminal_output.is_empty());
+        assert!(!app.auto_restart_due.contains_key(&key));
+        assert!(!app.auto_restart_attempts.contains_key(&key));
+        assert_eq!(app.status, "已强制终止 Agent，当前配置已停止，等待重新开启");
     }
 
     #[test]
@@ -22207,6 +24595,31 @@ mod tests {
             menu_block.contains("self.select_config_path(path.to_path_buf(), false);"),
             "右键菜单只应切换上下文，不能隐式启动该配置"
         );
+    }
+
+    #[test]
+    fn config_context_menu_forks_conversation_into_a_new_config() {
+        let source = include_str!("app.rs");
+        let config_row = source
+            .split("fn render_config_tree_row")
+            .nth(1)
+            .and_then(|tail| tail.split("fn render_config_picker").next())
+            .expect("config row renderer should be discoverable");
+        let helper = source
+            .split("fn fork_conversation_for_config")
+            .nth(1)
+            .and_then(|tail| tail.split("fn resolve_current_agent_fork_source").next())
+            .expect("fork helper should be discoverable");
+
+        assert!(config_row.contains("ui.button(\"分叉会话\")"));
+        assert!(config_row.contains("self.fork_conversation_for_config(path.to_path_buf())"));
+        assert!(helper.contains("cloned[\"config_name\"]"));
+        assert!(helper.contains("cloned[\"agent_id\"]"));
+        assert!(helper.contains("self.select_config_path(target, false);"));
+        assert!(helper.contains("AgentDriver::Generic"));
+        assert!(helper
+            .contains("self.start_runtime_with_restart_reset_and_fork(true, Some(fork_source));"));
+        assert!(!helper.contains("clear_session_bindings_for_config_path"));
     }
 
     #[test]
@@ -22401,7 +24814,7 @@ mod tests {
     fn starting_config_pauses_auto_continuation_unless_autostart_enabled() {
         let source = include_str!("app.rs");
         let start_block = source
-            .split("fn start_runtime_with_restart_reset")
+            .split("fn start_runtime_with_restart_reset_and_options")
             .nth(1)
             .and_then(|tail| tail.split("fn session_binding_required").next())
             .expect("start runtime block should be discoverable");
@@ -22819,6 +25232,91 @@ mod tests {
     }
 
     #[test]
+    fn config_tree_agent_driver_icons_are_mapped_to_brand_assets() {
+        assert_eq!(
+            agent_driver_icon_asset(&watchapi_core::AgentDriver::Codex, GuiTheme::Dark),
+            Some(AgentDriverIconAsset::Codex)
+        );
+        assert_eq!(
+            agent_driver_icon_asset(&watchapi_core::AgentDriver::ClaudeCode, GuiTheme::Dark),
+            Some(AgentDriverIconAsset::ClaudeCode)
+        );
+        assert_eq!(
+            agent_driver_icon_asset(&watchapi_core::AgentDriver::OpenCode, GuiTheme::Dark),
+            Some(AgentDriverIconAsset::OpenCodeDark)
+        );
+        assert_eq!(
+            agent_driver_icon_asset(&watchapi_core::AgentDriver::OpenCode, GuiTheme::Light),
+            Some(AgentDriverIconAsset::OpenCodeLight)
+        );
+        assert_eq!(
+            agent_driver_icon_asset(&watchapi_core::AgentDriver::Generic, GuiTheme::Dark),
+            None
+        );
+    }
+
+    #[test]
+    fn embedded_agent_driver_icons_are_valid_square_pngs() {
+        for png in [
+            CODEX_AGENT_ICON_PNG,
+            CLAUDE_CODE_AGENT_ICON_PNG,
+            OPENCODE_DARK_AGENT_ICON_PNG,
+            OPENCODE_LIGHT_AGENT_ICON_PNG,
+        ] {
+            let icon = image::load_from_memory(png).expect("brand icon should decode");
+            assert_eq!(icon.width(), 640);
+            assert_eq!(icon.height(), 640);
+        }
+    }
+
+    #[test]
+    fn config_tree_driver_detection_supports_explicit_and_legacy_commands() {
+        assert_eq!(
+            agent_driver_from_config_json(&json!({"agent_driver": "claude-code"})),
+            Some(watchapi_core::AgentDriver::ClaudeCode)
+        );
+        assert_eq!(
+            agent_driver_from_config_json(&json!({"agent_driver": "opencode"})),
+            Some(watchapi_core::AgentDriver::OpenCode)
+        );
+        assert_eq!(
+            agent_driver_from_config_json(&json!({"agent_command": ["opencode", "--continue"]})),
+            Some(watchapi_core::AgentDriver::OpenCode)
+        );
+        assert_eq!(
+            agent_driver_from_config_json(
+                &json!({"codex_command": "claude --dangerously-skip-permissions"})
+            ),
+            Some(watchapi_core::AgentDriver::ClaudeCode)
+        );
+    }
+
+    #[test]
+    fn config_tree_row_paints_driver_icon_before_name() {
+        let source = include_str!("app.rs");
+        let config_row = source
+            .split("fn render_config_tree_row")
+            .nth(1)
+            .and_then(|tail| tail.split("fn render_config_picker").next())
+            .expect("config tree row renderer should be discoverable");
+
+        assert!(config_row.contains("self.agent_driver_for_config_path(path)"));
+        assert!(
+            config_row.contains("paint_agent_driver_icon_image(&painter, icon_rect, texture_id)")
+        );
+        assert!(config_row.contains("let name_x = label_x + CONFIG_TREE_AGENT_ICON_SIZE"));
+        assert!(source.contains("const CONFIG_TREE_AGENT_ICON_SIZE: f32 = 14.0;"));
+        let icon_painter = source
+            .split("fn paint_agent_driver_icon_image")
+            .nth(1)
+            .and_then(|tail| tail.split("fn paint_config_tree_connector").next())
+            .expect("brand icon image painter should be discoverable");
+        assert!(icon_painter.contains("painter.image("));
+        assert!(!icon_painter.contains("line_segment"));
+        assert!(!icon_painter.contains("circle_filled"));
+    }
+
+    #[test]
     fn workspace_defaults_editor_and_inherit_button_are_discoverable() {
         let source = include_str!("app.rs");
         let workspace_row = source
@@ -22848,6 +25346,67 @@ mod tests {
                 && config_editor.contains("self.apply_current_workspace_defaults_to_editor()"),
             "配置编辑器应提供手动继承工作区参数的按钮"
         );
+    }
+
+    #[test]
+    fn workspace_context_menu_opens_an_independent_terminal_in_its_directory() {
+        let source = include_str!("app.rs");
+        let workspace_row = source
+            .split("fn render_workspace_row")
+            .nth(1)
+            .and_then(|tail| tail.split("fn select_workspace_row").next())
+            .expect("workspace row renderer should be discoverable");
+        let terminal_helper = source
+            .split("fn open_terminal_in_directory_with_command")
+            .nth(1)
+            .and_then(|tail| tail.split("fn start_autostart_configs").next())
+            .expect("workspace terminal helper should be discoverable");
+
+        assert!(workspace_row.contains("ui.button(\"在此处打开终端\")"));
+        assert!(workspace_row.contains("self.open_terminal_in_directory(&workspace.path);"));
+        assert!(terminal_helper.contains("Command::new(\"wt.exe\")"));
+        assert!(terminal_helper.contains("windows_terminal.arg(\"-d\").arg(&directory);"));
+        assert!(terminal_helper.contains("Command::new(\"cmd.exe\")"));
+        assert!(terminal_helper.contains("command_prompt.current_dir(&directory);"));
+        assert!(terminal_helper.contains("CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP"));
+    }
+
+    #[test]
+    fn workspace_context_menu_has_agent_submenu_for_supported_clis() {
+        let source = include_str!("app.rs");
+        let workspace_row = source
+            .split("fn render_workspace_row")
+            .nth(1)
+            .and_then(|tail| tail.split("fn select_workspace_row").next())
+            .expect("workspace row renderer should be discoverable");
+        let agent_helper = source
+            .split("fn open_agent_in_directory")
+            .nth(1)
+            .and_then(|tail| tail.split("fn start_autostart_configs").next())
+            .expect("workspace agent helper should be discoverable");
+        let command_builder = source
+            .split("fn build_agent_launch_command")
+            .nth(1)
+            .and_then(|tail| tail.split("fn render_agent_launch_profile").next())
+            .expect("agent launch command builder should be discoverable");
+
+        assert!(workspace_row.contains("ui.menu_button(\"Agent\""));
+        assert!(workspace_row.contains("ui.button(\"Codex\")"));
+        assert!(workspace_row.contains("ui.button(\"OpenCode\")"));
+        assert!(workspace_row.contains("ui.button(\"Claude\")"));
+        assert!(workspace_row.contains("self.open_agent_in_directory(&workspace.path, \"codex\")"));
+        assert!(
+            workspace_row.contains("self.open_agent_in_directory(&workspace.path, \"opencode\")")
+        );
+        assert!(workspace_row
+            .contains("self.open_agent_in_directory(&workspace.path, \"claude-code\")"));
+        assert!(agent_helper.contains("build_agent_launch_command(driver, &profile, &context)"));
+        assert!(command_builder.contains("default_agent_command_for_driver(driver)?"));
+        assert!(command_builder.contains("full_access_argument_for_driver(driver)"));
+        assert!(command_builder.contains("arguments.insert(0, full_access_argument.to_string())"));
+        assert!(agent_helper.contains("windows_terminal.args([\"cmd.exe\", \"/d\", \"/k\"])"));
+        assert!(agent_helper.contains("windows_terminal.args(agent_command)"));
+        assert!(agent_helper.contains("command_prompt.args(agent_command)"));
     }
 
     #[test]
@@ -25573,9 +28132,9 @@ mod tests {
     fn start_runtime_rebuilds_runtime_from_current_config() {
         let source = include_str!("app.rs");
         let block = source
-            .split("fn start_runtime_with_restart_reset")
+            .split("fn start_runtime_with_restart_reset_and_options")
             .nth(1)
-            .and_then(|tail| tail.split("let handle = thread::spawn").next())
+            .and_then(|tail| tail.split("fn session_binding_required").next())
             .expect("start_runtime_with_restart_reset pre-probe block should be discoverable");
 
         assert!(
@@ -31756,6 +34315,7 @@ mod tests {
         .unwrap();
         let context = SessionCandidateScanContext {
             driver: watchapi_core::AgentDriver::Codex,
+            agent_command: vec!["codex".to_string()],
             codex_home,
             additional_codex_homes: Vec::new(),
             agent_home: None,
@@ -31803,6 +34363,7 @@ mod tests {
         .unwrap();
         let context = SessionCandidateScanContext {
             driver: watchapi_core::AgentDriver::Codex,
+            agent_command: vec!["codex".to_string()],
             codex_home,
             additional_codex_homes: vec![historical_home],
             agent_home: None,
@@ -32006,13 +34567,29 @@ mod tests {
         editor_json["workdir"] = json!("old");
         editor_json["agent_id"] = json!("old-agent");
 
-        sync_editor_runtime_identity(&mut editor_json, &workspace);
+        sync_editor_runtime_identity(&mut editor_json, &workspace, true);
 
         assert_eq!(
             editor_json["workdir"],
             json!(workspace.to_string_lossy().to_string())
         );
         assert_eq!(editor_json["agent_id"], json!("claude-code-主_配置_一"));
+    }
+
+    #[test]
+    fn editor_save_preserves_existing_agent_id_when_config_name_changes() {
+        let workspace = PathBuf::from(r"D:\Workspaces\ExampleProject");
+        let mut editor_json = default_config_data();
+        editor_json["config_name"] = json!("改名后配置");
+        editor_json["agent_id"] = json!("codex-改名前配置");
+
+        sync_editor_runtime_identity(&mut editor_json, &workspace, false);
+
+        assert_eq!(editor_json["agent_id"], json!("codex-改名前配置"));
+        assert_eq!(
+            editor_json["workdir"],
+            json!(workspace.to_string_lossy().to_string())
+        );
     }
 
     #[test]
@@ -32535,6 +35112,38 @@ mod tests {
             !block.contains("self.current_config_display_name()"),
             "当前配置卡片右上角不应再显示配置名小字，避免和状态行重复"
         );
+    }
+
+    #[test]
+    fn tools_page_exposes_codex_repair_tool() {
+        let source = include_str!("app.rs");
+        let nav = source
+            .split("fn render_main_nav_segment")
+            .nth(1)
+            .and_then(|tail| tail.split("fn render_run_page").next())
+            .expect("main navigation block should be discoverable");
+        let tools = source
+            .split("fn render_tools_page")
+            .nth(1)
+            .and_then(|tail| tail.split("fn render_proxy_list").next())
+            .expect("tools page block should be discoverable");
+        assert!(nav.contains("label: \"工具\""));
+        assert!(nav.contains("MainPage::Tools"));
+        assert!(tools.contains("ToolPage::CodexRepair"));
+        assert!(tools.contains("self.start_codex_repair()"));
+        assert!(tools.contains("codex_repair_home"));
+    }
+
+    #[test]
+    fn codex_repair_path_resolves_dot_codex_under_home() {
+        assert_eq!(resolve_codex_home_path(".codex"), home_dir().join(".codex"));
+        assert_eq!(
+            resolve_codex_home_path("~/.codex"),
+            home_dir().join(".codex")
+        );
+        assert!(resolve_codex_home_path(" ").as_os_str().is_empty());
+        assert!(CODEX_REPAIR_PYTHON_SCRIPT.contains("status='complete'"));
+        assert!(CODEX_REPAIR_PYTHON_SCRIPT.contains("state_5-fix-"));
     }
 
     #[cfg(windows)]
