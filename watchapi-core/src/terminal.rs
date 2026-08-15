@@ -448,6 +448,51 @@ impl TerminalSession {
         self.write_input(&text, source)
     }
 
+    pub fn send_pasted_prompt(
+        &self,
+        prompt: &str,
+        submit_sequence: &str,
+        submit_delay: Duration,
+        source: InputSource,
+    ) -> Result<(), TerminalError> {
+        let user_input_active = self.user_input_active.lock();
+        if source == InputSource::Auto && *user_input_active {
+            return Err(TerminalError::UserInputActive);
+        }
+
+        let normalized = terminal_bracketed_paste_text(prompt.trim_end());
+        let body = if self.emulator.lock().modes().bracketed_paste {
+            format!("\x1b[200~{normalized}\x1b[201~")
+        } else {
+            normalized
+        };
+        let submit = submit_sequence_text(submit_sequence);
+        match &self.backend {
+            TerminalBackend::Pty { writer, .. } => {
+                let mut writer = writer.lock();
+                writer
+                    .write_all(body.as_bytes())
+                    .map_err(|err| TerminalError::Pty(err.to_string()))?;
+                writer
+                    .flush()
+                    .map_err(|err| TerminalError::Pty(err.to_string()))?;
+                if !submit_delay.is_zero() {
+                    thread::sleep(submit_delay);
+                }
+                writer
+                    .write_all(submit.as_bytes())
+                    .map_err(|err| TerminalError::Pty(err.to_string()))?;
+                writer
+                    .flush()
+                    .map_err(|err| TerminalError::Pty(err.to_string()))?;
+            }
+        }
+        drop(user_input_active);
+        *self.last_activity_at.lock() = Instant::now();
+        wake_terminal_activity(&self.activity_wakeup);
+        Ok(())
+    }
+
     pub fn is_running(&self) -> bool {
         match &self.backend {
             TerminalBackend::Pty { child, .. } => {
@@ -776,6 +821,13 @@ fn submit_sequence_text(sequence: &str) -> &'static str {
     }
 }
 
+fn terminal_bracketed_paste_text(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace("\x1b[200~", "")
+        .replace("\x1b[201~", "")
+}
+
 fn resolve_program(program: String) -> Result<String, TerminalError> {
     if has_path_part(&program) {
         if PathBuf::from(&program).exists() {
@@ -963,6 +1015,22 @@ mod tests {
     use anyhow::Error;
     use std::io;
 
+    #[derive(Clone)]
+    struct RecordingWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl io::Write for RecordingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.bytes.lock().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[derive(Debug)]
     struct TestMasterPty;
 
@@ -1051,6 +1119,29 @@ mod tests {
             events: rx,
             _event_tx: _tx,
         }
+    }
+
+    fn terminal_session_with_recording_writer() -> (TerminalSession, Arc<Mutex<Vec<u8>>>) {
+        let (_tx, rx) = unbounded();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let session = TerminalSession {
+            backend: TerminalBackend::Pty {
+                master: Arc::new(Mutex::new(Box::new(TestMasterPty))),
+                writer: Arc::new(Mutex::new(Box::new(RecordingWriter {
+                    bytes: Arc::clone(&bytes),
+                }))),
+                child: Arc::new(Mutex::new(None)),
+            },
+            output: Arc::new(Mutex::new(RingTextBuffer::new(1024))),
+            emulator: Arc::new(Mutex::new(TerminalEmulator::new(30, 120))),
+            user_input_active: Arc::new(Mutex::new(false)),
+            last_activity_at: Arc::new(Mutex::new(Instant::now())),
+            last_output_at: Arc::new(Mutex::new(Instant::now())),
+            activity_wakeup: Arc::new(Mutex::new(None)),
+            events: rx,
+            _event_tx: _tx,
+        };
+        (session, bytes)
     }
 
     #[test]
@@ -1351,6 +1442,26 @@ mod tests {
         assert!(
             session.output_text().contains("watchapi-pty-smoke"),
             "PTY reader should receive child process stdout"
+        );
+    }
+
+    #[test]
+    fn pasted_prompt_uses_terminal_mode_and_submits_after_sanitized_body() {
+        let (session, bytes) = terminal_session_with_recording_writer();
+        session.emulator.lock().advance(b"\x1b[?2004h");
+
+        session
+            .send_pasted_prompt(
+                "line one\r\nline two\x1b[201~\r\n",
+                "control-m",
+                Duration::ZERO,
+                InputSource::Auto,
+            )
+            .unwrap();
+
+        assert_eq!(
+            bytes.lock().as_slice(),
+            b"\x1b[200~line one\nline two\x1b[201~\r"
         );
     }
 

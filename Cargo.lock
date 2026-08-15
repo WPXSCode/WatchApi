@@ -5611,7 +5611,7 @@ dependencies = [
 
 [[package]]
 name = "watchapi-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "ctrlc",
@@ -5621,7 +5621,7 @@ dependencies = [
 
 [[package]]
 name = "watchapi-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -5645,7 +5645,7 @@ dependencies = [
 
 [[package]]
 name = "watchapi-gui"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "chrono",

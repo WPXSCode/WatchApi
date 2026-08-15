@@ -4606,22 +4606,15 @@ impl WatchApiApp {
             }
             "model" => {
                 let mut value = current_value.clone();
-                ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [label_w, 24.0],
-                        egui::Label::new(RichText::new(label).strong()),
-                    );
-                    egui::ComboBox::from_id_salt(("endpoint_combo", key, self.selected_endpoint))
-                        .selected_text(value.clone())
-                        .width(ui.available_width().max(260.0))
-                        .show_ui(ui, |ui| {
-                            for option in MODEL_OPTIONS {
-                                if ui.selectable_label(value == *option, *option).clicked() {
-                                    value = (*option).to_string();
-                                }
-                            }
-                        });
-                });
+                render_editable_preset_row(
+                    ui,
+                    label_w,
+                    &label,
+                    &mut value,
+                    MODEL_OPTIONS,
+                    ("endpoint_model_preset", self.selected_endpoint),
+                    "可直接输入任意模型 ID",
+                );
                 if value != current_value {
                     if let Some(endpoint) = self.selected_endpoint_value_mut() {
                         endpoint[key] = json!(value);
@@ -4630,22 +4623,15 @@ impl WatchApiApp {
             }
             "reasoning_effort" => {
                 let mut value = current_value.clone().if_empty("high");
-                ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [label_w, 24.0],
-                        egui::Label::new(RichText::new(label).strong()),
-                    );
-                    egui::ComboBox::from_id_salt(("endpoint_combo", key, self.selected_endpoint))
-                        .selected_text(value.clone())
-                        .width(ui.available_width().max(220.0))
-                        .show_ui(ui, |ui| {
-                            for option in REASONING_EFFORT_OPTIONS {
-                                if ui.selectable_label(value == *option, *option).clicked() {
-                                    value = (*option).to_string();
-                                }
-                            }
-                        });
-                });
+                render_editable_preset_row(
+                    ui,
+                    label_w,
+                    &label,
+                    &mut value,
+                    REASONING_EFFORT_OPTIONS,
+                    ("endpoint_reasoning_preset", self.selected_endpoint),
+                    "可直接输入任意思考等级",
+                );
                 if value != current_value {
                     if let Some(endpoint) = self.selected_endpoint_value_mut() {
                         endpoint[key] = json!(value);
@@ -4777,22 +4763,15 @@ impl WatchApiApp {
             }
             "model" => {
                 let mut value = current_value.clone();
-                ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [label_w, 24.0],
-                        egui::Label::new(RichText::new(label).strong()),
-                    );
-                    egui::ComboBox::from_id_salt(("provider_combo", key, self.selected_provider))
-                        .selected_text(value.clone())
-                        .width(ui.available_width().max(260.0))
-                        .show_ui(ui, |ui| {
-                            for option in MODEL_OPTIONS {
-                                if ui.selectable_label(value == *option, *option).clicked() {
-                                    value = (*option).to_string();
-                                }
-                            }
-                        });
-                });
+                render_editable_preset_row(
+                    ui,
+                    label_w,
+                    &label,
+                    &mut value,
+                    MODEL_OPTIONS,
+                    ("provider_model_preset", self.selected_provider),
+                    "可直接输入任意模型 ID",
+                );
                 if value != current_value {
                     self.commit_selected_provider_library_update(
                         "供应商库已同步",
@@ -4804,22 +4783,15 @@ impl WatchApiApp {
             }
             "reasoning_effort" => {
                 let mut value = current_value.clone().if_empty("high");
-                ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [label_w, 24.0],
-                        egui::Label::new(RichText::new(label).strong()),
-                    );
-                    egui::ComboBox::from_id_salt(("provider_combo", key, self.selected_provider))
-                        .selected_text(value.clone())
-                        .width(ui.available_width().max(220.0))
-                        .show_ui(ui, |ui| {
-                            for option in REASONING_EFFORT_OPTIONS {
-                                if ui.selectable_label(value == *option, *option).clicked() {
-                                    value = (*option).to_string();
-                                }
-                            }
-                        });
-                });
+                render_editable_preset_row(
+                    ui,
+                    label_w,
+                    &label,
+                    &mut value,
+                    REASONING_EFFORT_OPTIONS,
+                    ("provider_reasoning_preset", self.selected_provider),
+                    "可直接输入任意思考等级",
+                );
                 if value != current_value {
                     self.commit_selected_provider_library_update(
                         "供应商库已同步",
@@ -15365,6 +15337,10 @@ fn terminal_key_sequence(
     modes: Option<TerminalModeView>,
 ) -> Option<&'static str> {
     let modifiers = terminal_normalized_modifiers(modifiers);
+    // CSI Z is the standard terminal sequence for reverse tab navigation.
+    if key == Key::Tab && modifiers.shift && !modifiers.alt && !modifiers.ctrl {
+        return Some("\x1b[Z");
+    }
     if let Some(sequence) = terminal_modified_key_sequence(key, modifiers) {
         return Some(sequence);
     }
@@ -15761,7 +15737,7 @@ fn terminal_keyboard_action_for_event(
             ..
         } => {
             let modifiers = terminal_normalized_modifiers(*modifiers);
-            if modifiers.ctrl && *key == Key::A {
+            if modifiers.ctrl && modifiers.shift && *key == Key::A {
                 Some(TerminalInputAction::SelectVisible)
             } else if (modifiers.ctrl && modifiers.shift && *key == Key::C)
                 || (modifiers.ctrl && *key == Key::Insert)
@@ -18547,6 +18523,44 @@ fn endpoint_table_cell(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Resp
 
 fn centered_singleline<'a>(text: &'a mut String) -> TextEdit<'a> {
     TextEdit::singleline(text).vertical_align(Align::Center)
+}
+
+fn render_editable_preset_row(
+    ui: &mut egui::Ui,
+    label_w: f32,
+    label: &str,
+    value: &mut String,
+    options: &[&str],
+    id_source: impl std::hash::Hash,
+    hint: &str,
+) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [label_w.min(ui.available_width()), 24.0],
+            egui::Label::new(RichText::new(label).strong()),
+        );
+
+        let spacing = ui.spacing().item_spacing.x;
+        let preset_width = 62.0;
+        let edit_width = (ui.available_width() - preset_width - spacing).max(80.0);
+        ui.add_sized(
+            [edit_width, 28.0],
+            TextEdit::singleline(value)
+                .hint_text(hint)
+                .vertical_align(Align::Center),
+        );
+
+        ui.push_id(id_source, |ui| {
+            ui.menu_button("预设", |ui| {
+                for option in options {
+                    if ui.selectable_label(value == *option, *option).clicked() {
+                        *value = (*option).to_string();
+                        ui.close_menu();
+                    }
+                }
+            });
+        });
+    });
 }
 
 fn external_application_name(path: &Path) -> String {
@@ -22382,12 +22396,14 @@ fn endpoint_field_hint(key: &str) -> &'static str {
         "base_url" => "真实接口地址或本地聚合代理地址，通常应包含 /v1。",
         "api_key" => "请求该接口使用的 Key；如果选择聚合代理，这里会写入本地代理 Key。",
         "model" => {
-            "实际对话使用的模型名；留空探测模型时，探测会先从 models 接口里选最便宜的已知模型。"
+            "实际对话使用的模型名，可直接输入任意自定义模型 ID；留空探测模型时，探测会先从 models 接口里选最便宜的已知模型。"
         }
         "probe_model" => {
             "自定义探测请求使用的模型名。留空时自动从 models 接口获取并选择最便宜的已知模型。"
         }
-        "reasoning_effort" => "模型思考等级，会写入 Agent 启动参数；不支持时由上游忽略或报错。",
+        "reasoning_effort" => {
+            "模型思考等级，可直接输入自定义值；会原样写入 Agent 启动参数，不支持时由上游忽略或报错。"
+        }
         "service_tier" => "Codex/OpenAI 服务档位；fast 会写入 service_tier，留空会清除旧档位。",
         "weight" => "权重越高优先级越高；正常策略只探测比当前更高权重的接口。",
         "probe_url" => "单独指定探测地址；留空时使用 URL + 公共探测路径。",
@@ -26454,6 +26470,21 @@ mod tests {
             Some("\x1b[A")
         );
         assert_eq!(
+            terminal_key_sequence(Key::Tab, egui::Modifiers::default(), None),
+            Some("\t")
+        );
+        assert_eq!(
+            terminal_key_sequence(
+                Key::Tab,
+                egui::Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+                None
+            ),
+            Some("\x1b[Z")
+        );
+        assert_eq!(
             terminal_key_sequence(
                 Key::A,
                 egui::Modifiers {
@@ -26924,7 +26955,7 @@ mod tests {
         };
         assert_eq!(
             terminal_keyboard_action_for_event(&ctrl_a, 24, None),
-            Some(TerminalInputAction::SelectVisible)
+            Some(TerminalInputAction::WriteStatic("\x01"))
         );
 
         let shift_home = egui::Event::Key {
@@ -26944,34 +26975,36 @@ mod tests {
     }
 
     #[test]
-    fn terminal_ctrl_a_selects_visible_output() {
-        let ctrl_a = egui::Event::Key {
+    fn terminal_ctrl_shift_a_selects_visible_output() {
+        let ctrl_shift_a = egui::Event::Key {
             key: Key::A,
             physical_key: None,
             pressed: true,
             repeat: false,
             modifiers: egui::Modifiers {
                 ctrl: true,
+                shift: true,
                 ..Default::default()
             },
         };
         assert_eq!(
-            terminal_keyboard_action_for_event(&ctrl_a, 24, None),
+            terminal_keyboard_action_for_event(&ctrl_shift_a, 24, None),
             Some(TerminalInputAction::SelectVisible)
         );
 
-        let command_a = egui::Event::Key {
+        let command_shift_a = egui::Event::Key {
             key: Key::A,
             physical_key: None,
             pressed: true,
             repeat: false,
             modifiers: egui::Modifiers {
                 command: true,
+                shift: true,
                 ..Default::default()
             },
         };
         assert_eq!(
-            terminal_keyboard_action_for_event(&command_a, 24, None),
+            terminal_keyboard_action_for_event(&command_shift_a, 24, None),
             Some(TerminalInputAction::SelectVisible)
         );
     }
@@ -31577,6 +31610,38 @@ mod tests {
                 "missing reasoning effort option: {effort}"
             );
         }
+    }
+
+    #[test]
+    fn model_and_reasoning_fields_allow_custom_values() {
+        let mut providers = default_provider_library_data();
+        providers["providers"][0]["model"] = json!("partner/custom-codex-model");
+        providers["providers"][0]["reasoning_effort"] = json!("adaptive");
+        assert!(validate_provider_json(&providers).is_ok());
+        assert!(endpoint_field_hint("model").contains("自定义"));
+        assert!(endpoint_field_hint("reasoning_effort").contains("自定义"));
+
+        let source = include_str!("app.rs");
+        let helper = source
+            .split("fn render_editable_preset_row")
+            .nth(1)
+            .and_then(|tail| tail.split("fn external_application_name").next())
+            .expect("editable preset helper should be discoverable");
+        assert!(helper.contains("TextEdit::singleline(value)"));
+        assert!(helper.contains("ui.menu_button(\"预设\""));
+
+        let endpoint_fields = source
+            .split("fn render_endpoint_field_row")
+            .nth(1)
+            .and_then(|tail| tail.split("fn render_provider_field_row").next())
+            .expect("endpoint field renderer should be discoverable");
+        let provider_fields = source
+            .split("fn render_provider_field_row")
+            .nth(1)
+            .and_then(|tail| tail.split("fn render_provider_connection_block").next())
+            .expect("provider field renderer should be discoverable");
+        assert!(endpoint_fields.contains("render_editable_preset_row("));
+        assert!(provider_fields.contains("render_editable_preset_row("));
     }
 
     #[test]

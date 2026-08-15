@@ -186,6 +186,10 @@ impl TerminalEmulator {
         self.revision
     }
 
+    pub fn modes(&self) -> TerminalModeView {
+        mode_view(*self.term.mode())
+    }
+
     pub fn view(&self) -> TerminalView {
         let rows = self.term.screen_lines();
         let cols = self.term.columns();

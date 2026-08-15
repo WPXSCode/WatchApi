@@ -24,9 +24,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const CODEX_READY_UNLOCK_GRACE: Duration = Duration::from_secs(2);
+const INTERACTIVE_AGENT_READY_UNLOCK_GRACE: Duration = Duration::from_secs(2);
 const CODEX_STALE_WORKING_UNLOCK_GRACE: Duration = Duration::from_secs(20);
 const CODEX_ISOLATED_RUNTIME_DIR: &str = "runtime-v2";
+const OPENCODE_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(80);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentLaunch {
@@ -70,9 +71,11 @@ pub struct AgentProcess {
     handled_sandbox_setup_prompt: bool,
     handled_codex_repair_prompt: bool,
     handled_command_approval_prompt: bool,
+    handled_claude_terms_prompt: bool,
     handled_generic_startup_option_prompt: bool,
     observed_terminal_view_revision: u64,
     observed_terminal_view_text: String,
+    observed_terminal_bracketed_paste: bool,
     observed_current_input_placeholder: bool,
     last_prompt_sent_view_revision: Option<u64>,
     isolated_codex_home: Option<IsolatedCodexHome>,
@@ -282,6 +285,7 @@ impl AgentProcess {
         force_new_session: bool,
         fork_source: Option<AgentForkSource>,
     ) -> Self {
+        let handled_claude_terms_prompt = config.agent_driver != AgentDriverKind::ClaudeCode;
         let store = SessionStore::new(config.session_state_path.clone());
         Self {
             config,
@@ -312,9 +316,11 @@ impl AgentProcess {
             handled_sandbox_setup_prompt: false,
             handled_codex_repair_prompt: false,
             handled_command_approval_prompt: false,
+            handled_claude_terms_prompt,
             handled_generic_startup_option_prompt: false,
             observed_terminal_view_revision: 0,
             observed_terminal_view_text: String::new(),
+            observed_terminal_bracketed_paste: false,
             observed_current_input_placeholder: false,
             last_prompt_sent_view_revision: None,
             isolated_codex_home: None,
@@ -696,18 +702,24 @@ impl AgentProcess {
             ));
         }
         let terminal = self.terminal.as_ref().ok_or(TerminalError::NotRunning)?;
-        let prompt_text;
-        let prompt = if self.config.agent_driver == AgentDriverKind::Codex {
-            prompt_text = codex_auto_prompt_input_text(prompt);
-            prompt_text.as_str()
-        } else {
-            prompt
-        };
-        terminal.send_prompt(
-            prompt,
-            &self.config.prompt_submit_sequence,
-            InputSource::Auto,
-        )?;
+        match &self.config.agent_driver {
+            AgentDriverKind::Codex => terminal.send_prompt(
+                &codex_auto_prompt_input_text(prompt),
+                &self.config.prompt_submit_sequence,
+                InputSource::Auto,
+            )?,
+            AgentDriverKind::OpenCode => terminal.send_pasted_prompt(
+                prompt,
+                &self.config.prompt_submit_sequence,
+                OPENCODE_PROMPT_SUBMIT_DELAY,
+                InputSource::Auto,
+            )?,
+            AgentDriverKind::ClaudeCode | AgentDriverKind::Generic => terminal.send_prompt(
+                prompt,
+                &self.config.prompt_submit_sequence,
+                InputSource::Auto,
+            )?,
+        }
         let sent_view_revision = terminal.view_revision();
         self.clear_stale_terminal_failure_signals();
         let now = Instant::now();
@@ -755,7 +767,7 @@ impl AgentProcess {
         let recent_elapsed = self.recent_activity_elapsed();
         let current_view_ready = self.current_terminal_view_ready();
         let current_view_busy = self.current_terminal_view_busy();
-        let ready_unlock_allowed = !self.codex_ready_unlock_grace_active();
+        let ready_unlock_allowed = !self.ready_unlock_grace_active();
         if let Some(monitor) = self.monitor.as_mut() {
             if self.awaiting_turn_completion {
                 if self.saw_ready_banner && current_view_ready && ready_unlock_allowed {
@@ -820,10 +832,7 @@ impl AgentProcess {
         if self.awaiting_turn_completion || !self.startup_ready_for_prompt() {
             return false;
         }
-        if codex_prefilled_input_visible(
-            &self.observed_terminal_view_text,
-            self.observed_current_input_placeholder,
-        ) {
+        if self.current_terminal_prefilled_input_visible() {
             return false;
         }
         if self.current_terminal_view_busy() {
@@ -847,12 +856,14 @@ impl AgentProcess {
             {
                 return Some("等待 Codex 更新确认");
             }
-            return Some("等待 Codex 就绪");
+            return Some(match &self.config.agent_driver {
+                AgentDriverKind::Codex => "等待 Codex 就绪",
+                AgentDriverKind::ClaudeCode => "等待 Claude 就绪",
+                AgentDriverKind::OpenCode => "等待 OpenCode 输入框就绪",
+                AgentDriverKind::Generic => "等待 Agent 就绪",
+            });
         }
-        if codex_prefilled_input_visible(
-            &self.observed_terminal_view_text,
-            self.observed_current_input_placeholder,
-        ) {
+        if self.current_terminal_prefilled_input_visible() {
             return Some("输入框已有内容");
         }
         if self.current_terminal_view_busy() {
@@ -863,10 +874,16 @@ impl AgentProcess {
             {
                 return None;
             }
-            if codex_queued_message_visible(&self.observed_terminal_view_text) {
+            if self.config.agent_driver == AgentDriverKind::Codex
+                && codex_queued_message_visible(&self.observed_terminal_view_text)
+            {
                 return Some("已有排队消息");
             }
-            if codex_working_prompt_visible(&self.observed_terminal_view_text) {
+            if (self.config.agent_driver == AgentDriverKind::Codex
+                && codex_working_prompt_visible(&self.observed_terminal_view_text))
+                || (self.config.agent_driver == AgentDriverKind::OpenCode
+                    && opencode_busy_prompt_visible(&self.observed_terminal_view_text))
+            {
                 if self.config.agent_driver == AgentDriverKind::Codex
                     && self.last_prompt_sent_at.is_none()
                 {
@@ -900,7 +917,7 @@ impl AgentProcess {
         }
         self.saw_ready_banner
             && self.current_terminal_view_ready()
-            && !self.codex_ready_unlock_grace_active()
+            && !self.ready_unlock_grace_active()
     }
 
     pub fn needs_submit_retry(&self, retry_seconds: f64) -> bool {
@@ -910,10 +927,7 @@ impl AgentProcess {
         if self.current_terminal_view_busy() {
             return false;
         }
-        let visible_prefilled_input = codex_prefilled_input_visible(
-            &self.observed_terminal_view_text,
-            self.observed_current_input_placeholder,
-        );
+        let visible_prefilled_input = self.current_terminal_prefilled_input_visible();
         if !self.awaiting_turn_completion && !visible_prefilled_input {
             return false;
         }
@@ -1109,7 +1123,7 @@ impl AgentProcess {
         if is_transient_endpoint_failure_text(&self.recent_output) {
             self.transient_endpoint_failure_detected = true;
         }
-        if !self.saw_ready_banner && ready_banner_visible(&self.recent_output) {
+        if !self.saw_ready_banner && self.ready_banner_visible(&self.recent_output) {
             self.saw_ready_banner = true;
         }
     }
@@ -1121,6 +1135,7 @@ impl AgentProcess {
             && self.handled_sandbox_setup_prompt
             && self.handled_codex_repair_prompt
             && self.handled_command_approval_prompt
+            && self.handled_claude_terms_prompt
             && self.handled_generic_startup_option_prompt
         {
             return;
@@ -1179,6 +1194,15 @@ impl AgentProcess {
         {
             self.handled_command_approval_prompt = true;
         }
+        if !self.handled_claude_terms_prompt
+            && claude_terms_acceptance_prompt_visible(observed)
+            && self.write_auto_terminal_input(format!(
+                "2{}",
+                submit_sequence_text(&self.config.prompt_submit_sequence)
+            ))
+        {
+            self.handled_claude_terms_prompt = true;
+        }
         if !self.handled_generic_startup_option_prompt
             && generic_first_option_prompt_visible(observed)
             && self.write_auto_terminal_input(format!(
@@ -1208,6 +1232,7 @@ impl AgentProcess {
         let Some(terminal) = self.terminal.as_ref() else {
             self.observed_terminal_view_revision = 0;
             self.observed_terminal_view_text.clear();
+            self.observed_terminal_bracketed_paste = false;
             self.observed_current_input_placeholder = false;
             return;
         };
@@ -1217,6 +1242,7 @@ impl AgentProcess {
         }
         self.observed_terminal_view_revision = revision;
         let view = terminal.view();
+        self.observed_terminal_bracketed_paste = view.modes.bracketed_paste;
         self.observed_current_input_placeholder = terminal_view_current_codex_input(&view)
             .is_some_and(|input| !input.text.is_empty() && input.placeholder);
         let screen = terminal_view_visible_text(&view);
@@ -1230,7 +1256,7 @@ impl AgentProcess {
                 .is_none_or(|sent_revision| revision > sent_revision);
             if !self.saw_ready_banner
                 && view_updated_after_prompt
-                && ready_banner_visible(&self.observed_terminal_view_text)
+                && self.ready_banner_visible(&self.observed_terminal_view_text)
             {
                 self.saw_ready_banner = true;
             }
@@ -1258,27 +1284,72 @@ impl AgentProcess {
     }
 
     fn current_terminal_view_ready(&self) -> bool {
-        !self.observed_terminal_view_text.trim().is_empty()
-            && ready_banner_visible(&self.observed_terminal_view_text)
-            && (self.config.agent_driver != AgentDriverKind::Codex
-                || !codex_prefilled_input_visible(
-                    &self.observed_terminal_view_text,
-                    self.observed_current_input_placeholder,
-                ))
+        if self.observed_terminal_view_text.trim().is_empty() {
+            return false;
+        }
+        match &self.config.agent_driver {
+            AgentDriverKind::Codex => {
+                ready_banner_visible(&self.observed_terminal_view_text)
+                    && !codex_prefilled_input_visible(
+                        &self.observed_terminal_view_text,
+                        self.observed_current_input_placeholder,
+                    )
+            }
+            AgentDriverKind::OpenCode => {
+                opencode_idle_prompt_visible(&self.observed_terminal_view_text)
+            }
+            AgentDriverKind::ClaudeCode | AgentDriverKind::Generic => {
+                ready_banner_visible(&self.observed_terminal_view_text)
+            }
+        }
+    }
+
+    fn current_terminal_prefilled_input_visible(&self) -> bool {
+        match &self.config.agent_driver {
+            AgentDriverKind::Codex => codex_prefilled_input_visible(
+                &self.observed_terminal_view_text,
+                self.observed_current_input_placeholder,
+            ),
+            AgentDriverKind::OpenCode => {
+                opencode_prefilled_input_visible(&self.observed_terminal_view_text)
+            }
+            AgentDriverKind::ClaudeCode | AgentDriverKind::Generic => false,
+        }
+    }
+
+    fn ready_banner_visible(&self, text: &str) -> bool {
+        match &self.config.agent_driver {
+            AgentDriverKind::OpenCode => opencode_idle_prompt_visible(text),
+            AgentDriverKind::Codex | AgentDriverKind::ClaudeCode | AgentDriverKind::Generic => {
+                ready_banner_visible(text)
+            }
+        }
     }
 
     fn current_terminal_view_busy(&self) -> bool {
-        !self.observed_terminal_view_text.trim().is_empty()
-            && codex_busy_prompt_visible(&self.observed_terminal_view_text)
+        if self.observed_terminal_view_text.trim().is_empty() {
+            return false;
+        }
+        match &self.config.agent_driver {
+            AgentDriverKind::OpenCode => {
+                opencode_busy_prompt_visible(&self.observed_terminal_view_text)
+            }
+            AgentDriverKind::Codex | AgentDriverKind::ClaudeCode | AgentDriverKind::Generic => {
+                codex_busy_prompt_visible(&self.observed_terminal_view_text)
+            }
+        }
     }
 
     fn stale_working_prompt_can_unlock(&self) -> bool {
+        if self.config.agent_driver != AgentDriverKind::Codex {
+            return false;
+        }
         let text = self.observed_terminal_view_text.as_str();
         if text.trim().is_empty()
             || codex_queued_message_visible(text)
             || !codex_working_prompt_visible(text)
             || !codex_idle_prompt_visible(text)
-            || self.codex_ready_unlock_grace_active()
+            || self.ready_unlock_grace_active()
         {
             return false;
         }
@@ -1287,25 +1358,30 @@ impl AgentProcess {
             && self.recent_activity_elapsed() >= CODEX_STALE_WORKING_UNLOCK_GRACE
     }
 
-    fn codex_ready_unlock_grace_active(&self) -> bool {
-        self.config.agent_driver == AgentDriverKind::Codex
+    fn ready_unlock_grace_active(&self) -> bool {
+        self.config.agent_driver != AgentDriverKind::Generic
             && self
                 .last_prompt_sent_at
-                .is_some_and(|at| at.elapsed() < CODEX_READY_UNLOCK_GRACE)
+                .is_some_and(|at| at.elapsed() < INTERACTIVE_AGENT_READY_UNLOCK_GRACE)
     }
 
     fn startup_ready_for_prompt(&self) -> bool {
-        if self.config.agent_driver != AgentDriverKind::Codex {
-            return true;
+        match &self.config.agent_driver {
+            AgentDriverKind::Codex => {
+                if codex_update_prompt_visible(&self.recent_output) {
+                    return false;
+                }
+                self.saw_ready_banner
+                    || self
+                        .launched_at
+                        .is_some_and(|at| at.elapsed() >= Duration::from_secs(12))
+            }
+            AgentDriverKind::OpenCode => {
+                self.observed_terminal_bracketed_paste
+                    && opencode_prompt_footer_visible(&self.observed_terminal_view_text)
+            }
+            AgentDriverKind::ClaudeCode | AgentDriverKind::Generic => true,
         }
-        if codex_update_prompt_visible(&self.recent_output) {
-            return false;
-        }
-        if self.saw_ready_banner {
-            return true;
-        }
-        self.launched_at
-            .is_some_and(|at| at.elapsed() >= Duration::from_secs(12))
     }
 }
 
@@ -2091,6 +2167,13 @@ fn claude_command_with_endpoint_overrides(
         }
         _ => command,
     };
+    let command = command_with_agent_option_override(
+        command,
+        "claude-code",
+        "--permission-mode",
+        None,
+        "bypassPermissions",
+    );
     command_with_required_agent_flag(command, "claude-code", "--dangerously-skip-permissions")
 }
 
@@ -2627,6 +2710,99 @@ fn ready_banner_visible(text: &str) -> bool {
     known_ready_marker || codex_idle_prompt_visible(text)
 }
 
+fn opencode_prompt_footer_visible(text: &str) -> bool {
+    opencode_current_prompt_input(text).is_some()
+}
+
+fn opencode_idle_prompt_visible(text: &str) -> bool {
+    if opencode_busy_prompt_visible(text) {
+        return false;
+    }
+    opencode_current_prompt_input(text)
+        .is_some_and(|input| input.is_empty() || opencode_placeholder_input_visible(&input))
+}
+
+fn opencode_prefilled_input_visible(text: &str) -> bool {
+    if opencode_busy_prompt_visible(text) {
+        return false;
+    }
+    opencode_current_prompt_input(text)
+        .is_some_and(|input| !input.is_empty() && !opencode_placeholder_input_visible(&input))
+}
+
+fn opencode_current_prompt_input(text: &str) -> Option<String> {
+    let lines = text.lines().collect::<Vec<_>>();
+    let footer_index = lines
+        .iter()
+        .rposition(|line| opencode_prompt_bottom_visible(line))?;
+    if footer_index == 0 {
+        return None;
+    }
+
+    let mut box_lines = Vec::new();
+    let mut index = footer_index;
+    while index > 0 {
+        let Some(content) = opencode_prompt_line_content(lines[index - 1]) else {
+            break;
+        };
+        box_lines.push(content);
+        index -= 1;
+    }
+    box_lines.reverse();
+
+    let metadata_index = box_lines.iter().rposition(|line| line.contains('·'))?;
+    let mut input_lines = box_lines[..metadata_index].to_vec();
+    while input_lines.first().is_some_and(|line| line.is_empty()) {
+        input_lines.remove(0);
+    }
+    while input_lines.last().is_some_and(|line| line.is_empty()) {
+        input_lines.pop();
+    }
+    Some(input_lines.join("\n"))
+}
+
+fn opencode_prompt_bottom_visible(line: &str) -> bool {
+    let Some(bottom) = line.trim_start().strip_prefix('╹') else {
+        return false;
+    };
+    let bottom = bottom.trim_end();
+    bottom.chars().count() >= 3 && bottom.chars().all(|ch| ch == '▀')
+}
+
+fn opencode_prompt_line_content(line: &str) -> Option<String> {
+    let content = line.trim_start().strip_prefix('┃')?;
+    let content = content
+        .strip_prefix("  ")
+        .or_else(|| content.strip_prefix(' '))
+        .unwrap_or(content);
+    Some(content.trim_end().to_string())
+}
+
+fn opencode_placeholder_input_visible(input: &str) -> bool {
+    input
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("ask anything...")
+}
+
+fn opencode_busy_prompt_visible(text: &str) -> bool {
+    text.lines().any(|line| {
+        let lowered = line
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        lowered.contains("esc interrupt")
+            || lowered.contains("esc to interrupt")
+            || lowered.contains("ctrl+c to interrupt")
+            || lowered.contains("ctrl-c to interrupt")
+            || ((lowered.contains("retry") || lowered.contains("retrying"))
+                && (lowered.contains(" in ")
+                    || lowered.contains("attempt")
+                    || lowered.contains("failed")))
+    })
+}
+
 fn codex_idle_prompt_visible(text: &str) -> bool {
     text.lines().any(|line| {
         let Some((_, input)) = line.split_once('›') else {
@@ -2776,6 +2952,9 @@ fn codex_command_approval_prompt_visible(text: &str) -> bool {
 }
 
 fn generic_first_option_prompt_visible(text: &str) -> bool {
+    if claude_terms_acceptance_prompt_visible(text) {
+        return false;
+    }
     let lines = text.lines().collect::<Vec<_>>();
     let codex_goal_resume_context = codex_goal_resume_prompt_visible(text);
     lines.iter().enumerate().any(|(index, line)| {
@@ -2785,6 +2964,11 @@ fn generic_first_option_prompt_visible(text: &str) -> bool {
         nearby_second_option(&lines, index)
             && (selector != FirstOptionSelector::CodexPromptArrow || codex_goal_resume_context)
     })
+}
+
+fn claude_terms_acceptance_prompt_visible(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    lowered.contains("1. no, exit") && lowered.contains("2. yes, i accept")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4424,6 +4608,14 @@ mod tests {
             1
         );
         assert_eq!(claude[1], "--dangerously-skip-permissions");
+        assert_eq!(
+            claude
+                .iter()
+                .filter(|item| item.as_str() == "--permission-mode")
+                .count(),
+            0,
+            "the low-level required-flag helper must not add unrelated options"
+        );
         assert_eq!(opencode[1], "--auto");
     }
 
@@ -4452,6 +4644,8 @@ mod tests {
             AgentCommand::Args(vec![
                 "claude".to_string(),
                 "--dangerously-skip-permissions".to_string(),
+                "--permission-mode".to_string(),
+                "bypassPermissions".to_string(),
                 "--effort".to_string(),
                 "high".to_string(),
                 "--model".to_string(),
@@ -4857,6 +5051,9 @@ mod tests {
             .expect("send prompt block should be discoverable");
 
         assert!(send_block.contains("terminal.send_prompt("));
+        assert!(send_block.contains("AgentDriverKind::OpenCode"));
+        assert!(send_block.contains("terminal.send_pasted_prompt("));
+        assert!(send_block.contains("OPENCODE_PROMPT_SUBMIT_DELAY"));
         assert!(send_block.contains("self.clear_stale_terminal_failure_signals();"));
         assert!(
             send_block.find("terminal.send_prompt(")
@@ -5174,20 +5371,20 @@ mod tests {
     }
 
     #[test]
-    fn codex_ready_prompt_unlock_has_post_send_grace_period() {
+    fn interactive_agent_ready_prompt_unlock_has_post_send_grace_period() {
         let source = include_str!("agent.rs");
         let block = source
-            .split("fn codex_ready_unlock_grace_active(&self)")
+            .split("fn ready_unlock_grace_active(&self)")
             .nth(1)
             .and_then(|tail| tail.split("fn startup_ready_for_prompt").next())
             .expect("ready unlock grace helper should be discoverable");
 
-        assert!(
-            source.contains("const CODEX_READY_UNLOCK_GRACE: Duration = Duration::from_secs(2);")
-        );
-        assert!(block.contains("self.config.agent_driver == AgentDriverKind::Codex"));
+        assert!(source.contains(
+            "const INTERACTIVE_AGENT_READY_UNLOCK_GRACE: Duration = Duration::from_secs(2);"
+        ));
+        assert!(block.contains("self.config.agent_driver != AgentDriverKind::Generic"));
         assert!(block.contains("last_prompt_sent_at"));
-        assert!(block.contains("at.elapsed() < CODEX_READY_UNLOCK_GRACE"));
+        assert!(block.contains("at.elapsed() < INTERACTIVE_AGENT_READY_UNLOCK_GRACE"));
     }
 
     #[test]
@@ -5203,7 +5400,7 @@ mod tests {
         assert!(block.contains("AgentSessionMonitor::has_assistant_message_since_wait_start"));
         assert!(block.contains("self.saw_ready_banner"));
         assert!(block.contains("self.current_terminal_view_ready()"));
-        assert!(block.contains("!self.codex_ready_unlock_grace_active()"));
+        assert!(block.contains("!self.ready_unlock_grace_active()"));
         assert!(
             !block.contains("startup_ready_for_prompt"),
             "watchdog 不能把输入框可写当成任务结束；Codex Working 时也可能可输入"
@@ -6351,6 +6548,44 @@ mod tests {
     }
 
     #[test]
+    fn codex_cli_overrides_forward_custom_model_and_reasoning_effort() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let codex_home = tmp.path().join(".codex");
+        fs::create_dir_all(&codex_home).unwrap();
+        let config_path = codex_home.join("config.toml");
+        fs::write(
+            &config_path,
+            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"old\"\n",
+        )
+        .unwrap();
+        let mut cfg = config(
+            workdir.clone(),
+            AgentDriver::Codex,
+            AgentCommand::Args(vec!["codex".to_string()]),
+            tmp.path().join("state.json"),
+            codex_home,
+        );
+        cfg.codex_config_path = config_path;
+        let mut endpoint = endpoint(workdir);
+        endpoint.model = "partner/custom-codex-model".to_string();
+        endpoint.reasoning_effort = "adaptive".to_string();
+
+        let command = codex_command_with_cli_overrides(cfg.agent_command.clone(), &endpoint, &cfg);
+
+        let AgentCommand::Args(items) = command else {
+            panic!("expected args command");
+        };
+        assert!(items
+            .windows(2)
+            .any(|pair| pair == ["-c", "model=\"partner/custom-codex-model\""]));
+        assert!(items
+            .windows(2)
+            .any(|pair| pair == ["-c", "model_reasoning_effort=\"adaptive\""]));
+    }
+
+    #[test]
     fn codex_cli_overrides_preserve_no_alt_screen_for_scrollback() {
         let tmp = tempfile::tempdir().unwrap();
         let workdir = tmp.path().join("project");
@@ -6741,6 +6976,11 @@ mod tests {
              Repair Codex local data now? [y/N]:"
         ));
         assert!(!codex_repair_prompt_visible("Codex couldn't start only"));
+        let claude_terms = "Bypass permissions mode requires confirmation\n\
+             1. No, exit\n\
+             > 2. Yes, I accept";
+        assert!(claude_terms_acceptance_prompt_visible(claude_terms));
+        assert!(!generic_first_option_prompt_visible(claude_terms));
         assert!(generic_first_option_prompt_visible(
             "Choose an option:\n> 1. Continue with current settings\n  2. Quit\nPress enter to confirm"
         ));
@@ -6775,6 +7015,114 @@ mod tests {
              3. No, and tell Codex what to do differently (esc)";
         assert!(codex_command_approval_prompt_visible(command_approval));
         assert!(!generic_first_option_prompt_visible(command_approval));
+    }
+
+    #[test]
+    fn opencode_prompt_box_distinguishes_idle_prefilled_and_busy_states() {
+        let idle = "OpenCode\n\
+            ┃  Ask anything... \"Fix a TODO in the codebase\"\n\
+            ┃  Build auto · claude-opus-5 New API Local\n\
+            ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n\
+            tab agents  ctrl+p commands";
+        let prefilled = "OpenCode\n\
+            ┃  Continue the current task\n\
+            ┃  and run the tests\n\
+            ┃  Build auto · claude-opus-5 New API Local\n\
+            ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n\
+            tab agents  ctrl+p commands";
+        let busy = format!("{idle}\nesc interrupt");
+        let retrying = format!("{idle}\nRetrying in 3s (attempt 2)");
+
+        assert!(opencode_prompt_footer_visible(idle));
+        assert!(opencode_idle_prompt_visible(idle));
+        assert!(!opencode_prefilled_input_visible(idle));
+        assert_eq!(
+            opencode_current_prompt_input(prefilled).as_deref(),
+            Some("Continue the current task\nand run the tests")
+        );
+        assert!(opencode_prefilled_input_visible(prefilled));
+        assert!(!opencode_idle_prompt_visible(prefilled));
+        assert!(opencode_busy_prompt_visible(&busy));
+        assert!(opencode_busy_prompt_visible(&retrying));
+        assert!(!opencode_idle_prompt_visible(&busy));
+        assert!(!opencode_prompt_footer_visible(
+            "┃  Not an OpenCode prompt\n╹────────"
+        ));
+    }
+
+    #[test]
+    fn opencode_auto_input_waits_for_mounted_empty_prompt_and_bracketed_paste() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let mut agent = AgentProcess::new(
+            config(
+                workdir.clone(),
+                AgentDriver::OpenCode,
+                AgentCommand::Args(vec!["opencode".to_string()]),
+                tmp.path().join("state.json"),
+                tmp.path().join(".codex"),
+            ),
+            endpoint(workdir),
+            false,
+        );
+        let idle = "┃  Ask anything... \"Fix a TODO in the codebase\"\n\
+            ┃  Build auto · claude-opus-5 New API Local\n\
+            ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n\
+            tab agents  ctrl+p commands";
+        agent.observed_terminal_view_text = idle.to_string();
+
+        assert!(!agent.startup_ready_for_prompt());
+        assert!(!agent.can_send_prompt());
+
+        agent.observed_terminal_bracketed_paste = true;
+        assert!(agent.startup_ready_for_prompt());
+        assert!(agent.current_terminal_view_ready());
+        assert!(agent.can_send_prompt());
+
+        agent.observed_terminal_view_text = idle.replace(
+            "Ask anything... \"Fix a TODO in the codebase\"",
+            "Continue the current task",
+        );
+        assert!(agent.current_terminal_prefilled_input_visible());
+        assert!(!agent.can_send_prompt());
+        assert_eq!(agent.auto_input_block_reason(), Some("输入框已有内容"));
+
+        agent.observed_terminal_view_text = format!("{idle}\nesc interrupt");
+        assert!(agent.current_terminal_view_busy());
+        assert!(!agent.can_send_prompt());
+    }
+
+    #[test]
+    fn opencode_submit_retry_detects_prompt_left_in_input_box() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("project");
+        fs::create_dir_all(&workdir).unwrap();
+        let mut agent = AgentProcess::new(
+            config(
+                workdir.clone(),
+                AgentDriver::OpenCode,
+                AgentCommand::Args(vec!["opencode".to_string()]),
+                tmp.path().join("state.json"),
+                tmp.path().join(".codex"),
+            ),
+            endpoint(workdir),
+            false,
+        );
+        agent.observed_terminal_bracketed_paste = true;
+        agent.observed_terminal_view_text = "┃  Continue the current task\n\
+            ┃  Build auto · claude-opus-5 New API Local\n\
+            ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀"
+            .to_string();
+        agent.awaiting_turn_completion = true;
+        agent.last_submit_attempt_at = Some(Instant::now() - Duration::from_secs(6));
+
+        assert!(agent.needs_submit_retry(5.0));
+
+        agent
+            .observed_terminal_view_text
+            .push_str("\nesc interrupt");
+        assert!(!agent.needs_submit_retry(5.0));
     }
 
     #[test]
