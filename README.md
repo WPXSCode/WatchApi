@@ -100,3 +100,11 @@ dist\WatchApiRust-portable.zip
 GUI 首次新建配置会默认保存到 exe 同级 `Configs` 目录；提示词库保存在 exe 同级 `prompt-library.json`。
 
 聚合代理配置保存在 exe 同级 `ProxyConfigs\proxies.json`，生成的 LiteLLM 配置和日志也在 `ProxyConfigs` 下。GUI 启动代理时会优先使用发布包内 `LiteLLM\litellm.cmd`；如果不存在，则回退到系统 PATH 里的 `litellm` 命令。
+
+
+
+## 致谢
+
+---
+
+感谢 [Linux.do](https://linux.do/) 社区。
