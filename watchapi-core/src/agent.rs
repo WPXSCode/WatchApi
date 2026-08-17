@@ -1,5 +1,5 @@
 use crate::codex_files::{
-    apply_codex_endpoint_with_model_context_window, ensure_codex_unattended_state,
+    apply_codex_endpoint_with_model_limits, ensure_codex_unattended_state,
     get_current_model_provider,
 };
 use crate::config::{
@@ -75,7 +75,6 @@ pub struct AgentProcess {
     handled_generic_startup_option_prompt: bool,
     observed_terminal_view_revision: u64,
     observed_terminal_view_text: String,
-    observed_terminal_bracketed_paste: bool,
     observed_current_input_placeholder: bool,
     last_prompt_sent_view_revision: Option<u64>,
     isolated_codex_home: Option<IsolatedCodexHome>,
@@ -320,7 +319,6 @@ impl AgentProcess {
             handled_generic_startup_option_prompt: false,
             observed_terminal_view_revision: 0,
             observed_terminal_view_text: String::new(),
-            observed_terminal_bracketed_paste: false,
             observed_current_input_placeholder: false,
             last_prompt_sent_view_revision: None,
             isolated_codex_home: None,
@@ -392,12 +390,15 @@ impl AgentProcess {
                     .set_bound_session_id(&binding, session_id, Some(&copied_session))?;
             }
             ensure_codex_unattended_state(&launch_config.codex_home)?;
-            apply_codex_endpoint_with_model_context_window(
+            let codex_model_limits =
+                launch_config.effective_codex_model_limits(&self.endpoint.name);
+            apply_codex_endpoint_with_model_limits(
                 &self.endpoint,
                 &launch_config.codex_config_path,
                 &launch_config.codex_auth_path,
                 &launch_config.codex_provider_name,
-                launch_config.codex_model_context_window,
+                codex_model_limits.model_context_window,
+                codex_model_limits.model_auto_compact_token_limit,
             )?;
             terminal_env.insert("OPENAI_API_KEY".to_string(), self.endpoint.api_key.clone());
             launch.command =
@@ -1197,7 +1198,8 @@ impl AgentProcess {
         if !self.handled_claude_terms_prompt
             && claude_terms_acceptance_prompt_visible(observed)
             && self.write_auto_terminal_input(format!(
-                "2{}",
+                "{}{}",
+                claude_terms_acceptance_prompt_navigation(observed),
                 submit_sequence_text(&self.config.prompt_submit_sequence)
             ))
         {
@@ -1232,7 +1234,6 @@ impl AgentProcess {
         let Some(terminal) = self.terminal.as_ref() else {
             self.observed_terminal_view_revision = 0;
             self.observed_terminal_view_text.clear();
-            self.observed_terminal_bracketed_paste = false;
             self.observed_current_input_placeholder = false;
             return;
         };
@@ -1242,7 +1243,6 @@ impl AgentProcess {
         }
         self.observed_terminal_view_revision = revision;
         let view = terminal.view();
-        self.observed_terminal_bracketed_paste = view.modes.bracketed_paste;
         self.observed_current_input_placeholder = terminal_view_current_codex_input(&view)
             .is_some_and(|input| !input.text.is_empty() && input.placeholder);
         let screen = terminal_view_visible_text(&view);
@@ -1377,8 +1377,7 @@ impl AgentProcess {
                         .is_some_and(|at| at.elapsed() >= Duration::from_secs(12))
             }
             AgentDriverKind::OpenCode => {
-                self.observed_terminal_bracketed_paste
-                    && opencode_prompt_footer_visible(&self.observed_terminal_view_text)
+                opencode_prompt_footer_visible(&self.observed_terminal_view_text)
             }
             AgentDriverKind::ClaudeCode | AgentDriverKind::Generic => true,
         }
@@ -2504,9 +2503,17 @@ fn codex_command_with_cli_overrides(
         overrides.push("-c".to_string());
         overrides.push(format!("service_tier={}", toml_cli_string(service_tier)));
     }
-    if let Some(model_context_window) = config.codex_model_context_window {
+    let codex_model_limits = config.effective_codex_model_limits(&endpoint.name);
+    if let Some(model_context_window) = codex_model_limits.model_context_window {
         overrides.push("-c".to_string());
         overrides.push(format!("model_context_window={model_context_window}"));
+    }
+    if let Some(model_auto_compact_token_limit) = codex_model_limits.model_auto_compact_token_limit
+    {
+        overrides.push("-c".to_string());
+        overrides.push(format!(
+            "model_auto_compact_token_limit={model_auto_compact_token_limit}"
+        ));
     }
     match command {
         AgentCommand::Args(items) => {
@@ -2750,7 +2757,20 @@ fn opencode_current_prompt_input(text: &str) -> Option<String> {
     }
     box_lines.reverse();
 
-    let metadata_index = box_lines.iter().rposition(|line| line.contains('·'))?;
+    let metadata_index = box_lines.iter().rposition(|line| line.contains('·'));
+    if metadata_index.is_none() {
+        let has_placeholder = box_lines
+            .iter()
+            .any(|line| opencode_placeholder_input_visible(line));
+        let has_controls = lines[footer_index + 1..].iter().any(|line| {
+            let lowered = line.to_ascii_lowercase();
+            lowered.contains("tab agents") && lowered.contains("commands")
+        });
+        if !has_placeholder && !has_controls {
+            return None;
+        }
+    }
+    let metadata_index = metadata_index.unwrap_or(box_lines.len());
     let mut input_lines = box_lines[..metadata_index].to_vec();
     while input_lines.first().is_some_and(|line| line.is_empty()) {
         input_lines.remove(0);
@@ -2762,15 +2782,29 @@ fn opencode_current_prompt_input(text: &str) -> Option<String> {
 }
 
 fn opencode_prompt_bottom_visible(line: &str) -> bool {
-    let Some(bottom) = line.trim_start().strip_prefix('╹') else {
+    let line = line.trim_start();
+    let mut chars = line.chars();
+    let Some(marker) = chars.next() else {
         return false;
     };
-    let bottom = bottom.trim_end();
-    bottom.chars().count() >= 3 && bottom.chars().all(|ch| ch == '▀')
+    if !matches!(marker, '╹' | '└' | '╰' | '╚' | '┕' | '┗' | '┙' | '╘') {
+        return false;
+    }
+    let bottom = chars.as_str().trim_end();
+    bottom.chars().count() >= 3
+        && bottom
+            .chars()
+            .all(|ch| matches!(ch, '▀' | '─' | '━' | '═' | '-' | '_' | '▔' | '▄'))
 }
 
 fn opencode_prompt_line_content(line: &str) -> Option<String> {
-    let content = line.trim_start().strip_prefix('┃')?;
+    let line = line.trim_start();
+    let mut chars = line.chars();
+    let marker = chars.next()?;
+    if !matches!(marker, '┃' | '│' | '║' | '|' | '▕' | '▐') {
+        return None;
+    }
+    let content = chars.as_str();
     let content = content
         .strip_prefix("  ")
         .or_else(|| content.strip_prefix(' '))
@@ -2969,6 +3003,27 @@ fn generic_first_option_prompt_visible(text: &str) -> bool {
 fn claude_terms_acceptance_prompt_visible(text: &str) -> bool {
     let lowered = text.to_ascii_lowercase();
     lowered.contains("1. no, exit") && lowered.contains("2. yes, i accept")
+}
+
+fn claude_terms_acceptance_prompt_navigation(text: &str) -> &'static str {
+    let selected = text.lines().rev().find_map(|line| {
+        let trimmed = line.trim_start();
+        [">", "❯", "➜", "›"].iter().find_map(|marker| {
+            let rest = trimmed.strip_prefix(marker)?.trim_start();
+            if rest.starts_with("1.") {
+                Some(1)
+            } else if rest.starts_with("2.") {
+                Some(2)
+            } else {
+                None
+            }
+        })
+    });
+    if selected == Some(2) {
+        ""
+    } else {
+        "\x1b[B"
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3243,7 +3298,7 @@ fn _launch_started_at() -> chrono::DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AgentCommand, AgentDriver};
+    use crate::config::{AgentCommand, AgentDriver, CodexModelLimits};
     use chrono::Utc;
     use serde_json::json;
     use std::fs;
@@ -3307,6 +3362,7 @@ mod tests {
             restore_sessions: true,
             codex_provider_name: "custom".to_string(),
             codex_model_context_window: None,
+            codex_provider_model_limits: Default::default(),
             probe_expected_text: "WATCHAPI_OK".to_string(),
             probe_path: "/v1/responses".to_string(),
             polluted_response_keywords: vec![],
@@ -3456,7 +3512,7 @@ mod tests {
             .expect("AgentProcess::start block should be discoverable");
 
         let apply_pos = start_block
-            .find("apply_codex_endpoint_with_model_context_window(")
+            .find("apply_codex_endpoint_with_model_limits(")
             .expect("Codex startup must write isolated config before launching");
         let override_pos = start_block
             .find("codex_command_with_cli_overrides(")
@@ -6625,7 +6681,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_cli_overrides_include_model_context_window_when_configured() {
+    fn codex_cli_overrides_include_provider_model_limits_when_configured() {
         let tmp = tempfile::tempdir().unwrap();
         let workdir = tmp.path().join("project");
         fs::create_dir_all(&workdir).unwrap();
@@ -6645,7 +6701,14 @@ mod tests {
             codex_home,
         );
         cfg.codex_config_path = config_path;
-        cfg.codex_model_context_window = Some(128000);
+        cfg.codex_model_context_window = Some(65536);
+        cfg.codex_provider_model_limits.insert(
+            "primary".to_string(),
+            CodexModelLimits {
+                model_context_window: Some(128000),
+                model_auto_compact_token_limit: Some(112000),
+            },
+        );
         let endpoint = endpoint(workdir);
 
         let command = codex_command_with_cli_overrides(cfg.agent_command.clone(), &endpoint, &cfg);
@@ -6656,6 +6719,9 @@ mod tests {
         assert!(items
             .windows(2)
             .any(|pair| pair == ["-c", "model_context_window=128000"]));
+        assert!(items
+            .windows(2)
+            .any(|pair| pair == ["-c", "model_auto_compact_token_limit=112000"]));
     }
 
     #[test]
@@ -6980,6 +7046,15 @@ mod tests {
              1. No, exit\n\
              > 2. Yes, I accept";
         assert!(claude_terms_acceptance_prompt_visible(claude_terms));
+        assert_eq!(claude_terms_acceptance_prompt_navigation(claude_terms), "");
+        assert_eq!(
+            claude_terms_acceptance_prompt_navigation(
+                "Bypass permissions mode requires confirmation\n\
+                 > 1. No, exit\n\
+                   2. Yes, I accept"
+            ),
+            "\x1b[B"
+        );
         assert!(!generic_first_option_prompt_visible(claude_terms));
         assert!(generic_first_option_prompt_visible(
             "Choose an option:\n> 1. Continue with current settings\n  2. Quit\nPress enter to confirm"
@@ -7020,8 +7095,10 @@ mod tests {
     #[test]
     fn opencode_prompt_box_distinguishes_idle_prefilled_and_busy_states() {
         let idle = "OpenCode\n\
-            ┃  Ask anything... \"Fix a TODO in the codebase\"\n\
-            ┃  Build auto · claude-opus-5 New API Local\n\
+            ┃\n\
+            ┃  Ask anything... \"What is the tech stack of this project?\"\n\
+            ┃\n\
+            ┃  Build auto · gpt-5.6-terra WatchApi Runtime\n\
             ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n\
             tab agents  ctrl+p commands";
         let prefilled = "OpenCode\n\
@@ -7048,10 +7125,22 @@ mod tests {
         assert!(!opencode_prompt_footer_visible(
             "┃  Not an OpenCode prompt\n╹────────"
         ));
+
+        let alternate_idle = "│  Ask anything... \"Fix a TODO in the codebase\"\n\
+            └────────────────";
+        let alternate_prefilled = "│  Continue the current task\n\
+            └────────────────\n\
+            tab agents  ctrl+p commands";
+        assert!(opencode_idle_prompt_visible(alternate_idle));
+        assert_eq!(
+            opencode_current_prompt_input(alternate_prefilled).as_deref(),
+            Some("Continue the current task")
+        );
+        assert!(opencode_prefilled_input_visible(alternate_prefilled));
     }
 
     #[test]
-    fn opencode_auto_input_waits_for_mounted_empty_prompt_and_bracketed_paste() {
+    fn opencode_auto_input_uses_mounted_empty_prompt_without_bracketed_paste() {
         let tmp = tempfile::tempdir().unwrap();
         let workdir = tmp.path().join("project");
         fs::create_dir_all(&workdir).unwrap();
@@ -7072,10 +7161,6 @@ mod tests {
             tab agents  ctrl+p commands";
         agent.observed_terminal_view_text = idle.to_string();
 
-        assert!(!agent.startup_ready_for_prompt());
-        assert!(!agent.can_send_prompt());
-
-        agent.observed_terminal_bracketed_paste = true;
         assert!(agent.startup_ready_for_prompt());
         assert!(agent.current_terminal_view_ready());
         assert!(agent.can_send_prompt());
@@ -7109,7 +7194,6 @@ mod tests {
             endpoint(workdir),
             false,
         );
-        agent.observed_terminal_bracketed_paste = true;
         agent.observed_terminal_view_text = "┃  Continue the current task\n\
             ┃  Build auto · claude-opus-5 New API Local\n\
             ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀"

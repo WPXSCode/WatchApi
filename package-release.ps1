@@ -217,8 +217,8 @@ New-Item -ItemType Directory -Force -Path (Join-Path $StageDir "assets") | Out-N
 Copy-Item -LiteralPath (Join-Path $TargetDir "watchapi-gui.exe") -Destination (Join-Path $StageDir "watchapi-gui.exe") -Force
 Copy-Item -LiteralPath (Join-Path $TargetDir "watchapi-cli.exe") -Destination (Join-Path $StageDir "watchapi-cli.exe") -Force
 Copy-Item -LiteralPath (Join-Path $Root "README.md") -Destination (Join-Path $StageDir "README.md") -Force
-Copy-Item -LiteralPath (Join-Path $RepoRoot "assets\watchapi.ico") -Destination (Join-Path $StageDir "assets\watchapi.ico") -Force
-Copy-Item -LiteralPath (Join-Path $RepoRoot "assets\watchapi.png") -Destination (Join-Path $StageDir "assets\watchapi.png") -Force
+Copy-Item -LiteralPath (Join-Path $Root "watchapi-gui\assets\watchapi.ico") -Destination (Join-Path $StageDir "assets\watchapi.ico") -Force
+Copy-Item -LiteralPath (Join-Path $Root "watchapi-gui\assets\watchapi.png") -Destination (Join-Path $StageDir "assets\watchapi.png") -Force
 
 $PromptLibrary = Join-Path $StageDir "prompt-library.json"
 if (-not (Test-Path $PromptLibrary)) {

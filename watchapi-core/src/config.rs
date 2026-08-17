@@ -17,7 +17,7 @@ pub enum ConfigError {
     Parse(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AgentDriver {
     Codex,
     ClaudeCode,
@@ -63,6 +63,7 @@ pub struct AppConfig {
     pub restore_sessions: bool,
     pub codex_provider_name: String,
     pub codex_model_context_window: Option<usize>,
+    pub codex_provider_model_limits: HashMap<String, CodexModelLimits>,
     pub probe_expected_text: String,
     pub probe_path: String,
     pub polluted_response_keywords: Vec<String>,
@@ -150,15 +151,24 @@ pub struct EndpointProviderLibrary {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EndpointProviderConfig {
     pub name: String,
+    pub agent_driver: Option<AgentDriver>,
     pub base_url: String,
     pub api_key: String,
     pub model: String,
     pub probe_model: Option<String>,
     pub reasoning_effort: String,
     pub service_tier: Option<String>,
+    pub model_context_window: Option<usize>,
+    pub model_auto_compact_token_limit: Option<usize>,
     pub weight: i64,
     pub probe_url: Option<String>,
     pub guard_proxy: GuardProxyConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodexModelLimits {
+    pub model_context_window: Option<usize>,
+    pub model_auto_compact_token_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -303,12 +313,15 @@ struct RawEndpointProviderLibrary {
 #[derive(Debug, Deserialize)]
 struct RawEndpointProvider {
     name: Option<String>,
+    agent_driver: Option<String>,
     base_url: Option<String>,
     api_key: Option<String>,
     model: Option<String>,
     probe_model: Option<String>,
     reasoning_effort: Option<String>,
     service_tier: Option<String>,
+    model_context_window: Option<usize>,
+    model_auto_compact_token_limit: Option<usize>,
     weight: Option<i64>,
     probe_url: Option<String>,
     guard_proxy: Option<RawGuardProxy>,
@@ -405,19 +418,19 @@ impl AppConfig {
         let workdir = shared_workdir
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let command_value = raw.agent_command.or(raw.codex_command);
+        let driver = parse_agent_driver(raw.agent_driver.as_deref(), command_value.as_ref())?;
+        let agent_command = parse_agent_command(command_value, &driver)?;
         let initial_prompt = required_config_text(raw.initial_prompt, "initial_prompt")?;
         let auto_prompt = required_config_text(raw.auto_prompt, "auto_prompt")?;
-        let endpoints = resolve_endpoint_refs(
+        let (endpoints, codex_provider_model_limits) = resolve_endpoint_refs(
             raw_refs,
             provider_library,
+            &driver,
             workdir.clone(),
             initial_prompt,
             auto_prompt,
         )?;
-
-        let command_value = raw.agent_command.or(raw.codex_command);
-        let driver = parse_agent_driver(raw.agent_driver.as_deref(), command_value.as_ref())?;
-        let agent_command = parse_agent_command(command_value, &driver)?;
 
         let home = home_dir();
         let codex_home = optional_path(raw.codex_home).unwrap_or_else(|| home.join(".codex"));
@@ -515,6 +528,7 @@ impl AppConfig {
                 raw.codex_model_context_window,
                 "codex_model_context_window",
             )?,
+            codex_provider_model_limits,
             probe_expected_text: non_empty_or_default(raw.probe_expected_text, "WATCHAPI_OK"),
             probe_path: non_empty_or_default(raw.probe_path, "/v1/responses"),
             polluted_response_keywords: string_list(raw.polluted_response_keywords),
@@ -534,6 +548,20 @@ impl AppConfig {
                 raw.continuation_trigger_rules,
             )?,
         })
+    }
+}
+
+impl AppConfig {
+    pub fn effective_codex_model_limits(&self, endpoint_name: &str) -> CodexModelLimits {
+        let mut limits = self
+            .codex_provider_model_limits
+            .get(&endpoint_name.trim().to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_default();
+        if limits.model_context_window.is_none() {
+            limits.model_context_window = self.codex_model_context_window;
+        }
+        limits
     }
 }
 
@@ -594,9 +622,15 @@ fn load_provider_library(
     let mut names = HashSet::new();
     for raw in raw_providers {
         let provider = load_provider(raw)?;
-        if !names.insert(provider.name.to_ascii_lowercase()) {
+        let scope = provider
+            .agent_driver
+            .as_ref()
+            .map(agent_driver_scope_key)
+            .unwrap_or("shared");
+        let name_key = format!("{scope}:{}", provider.name.to_ascii_lowercase());
+        if !names.insert(name_key) {
             return Err(ConfigError::Validation(format!(
-                "duplicate provider name: {}",
+                "duplicate provider name in {scope}: {}",
                 provider.name
             )));
         }
@@ -669,6 +703,11 @@ fn parse_agent_goal(raw: Option<RawAgentGoal>) -> Result<AgentGoalConfig, Config
 
 fn load_provider(raw: RawEndpointProvider) -> Result<EndpointProviderConfig, ConfigError> {
     let name = required_text(raw.name, "name")?;
+    let agent_driver = raw
+        .agent_driver
+        .as_deref()
+        .map(|value| parse_agent_driver(Some(value), None))
+        .transpose()?;
     let base_url = required_text(raw.base_url, "base_url")?;
     let api_key = required_text(raw.api_key, "api_key")?;
     let model = required_text(raw.model, "model")?;
@@ -679,12 +718,21 @@ fn load_provider(raw: RawEndpointProvider) -> Result<EndpointProviderConfig, Con
 
     Ok(EndpointProviderConfig {
         name,
+        agent_driver,
         base_url,
         api_key,
         model,
         probe_model: raw.probe_model.and_then(trim_non_empty),
         reasoning_effort,
         service_tier: raw.service_tier.and_then(trim_non_empty),
+        model_context_window: optional_positive_usize(
+            raw.model_context_window,
+            "provider.model_context_window",
+        )?,
+        model_auto_compact_token_limit: optional_positive_usize(
+            raw.model_auto_compact_token_limit,
+            "provider.model_auto_compact_token_limit",
+        )?,
         weight,
         probe_url: raw.probe_url.and_then(trim_non_empty),
         guard_proxy: load_guard_proxy(raw.guard_proxy)?,
@@ -694,16 +742,32 @@ fn load_provider(raw: RawEndpointProvider) -> Result<EndpointProviderConfig, Con
 fn resolve_endpoint_refs(
     raw_refs: Vec<RawEndpointRef>,
     provider_library: EndpointProviderLibrary,
+    agent_driver: &AgentDriver,
     workdir: PathBuf,
     initial_prompt: String,
     auto_prompt: String,
-) -> Result<Vec<EndpointConfig>, ConfigError> {
-    let providers = provider_library
-        .providers
-        .into_iter()
-        .map(|provider| (provider.name.to_ascii_lowercase(), provider))
-        .collect::<HashMap<_, _>>();
+) -> Result<(Vec<EndpointConfig>, HashMap<String, CodexModelLimits>), ConfigError> {
+    let mut providers: HashMap<String, (u8, EndpointProviderConfig)> = HashMap::new();
+    for provider in provider_library.providers {
+        let priority = match provider.agent_driver.as_ref() {
+            Some(scope) if scope == agent_driver => 2,
+            Some(AgentDriver::Codex) if *agent_driver == AgentDriver::Generic => 1,
+            None => 0,
+            Some(_) => continue,
+        };
+        if provider.name.trim().is_empty() {
+            continue;
+        }
+        let key = provider.name.to_ascii_lowercase();
+        let replace = providers
+            .get(&key)
+            .is_none_or(|(existing_priority, _)| priority > *existing_priority);
+        if replace {
+            providers.insert(key, (priority, provider));
+        }
+    }
     let mut endpoints = Vec::with_capacity(raw_refs.len());
+    let mut codex_provider_model_limits = HashMap::new();
     let mut refs = HashSet::new();
     for raw_ref in raw_refs {
         let provider_name = required_config_text(raw_ref.provider, "endpoint_refs.provider")?;
@@ -713,13 +777,25 @@ fn resolve_endpoint_refs(
                 "duplicate endpoint_ref provider: {provider_name}"
             )));
         }
-        let provider = providers.get(&provider_key).ok_or_else(|| {
-            ConfigError::Validation(format!("unknown endpoint provider: {provider_name}"))
-        })?;
+        let provider = providers
+            .get(&provider_key)
+            .map(|(_, provider)| provider)
+            .ok_or_else(|| {
+                ConfigError::Validation(format!("unknown endpoint provider: {provider_name}"))
+            })?;
         let mut guard_proxy =
             apply_guard_proxy_override(provider.guard_proxy.clone(), raw_ref.guard_proxy)?;
         if let Some(enabled) = raw_ref.guard_proxy_enabled {
             guard_proxy.enabled = enabled;
+        }
+        if *agent_driver == AgentDriver::Codex {
+            codex_provider_model_limits.insert(
+                provider_key,
+                CodexModelLimits {
+                    model_context_window: provider.model_context_window,
+                    model_auto_compact_token_limit: provider.model_auto_compact_token_limit,
+                },
+            );
         }
         endpoints.push(EndpointConfig {
             name: provider.name.clone(),
@@ -738,7 +814,7 @@ fn resolve_endpoint_refs(
             guard_proxy,
         });
     }
-    Ok(endpoints)
+    Ok((endpoints, codex_provider_model_limits))
 }
 
 fn load_guard_proxy(raw: Option<RawGuardProxy>) -> Result<GuardProxyConfig, ConfigError> {
@@ -1092,6 +1168,15 @@ fn parse_agent_driver(
     }
 }
 
+fn agent_driver_scope_key(driver: &AgentDriver) -> &'static str {
+    match driver {
+        AgentDriver::Codex => "codex",
+        AgentDriver::ClaudeCode => "claude-code",
+        AgentDriver::OpenCode => "opencode",
+        AgentDriver::Generic => "generic",
+    }
+}
+
 fn parse_agent_command(
     value: Option<RawCommand>,
     driver: &AgentDriver,
@@ -1403,6 +1488,85 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_refs_resolve_same_provider_name_in_current_agent_scope() {
+        let mut value: serde_json::Value = serde_json::from_str(&sample_config()).unwrap();
+        value["providers"] = serde_json::json!([
+            {
+                "name": "high",
+                "agent_driver": "claude-code",
+                "base_url": "https://claude.example/v1",
+                "api_key": "claude-key",
+                "model": "claude-opus-4-1",
+                "reasoning_effort": "high",
+                "weight": 100
+            },
+            {
+                "name": "high",
+                "base_url": "https://shared.example/v1",
+                "api_key": "shared-key",
+                "model": "shared-model",
+                "reasoning_effort": "high",
+                "weight": 100
+            },
+            {
+                "name": "high",
+                "agent_driver": "codex",
+                "base_url": "https://codex.example/v1",
+                "api_key": "codex-key",
+                "model": "gpt-5.4",
+                "reasoning_effort": "high",
+                "weight": 100
+            }
+        ]);
+
+        let codex = AppConfig::from_json_str(&value.to_string()).unwrap();
+        assert_eq!(codex.endpoints[0].base_url, "https://codex.example/v1");
+        assert_eq!(codex.endpoints[0].api_key, "codex-key");
+
+        value["agent_driver"] = serde_json::json!("claude-code");
+        value["agent_command"] = serde_json::json!(["claude"]);
+        let claude = AppConfig::from_json_str(&value.to_string()).unwrap();
+        assert_eq!(claude.endpoints[0].base_url, "https://claude.example/v1");
+        assert_eq!(claude.endpoints[0].api_key, "claude-key");
+    }
+
+    #[test]
+    fn generic_provider_fallback_priority_is_order_independent() {
+        let shared = serde_json::json!({
+            "name": "high",
+            "base_url": "https://shared.example/v1",
+            "api_key": "shared-key",
+            "model": "shared-model",
+            "reasoning_effort": "high",
+            "weight": 100
+        });
+        let codex = serde_json::json!({
+            "name": "high",
+            "agent_driver": "codex",
+            "base_url": "https://codex.example/v1",
+            "api_key": "codex-key",
+            "model": "gpt-5.4",
+            "reasoning_effort": "high",
+            "weight": 100
+        });
+
+        for providers in [
+            vec![codex.clone(), shared.clone()],
+            vec![shared.clone(), codex.clone()],
+        ] {
+            let mut value: serde_json::Value = serde_json::from_str(&sample_config()).unwrap();
+            value["agent_driver"] = serde_json::json!("generic");
+            value["agent_command"] = serde_json::json!(["custom-agent"]);
+            value["providers"] = serde_json::Value::Array(providers);
+
+            let config = AppConfig::from_json_str(&value.to_string()).unwrap();
+
+            assert_eq!(config.endpoints[0].base_url, "https://codex.example/v1");
+            assert_eq!(config.endpoints[0].api_key, "codex-key");
+        }
+    }
+
+    #[test]
     fn endpoint_ref_guard_proxy_overrides_provider_guard_proxy() {
         let tmp = tempfile::tempdir().unwrap();
         let config_path = tmp.path().join("ModernUI.json");
@@ -1634,6 +1798,32 @@ mod tests {
         let config = AppConfig::from_json_str(&text).unwrap();
 
         assert_eq!(config.codex_model_context_window, Some(128000));
+    }
+
+    #[test]
+    fn provider_codex_model_limits_override_workspace_context_window() {
+        let mut value: serde_json::Value = serde_json::from_str(&sample_config()).unwrap();
+        value["codex_model_context_window"] = serde_json::json!(65536);
+        value["providers"][0]["model_context_window"] = serde_json::json!(128000);
+        value["providers"][0]["model_auto_compact_token_limit"] = serde_json::json!(112000);
+
+        let config = AppConfig::from_json_str(&value.to_string()).unwrap();
+        let limits = config.effective_codex_model_limits("high");
+
+        assert_eq!(limits.model_context_window, Some(128000));
+        assert_eq!(limits.model_auto_compact_token_limit, Some(112000));
+    }
+
+    #[test]
+    fn provider_codex_model_limits_fall_back_to_workspace_context_window() {
+        let mut value: serde_json::Value = serde_json::from_str(&sample_config()).unwrap();
+        value["codex_model_context_window"] = serde_json::json!(65536);
+
+        let config = AppConfig::from_json_str(&value.to_string()).unwrap();
+        let limits = config.effective_codex_model_limits("high");
+
+        assert_eq!(limits.model_context_window, Some(65536));
+        assert_eq!(limits.model_auto_compact_token_limit, None);
     }
 
     #[test]

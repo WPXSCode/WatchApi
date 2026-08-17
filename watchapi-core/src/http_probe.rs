@@ -749,6 +749,7 @@ mod tests {
             restore_sessions: true,
             codex_provider_name: "custom".to_string(),
             codex_model_context_window: None,
+            codex_provider_model_limits: Default::default(),
             probe_expected_text: "WATCHAPI_OK".to_string(),
             probe_path: "/v1/responses".to_string(),
             polluted_response_keywords: vec![],

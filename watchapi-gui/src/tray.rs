@@ -11,7 +11,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 const RESTORE_ID: &str = "watchapi_restore";
 const EXIT_ID: &str = "watchapi_exit";
-const EMBEDDED_ICON_PNG: &[u8] = include_bytes!("../../../assets/watchapi.png");
+const EMBEDDED_ICON_PNG: &[u8] = include_bytes!("../assets/watchapi.png");
 static INSTALL_HANDLERS_ONCE: Once = Once::new();
 static ACTION_QUEUE: Mutex<VecDeque<TrayAction>> = Mutex::new(VecDeque::new());
 #[cfg(windows)]

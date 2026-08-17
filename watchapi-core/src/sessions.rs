@@ -11,17 +11,19 @@ use serde_json::{json, Value};
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::process::{Child, Command, Stdio};
+use std::sync::{mpsc, Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
-const OPENCODE_MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(750);
+const OPENCODE_MONITOR_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const OPENCODE_CLI_TIMEOUT: Duration = Duration::from_secs(20);
 
 static SESSION_STORE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const SUMMARY_TAIL_READ_BYTES: u64 = 256 * 1024;
@@ -894,12 +896,25 @@ pub struct OpenCodeSessionMonitor {
     pub last_session_append_at: Option<Instant>,
     pub token_usage_total: TokenUsage,
     last_cli_poll_at: Option<Instant>,
+    pending_cli_query: Option<OpenCodeMonitorQuery>,
     polluted_response_keywords: Vec<String>,
     completion_pause_keywords: Vec<String>,
     continuation_trigger_rules: Vec<ContinuationTriggerRule>,
     polluted_response_threshold: f64,
     polluted_context_window: usize,
     polluted_check_max_chars: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenCodeMonitorQueryKind {
+    FindSession,
+    Export,
+}
+
+#[derive(Debug)]
+struct OpenCodeMonitorQuery {
+    kind: OpenCodeMonitorQueryKind,
+    result: mpsc::Receiver<Option<Value>>,
 }
 
 impl OpenCodeSessionMonitor {
@@ -960,6 +975,7 @@ impl OpenCodeSessionMonitor {
             last_session_append_at: None,
             token_usage_total: TokenUsage::default(),
             last_cli_poll_at: None,
+            pending_cli_query: None,
             polluted_response_keywords,
             completion_pause_keywords,
             continuation_trigger_rules,
@@ -992,20 +1008,65 @@ impl OpenCodeSessionMonitor {
     }
 
     pub fn poll(&mut self) {
+        // OpenCode starts a full Bun process and may scan a large SQLite database; keep this off
+        // the runtime thread so prompt delivery remains responsive.
+        if !self.consume_pending_cli_query() {
+            return;
+        }
         if !self.reserve_cli_poll_slot(Instant::now()) {
             return;
         }
-        if self.session_id.is_none() {
-            self.session_id = self.find_latest_session_id();
-        }
-        let Some(session_id) = self.session_id.clone() else {
-            return;
+        let (kind, args) = if let Some(session_id) = self.session_id.clone() {
+            (
+                OpenCodeMonitorQueryKind::Export,
+                vec!["export".to_string(), session_id, "--pure".to_string()],
+            )
+        } else {
+            (
+                OpenCodeMonitorQueryKind::FindSession,
+                vec![
+                    "session".to_string(),
+                    "list".to_string(),
+                    "--format".to_string(),
+                    "json".to_string(),
+                    "--max-count".to_string(),
+                    "50".to_string(),
+                    "--pure".to_string(),
+                ],
+            )
         };
-        let output = self.run_json(&["export", &session_id, "--pure"]);
+        self.pending_cli_query =
+            start_opencode_json_query(self.command.clone(), self.workdir.clone(), args, kind);
+    }
+
+    fn consume_pending_cli_query(&mut self) -> bool {
+        let Some(query) = self.pending_cli_query.as_ref() else {
+            return true;
+        };
+        let kind = query.kind;
+        let output = match query.result.try_recv() {
+            Ok(output) => output,
+            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.pending_cli_query = None;
         let Some(output) = output else {
-            return;
+            return true;
         };
-        self.observe_exported_value(&output);
+        match kind {
+            OpenCodeMonitorQueryKind::FindSession => {
+                if self.session_id.is_none() {
+                    self.session_id = new_opencode_session_id_since(
+                        &output,
+                        &self.workdir,
+                        self.launch_started_at,
+                        self.session_ids_before_launch.as_ref(),
+                    );
+                }
+            }
+            OpenCodeMonitorQueryKind::Export => self.observe_exported_value(&output),
+        }
+        true
     }
 
     fn observe_exported_value(&mut self, value: &Value) {
@@ -1084,24 +1145,6 @@ impl OpenCodeSessionMonitor {
             && !self.has_completed_assistant_message_since_wait_start()
     }
 
-    fn find_latest_session_id(&self) -> Option<String> {
-        let output = self.run_json(&[
-            "session",
-            "list",
-            "--format",
-            "json",
-            "--max-count",
-            "50",
-            "--pure",
-        ])?;
-        new_opencode_session_id_since(
-            &output,
-            &self.workdir,
-            self.launch_started_at,
-            self.session_ids_before_launch.as_ref(),
-        )
-    }
-
     fn reserve_cli_poll_slot(&mut self, now: Instant) -> bool {
         if self.last_cli_poll_at.is_some_and(|last| {
             now.saturating_duration_since(last) < OPENCODE_MONITOR_POLL_INTERVAL
@@ -1111,22 +1154,66 @@ impl OpenCodeSessionMonitor {
         self.last_cli_poll_at = Some(now);
         true
     }
+}
 
-    fn run_json(&self, args: &[&str]) -> Option<Value> {
-        run_opencode_json(&self.command, &self.workdir, args)
-    }
+fn start_opencode_json_query(
+    command: Vec<String>,
+    workdir: PathBuf,
+    args: Vec<String>,
+    kind: OpenCodeMonitorQueryKind,
+) -> Option<OpenCodeMonitorQuery> {
+    opencode_cli_executable(&command)?;
+    let (tx, result) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let _ = tx.send(run_opencode_json(&command, &workdir, &args));
+    });
+    Some(OpenCodeMonitorQuery { kind, result })
 }
 
 fn run_opencode_json(command_parts: &[String], workdir: &Path, args: &[&str]) -> Option<Value> {
     let executable = opencode_cli_executable(command_parts)?;
     let mut command = Command::new(executable);
-    command.args(args).current_dir(workdir);
+    command
+        .args(args)
+        .current_dir(workdir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
     hide_command_window(&mut command);
-    let output = command.output().ok()?;
-    if !output.status.success() {
+    let mut child = command.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let stdout_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).map(|_| output)
+    });
+    let deadline = Instant::now() + OPENCODE_CLI_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            Ok(None) | Err(_) => {
+                terminate_child_process_tree(&mut child);
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let output = stdout_reader.join().ok()?.ok()?;
+    if !status.success() {
         return None;
     }
-    serde_json::from_slice(&output.stdout).ok()
+    serde_json::from_slice(&output).ok()
+}
+
+fn terminate_child_process_tree(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        let mut taskkill = Command::new("taskkill");
+        taskkill.args(["/PID", &child.id().to_string(), "/T", "/F"]);
+        hide_command_window(&mut taskkill);
+        let _ = taskkill.status();
+    }
+    let _ = child.kill();
 }
 
 fn hide_command_window(command: &mut Command) {
@@ -4125,6 +4212,66 @@ mod tests {
         assert!(monitor.reserve_cli_poll_slot(now));
         assert!(!monitor.reserve_cli_poll_slot(now + OPENCODE_MONITOR_POLL_INTERVAL / 2));
         assert!(monitor.reserve_cli_poll_slot(now + OPENCODE_MONITOR_POLL_INTERVAL));
+    }
+
+    #[test]
+    fn opencode_monitor_poll_does_not_wait_for_pending_cli_query() {
+        let mut monitor = OpenCodeSessionMonitor::new(
+            vec!["opencode".to_string()],
+            PathBuf::from("D:/Works/SelfWorks/WatchApi"),
+            Utc::now(),
+            Some("opencode-session-1".to_string()),
+            vec![],
+            vec![],
+            0.35,
+            12,
+            300,
+        );
+        let (_sender, result) = mpsc::sync_channel(1);
+        monitor.pending_cli_query = Some(OpenCodeMonitorQuery {
+            kind: OpenCodeMonitorQueryKind::Export,
+            result,
+        });
+
+        let started = Instant::now();
+        monitor.poll();
+
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(monitor.pending_cli_query.is_some());
+    }
+
+    #[test]
+    fn opencode_monitor_consumes_completed_background_export_without_spawning_another_query() {
+        let mut monitor = OpenCodeSessionMonitor::new(
+            vec!["opencode".to_string()],
+            PathBuf::from("D:/Works/SelfWorks/WatchApi"),
+            Utc::now(),
+            Some("opencode-session-1".to_string()),
+            vec![],
+            vec!["任务完成".to_string()],
+            0.35,
+            12,
+            300,
+        );
+        let (sender, result) = mpsc::sync_channel(1);
+        monitor.last_cli_poll_at = Some(Instant::now());
+        monitor.pending_cli_query = Some(OpenCodeMonitorQuery {
+            kind: OpenCodeMonitorQueryKind::Export,
+            result,
+        });
+        sender
+            .send(Some(json!({
+                "messages": [{
+                    "info": {"role": "assistant", "id": "message-1", "finish": "stop"},
+                    "parts": [{"type": "text", "text": "任务完成。"}]
+                }]
+            })))
+            .unwrap();
+
+        monitor.poll();
+
+        assert!(monitor.completion_pause_detected);
+        assert!(monitor.pending_cli_query.is_none());
     }
 
     #[test]

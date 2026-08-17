@@ -168,11 +168,12 @@ pub fn apply_codex_endpoint(
     auth_path: &Path,
     provider_name: &str,
 ) -> Result<()> {
-    apply_codex_endpoint_with_model_context_window(
+    apply_codex_endpoint_with_model_limits(
         endpoint,
         config_path,
         auth_path,
         provider_name,
+        None,
         None,
     )
 }
@@ -183,6 +184,24 @@ pub fn apply_codex_endpoint_with_model_context_window(
     auth_path: &Path,
     provider_name: &str,
     model_context_window: Option<usize>,
+) -> Result<()> {
+    apply_codex_endpoint_with_model_limits(
+        endpoint,
+        config_path,
+        auth_path,
+        provider_name,
+        model_context_window,
+        None,
+    )
+}
+
+pub fn apply_codex_endpoint_with_model_limits(
+    endpoint: &EndpointConfig,
+    config_path: &Path,
+    auth_path: &Path,
+    provider_name: &str,
+    model_context_window: Option<usize>,
+    model_auto_compact_token_limit: Option<usize>,
 ) -> Result<()> {
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent)?;
@@ -210,6 +229,7 @@ pub fn apply_codex_endpoint_with_model_context_window(
             reasoning_effort: Some(&endpoint.reasoning_effort),
             service_tier: endpoint.service_tier.as_deref(),
             model_context_window,
+            model_auto_compact_token_limit,
             sandbox_mode: Some("danger-full-access"),
             approval_policy: Some("never"),
         },
@@ -271,6 +291,7 @@ pub struct CodexConfigValues<'a> {
     pub reasoning_effort: Option<&'a str>,
     pub service_tier: Option<&'a str>,
     pub model_context_window: Option<usize>,
+    pub model_auto_compact_token_limit: Option<usize>,
     pub sandbox_mode: Option<&'a str>,
     pub approval_policy: Option<&'a str>,
 }
@@ -292,6 +313,11 @@ pub fn set_codex_config_values(
         &mut lines,
         "model_context_window",
         values.model_context_window,
+    );
+    set_optional_top_level_usize_assignment(
+        &mut lines,
+        "model_auto_compact_token_limit",
+        values.model_auto_compact_token_limit,
     );
     if let Some(value) = values.sandbox_mode {
         set_top_level_assignment(&mut lines, "sandbox_mode", value);
@@ -1021,28 +1047,31 @@ mod tests {
     }
 
     #[test]
-    fn apply_codex_endpoint_can_write_and_clear_model_context_window() {
+    fn apply_codex_endpoint_can_write_and_clear_model_limits() {
         let tmp = tempfile::tempdir().unwrap();
         let config_path = tmp.path().join("config.toml");
         let auth_path = tmp.path().join("auth.json");
 
-        apply_codex_endpoint_with_model_context_window(
+        apply_codex_endpoint_with_model_limits(
             &endpoint(),
             &config_path,
             &auth_path,
             "custom",
             Some(128000),
+            Some(112000),
         )
         .unwrap();
 
         let config_text = fs::read_to_string(&config_path).unwrap();
         assert!(config_text.contains("model_context_window = 128000"));
+        assert!(config_text.contains("model_auto_compact_token_limit = 112000"));
 
-        apply_codex_endpoint_with_model_context_window(
+        apply_codex_endpoint_with_model_limits(
             &endpoint(),
             &config_path,
             &auth_path,
             "custom",
+            None,
             None,
         )
         .unwrap();
@@ -1050,6 +1079,8 @@ mod tests {
         let cleared = fs::read_to_string(&config_path).unwrap();
         assert!(!cleared.contains("model_context_window = 128000"));
         assert!(!cleared.contains("model_context_window = "));
+        assert!(!cleared.contains("model_auto_compact_token_limit = 112000"));
+        assert!(!cleared.contains("model_auto_compact_token_limit = "));
     }
 
     #[test]

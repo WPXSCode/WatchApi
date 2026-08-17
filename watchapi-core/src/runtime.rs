@@ -1881,7 +1881,8 @@ impl RuntimeCore {
             }
             return;
         };
-        if agent.send_prompt(&prompt).is_ok() {
+        let send_result = agent.send_prompt(&prompt);
+        if send_result.is_ok() {
             self.last_prompt_at = Some(Instant::now());
             if !is_goal_command {
                 self.last_auto_prompt_signature = Some((endpoint.name.clone(), prompt));
@@ -1914,14 +1915,22 @@ impl RuntimeCore {
             if is_manual {
                 self.manual_prompt_requeue_error = None;
             }
-        } else if is_manual {
-            self.requeue_manual_prompt(&prompt);
-        } else if restore_goal_prompt {
-            self.pending_goal_prompt = Some(prompt);
-        } else if restore_continuation_trigger_prompt {
-            self.pending_continuation_trigger_prompt = Some(prompt);
-        } else if restore_initial_prompt {
-            self.pending_initial_prompt = Some(prompt);
+        } else {
+            let error = send_result
+                .err()
+                .map(|err| format!("提示词发送失败：{err}"))
+                .unwrap_or_else(|| "提示词发送失败".to_string());
+            self.waiting_for_assistant_progress = false;
+            if is_manual {
+                self.requeue_manual_prompt(&prompt);
+            } else if restore_goal_prompt {
+                self.pending_goal_prompt = Some(prompt);
+            } else if restore_continuation_trigger_prompt {
+                self.pending_continuation_trigger_prompt = Some(prompt);
+            } else if restore_initial_prompt {
+                self.pending_initial_prompt = Some(prompt);
+            }
+            self.state = RuntimeState::Error(error);
         }
         self.publish_snapshot_event();
     }
@@ -3528,6 +3537,7 @@ mod tests {
             restore_sessions: true,
             codex_provider_name: "custom".to_string(),
             codex_model_context_window: None,
+            codex_provider_model_limits: Default::default(),
             probe_expected_text: "WATCHAPI_OK".to_string(),
             probe_path: "/v1/responses".to_string(),
             polluted_response_keywords: vec![],
@@ -6001,6 +6011,21 @@ mod tests {
             block.contains("} else if restore_initial_prompt {\n                self.pending_initial_prompt = Some(prompt);"),
             "发送被最终闸门拒绝时，只能恢复真实 pending initial prompt，不能把普通 auto prompt 塞回首轮提示词"
         );
+    }
+
+    #[test]
+    fn failed_auto_prompt_send_is_visible_and_releases_wait_gate() {
+        let source = include_str!("runtime.rs");
+        let block = source
+            .split("fn maybe_drive_prompt")
+            .nth(1)
+            .and_then(|tail| tail.split("fn record_agent_usage").next())
+            .expect("maybe_drive_prompt block should be discoverable");
+
+        assert!(block.contains("let send_result = agent.send_prompt(&prompt);"));
+        assert!(block.contains("提示词发送失败"));
+        assert!(block.contains("self.waiting_for_assistant_progress = false;"));
+        assert!(block.contains("self.state = RuntimeState::Error(error);"));
     }
 
     #[test]

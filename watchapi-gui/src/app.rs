@@ -99,6 +99,7 @@ pub struct WatchApiApp {
     editor_tab: EditorTab,
     selected_endpoint: usize,
     selected_provider: usize,
+    provider_agent_driver: watchapi_core::AgentDriver,
     prompt_library_open: bool,
     prompt_library: Vec<PromptLibraryItem>,
     prompt_library_name: String,
@@ -1243,7 +1244,7 @@ impl WatchApiApp {
             workspace_editor_id: None,
             workspace_editor_json: workspace_default_config_data(),
             workspace_editor_agent_launch: GuiAgentLaunchSettings::default(),
-            provider_json: load_global_provider_json(),
+            provider_json: normalize_provider_library_data(&load_global_provider_json()),
             add_endpoint_dialog_open: false,
             add_endpoint_dialog_page: 0,
             endpoint_editor_dialog_open: false,
@@ -1252,6 +1253,7 @@ impl WatchApiApp {
             editor_tab: EditorTab::Global,
             selected_endpoint: 0,
             selected_provider: 0,
+            provider_agent_driver: watchapi_core::AgentDriver::Codex,
             prompt_library_open: false,
             prompt_library: load_prompt_library(),
             prompt_library_name: String::new(),
@@ -1736,7 +1738,7 @@ impl WatchApiApp {
                 ui.label(RichText::new("供应商库").color(accent()).strong());
             });
             ui.label(
-                RichText::new("公共供应商在这里维护；当前配置通过接口状态表引用这些供应商。")
+                RichText::new("供应商按 Agent 独立维护；当前配置只会解析所属 Agent 的供应商。")
                     .small()
                     .color(muted()),
             );
@@ -3579,7 +3581,7 @@ impl WatchApiApp {
                 self.logged_output_len = 0;
                 self.terminal_diag = "PTY 终端待启动".to_string();
                 self.editor_json = load_json_or_default(Path::new(&self.config_path));
-                self.provider_json = load_global_provider_json();
+                self.provider_json = normalize_provider_library_data(&load_global_provider_json());
                 let (event_tx, event_rx) = std::sync::mpsc::channel();
                 let mut runtime = RuntimeCore::new(config.clone());
                 runtime.set_event_wakeup(self.runtime_event_wakeup.clone());
@@ -3608,8 +3610,11 @@ impl WatchApiApp {
         if path.as_os_str().is_empty() || !path.exists() {
             return;
         }
-        let provider_json = load_global_provider_json_with_config_fallback(&path);
-        if let Err(err) = save_provider_json_for_config(&path, &provider_json) {
+        let provider_json =
+            normalize_provider_library_data(&load_global_provider_json_with_config_fallback(&path));
+        let save_result = save_global_provider_json(&provider_json)
+            .and_then(|()| save_provider_json_for_config(&path, &provider_json));
+        if let Err(err) = save_result {
             self.status = format!("初始化供应商库失败：{err}");
         }
     }
@@ -3624,6 +3629,7 @@ impl WatchApiApp {
         if !migrate_legacy_endpoints_to_provider_refs(&mut editor_json, &mut provider_json) {
             return;
         }
+        provider_json = normalize_provider_library_data(&provider_json);
         if validate_config_json(&editor_json).is_err()
             || validate_provider_json(&provider_json).is_err()
         {
@@ -3650,9 +3656,11 @@ impl WatchApiApp {
         if path.as_os_str().is_empty() || !path.exists() {
             return;
         }
-        let provider_json = load_global_provider_json_with_config_fallback(&path);
-        let valid_providers = provider_name_set(&provider_json);
         let mut editor_json = load_json_or_default(&path);
+        let provider_json =
+            normalize_provider_library_data(&load_global_provider_json_with_config_fallback(&path));
+        let agent_driver = editor_agent_driver(&editor_json);
+        let valid_providers = provider_name_set_for_agent(&provider_json, &agent_driver);
         if !prune_endpoint_refs_not_in_set(&mut editor_json, &valid_providers) {
             return;
         }
@@ -3970,20 +3978,37 @@ impl WatchApiApp {
     }
 
     fn render_endpoint_editor(&mut self, ui: &mut egui::Ui) {
-        const LIST_W: f32 = 240.0;
+        const AGENT_LIST_W: f32 = 142.0;
+        const PROVIDER_LIST_W: f32 = 224.0;
         const LABEL_W: f32 = 110.0;
 
         let editor_height = ui.available_height().max(240.0);
         let total_width = ui.available_width();
         let spacing = ui.spacing().item_spacing.x;
-        let list_w = (total_width * 0.26).clamp(184.0, LIST_W);
-        let detail_w = (total_width - list_w - spacing).max(260.0);
+        let agent_list_w = (total_width * 0.14).clamp(120.0, AGENT_LIST_W);
+        let provider_list_w = (total_width * 0.22).clamp(180.0, PROVIDER_LIST_W);
+        let detail_w = (total_width - agent_list_w - provider_list_w - spacing * 2.0).max(260.0);
         ui.allocate_ui_with_layout(
             vec2(total_width, editor_height),
             egui::Layout::left_to_right(egui::Align::Min),
             |ui| {
                 ui.allocate_ui_with_layout(
-                    vec2(list_w, editor_height),
+                    vec2(agent_list_w, editor_height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        list_frame().show(ui, |ui| {
+                            ui.set_min_height(editor_height - 24.0);
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new("Agent").strong());
+                                ui.add_space(6.0);
+                                self.render_provider_agent_selector_list(ui, 80.0);
+                            });
+                        });
+                    },
+                );
+                ui.add_space(spacing);
+                ui.allocate_ui_with_layout(
+                    vec2(provider_list_w, editor_height),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         list_frame().show(ui, |ui| {
@@ -3996,8 +4021,7 @@ impl WatchApiApp {
                                         vec2(provider_header_w, CIRCULAR_ADD_BUTTON_SIZE),
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
-                                            if circular_add_button(ui, "新增供应商").clicked()
-                                            {
+                                            if circular_add_button(ui, "新增供应商").clicked() {
                                                 self.add_blank_provider_to_library();
                                             }
                                         },
@@ -4074,6 +4098,18 @@ impl WatchApiApp {
                                         self.render_provider_connection_block(ui, LABEL_W);
                                         self.render_provider_field_row(ui, "probe_url", LABEL_W);
                                     });
+                                    if self.provider_agent_driver
+                                        == watchapi_core::AgentDriver::Codex
+                                    {
+                                        editor_section_frame(ui, "Codex 上下文", |ui| {
+                                            for key in [
+                                                "model_context_window",
+                                                "model_auto_compact_token_limit",
+                                            ] {
+                                                self.render_provider_field_row(ui, key, LABEL_W);
+                                            }
+                                        });
+                                    }
                                     editor_section_frame(ui, "本地保护层默认值", |ui| {
                                         self.render_provider_guard_proxy_block(ui);
                                     });
@@ -4105,6 +4141,28 @@ impl WatchApiApp {
                         .clicked()
                     {
                         self.selected_endpoint = index;
+                    }
+                }
+            });
+    }
+
+    fn render_provider_agent_selector_list(&mut self, ui: &mut egui::Ui, min_height: f32) {
+        let options = provider_agent_driver_options();
+        egui::ScrollArea::vertical()
+            .max_height((ui.available_height() - 4.0).max(min_height))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let row_w = ui.available_width().max(96.0);
+                for driver in options {
+                    let selected = self.provider_agent_driver == driver;
+                    let label = provider_agent_driver_label(&driver);
+                    if ui
+                        .add_sized([row_w, 30.0], egui::Button::new(label).selected(selected))
+                        .on_hover_text(format!("管理 {label} 专属供应商"))
+                        .clicked()
+                    {
+                        self.provider_agent_driver = driver;
+                        self.selected_provider = 0;
                     }
                 }
             });
@@ -4376,6 +4434,7 @@ impl WatchApiApp {
                 if value != self.string_field(key) {
                     self.editor_json[key] = json!(value.clone());
                     self.apply_agent_defaults_for_driver(&value);
+                    self.sync_editor_provider_scope_to_agent();
                 }
             }
             "prompt_submit_sequence" => {
@@ -4768,7 +4827,7 @@ impl WatchApiApp {
                     label_w,
                     &label,
                     &mut value,
-                    MODEL_OPTIONS,
+                    provider_model_options(&self.provider_agent_driver),
                     ("provider_model_preset", self.selected_provider),
                     "可直接输入任意模型 ID",
                 );
@@ -4788,8 +4847,12 @@ impl WatchApiApp {
                     label_w,
                     &label,
                     &mut value,
-                    REASONING_EFFORT_OPTIONS,
-                    ("provider_reasoning_preset", self.selected_provider),
+                    provider_reasoning_effort_options(&self.provider_agent_driver),
+                    (
+                        "provider_reasoning_preset",
+                        provider_agent_driver_key(&self.provider_agent_driver),
+                        self.selected_provider,
+                    ),
                     "可直接输入任意思考等级",
                 );
                 if value != current_value {
@@ -4830,6 +4893,27 @@ impl WatchApiApp {
                         "供应商库已同步",
                         |provider| {
                             provider[key] = json!(value);
+                        },
+                    );
+                }
+            }
+            "model_context_window" | "model_auto_compact_token_limit" => {
+                let mut value = current_value.clone();
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [label_w, 24.0],
+                        egui::Label::new(RichText::new(label).strong()),
+                    );
+                    ui.add_sized(
+                        [ui.available_width(), 28.0],
+                        centered_singleline(&mut value).hint_text("留空使用默认值"),
+                    );
+                });
+                if value != current_value {
+                    self.commit_selected_provider_library_update(
+                        "供应商库已同步",
+                        |provider| {
+                            set_optional_object_scalar(provider, key, &value);
                         },
                     );
                 }
@@ -5192,9 +5276,11 @@ impl WatchApiApp {
                 .color(md_error()),
         );
         let mut next_provider_json = self.provider_json.clone();
-        let Some(provider) =
-            Self::selected_provider_value_mut_in(&mut next_provider_json, self.selected_provider)
-        else {
+        let Some(provider) = Self::selected_provider_value_mut_in(
+            &mut next_provider_json,
+            self.selected_provider,
+            &self.provider_agent_driver,
+        ) else {
             return;
         };
         if !provider.get("guard_proxy").is_some_and(Value::is_object) {
@@ -5933,7 +6019,7 @@ impl WatchApiApp {
         }
         let mut close = false;
         let refs = self.provider_refs();
-        let providers = self.provider_names();
+        let providers = self.current_config_provider_names();
         ctx.show_viewport_immediate(
             ViewportId::from_hash_of(ADD_ENDPOINT_VIEWPORT),
             child_viewport_builder("添加公共供应商接口", [460.0, 420.0], [360.0, 260.0]),
@@ -9339,6 +9425,15 @@ impl WatchApiApp {
         let name = value_to_string(provider.get("name")).if_empty("临时供应商");
         provider["name"] = json!(name.clone());
         let mut data = default_config_data();
+        let agent_driver = provider_agent_driver_from_value(&provider)
+            .unwrap_or_else(|| editor_agent_driver(&self.editor_json));
+        let agent_driver_key = provider_agent_driver_key(&agent_driver);
+        data["agent_driver"] = json!(agent_driver_key);
+        if let Some(command) = default_agent_command_for_driver(agent_driver_key) {
+            data["agent_command"] = json!(command);
+        } else if let Some(command) = self.editor_json.get("agent_command") {
+            data["agent_command"] = command.clone();
+        }
         for key in [
             "request_timeout_seconds",
             "probe_expected_text",
@@ -9898,7 +9993,9 @@ impl WatchApiApp {
             let path = PathBuf::from(self.config_path.trim());
             self.editor_config_path = Some(path.clone());
             self.editor_json = load_json_or_default(&path);
-            self.provider_json = load_global_provider_json_with_config_fallback(&path);
+            self.provider_json = normalize_provider_library_data(
+                &load_global_provider_json_with_config_fallback(&path),
+            );
         } else {
             let Some(_workspace_dir) = self.current_workspace_host_dir() else {
                 self.status = "请先打开工作区文件夹".to_string();
@@ -9906,12 +10003,9 @@ impl WatchApiApp {
             };
             self.editor_config_path = None;
             self.editor_json = default_config_data();
-            self.provider_json = load_global_provider_json();
-            align_default_endpoint_refs_to_provider_library(
-                &mut self.editor_json,
-                &self.provider_json,
-            );
+            self.provider_json = normalize_provider_library_data(&load_global_provider_json());
         }
+        self.sync_editor_provider_scope_to_agent();
         self.editor_tab = EditorTab::Global;
         self.selected_endpoint = 0;
         self.editor_open = true;
@@ -9979,15 +10073,23 @@ impl WatchApiApp {
             &mut self.editor_json,
             &workspace_defaults_with_fallbacks(&workspace.config_defaults),
         );
+        self.sync_editor_provider_scope_to_agent();
         self.status = format!("已继承工作区配置：{count} 项，保存配置后生效");
     }
 
     fn open_provider_page_from_current(&mut self) {
-        self.provider_json = self
+        let provider_json = self
             .config_path_path()
             .as_deref()
             .map(load_global_provider_json_with_config_fallback)
             .unwrap_or_else(load_global_provider_json);
+        self.provider_json = normalize_provider_library_data(&provider_json);
+        let config_driver = self
+            .config
+            .as_ref()
+            .map(|config| config.agent_driver.clone())
+            .unwrap_or(watchapi_core::AgentDriver::Codex);
+        self.provider_agent_driver = provider_library_agent_driver_for_config(&config_driver);
         self.selected_provider = 0;
         self.main_page = MainPage::Provider;
     }
@@ -10266,16 +10368,12 @@ impl WatchApiApp {
             .and_then(|items| items.get(self.selected_endpoint))
             .and_then(|item| item.get("provider"))
             .and_then(Value::as_str)?;
+        let agent_driver = editor_agent_driver(&self.editor_json);
+        let index = provider_index_for_name(&self.provider_json, &agent_driver, provider)?;
         self.provider_json
             .get("providers")
             .and_then(Value::as_array)
-            .and_then(|items| {
-                items.iter().find(|item| {
-                    item.get("name")
-                        .and_then(Value::as_str)
-                        .is_some_and(|name| name == provider)
-                })
-            })
+            .and_then(|items| items.get(index))
     }
 
     fn selected_endpoint_value_mut(&mut self) -> Option<&mut Value> {
@@ -10287,16 +10385,12 @@ impl WatchApiApp {
             .and_then(|item| item.get("provider"))
             .and_then(Value::as_str)?
             .to_string();
+        let agent_driver = editor_agent_driver(&self.editor_json);
+        let index = provider_index_for_name(&self.provider_json, &agent_driver, &provider)?;
         self.provider_json
             .get_mut("providers")
             .and_then(Value::as_array_mut)
-            .and_then(|items| {
-                items.iter_mut().find(|item| {
-                    item.get("name")
-                        .and_then(Value::as_str)
-                        .is_some_and(|name| name == provider)
-                })
-            })
+            .and_then(|items| items.get_mut(index))
     }
 
     fn endpoint_ref_value_mut_by_name(&mut self, endpoint_name: &str) -> Option<&mut Value> {
@@ -10313,16 +10407,20 @@ impl WatchApiApp {
     }
 
     fn provider_guard_proxy_json(&self, endpoint_name: &str) -> Value {
+        let agent_driver = self
+            .config
+            .as_ref()
+            .map(|config| config.agent_driver.clone())
+            .unwrap_or_else(|| editor_agent_driver(&self.editor_json));
+        let Some(index) =
+            provider_index_for_name(&self.provider_json, &agent_driver, endpoint_name)
+        else {
+            return default_guard_proxy_json();
+        };
         self.provider_json
             .get("providers")
             .and_then(Value::as_array)
-            .and_then(|items| {
-                items.iter().find(|item| {
-                    item.get("name")
-                        .and_then(Value::as_str)
-                        .is_some_and(|name| name == endpoint_name)
-                })
-            })
+            .and_then(|items| items.get(index))
             .and_then(|item| item.get("guard_proxy"))
             .filter(|value| value.is_object())
             .cloned()
@@ -10330,27 +10428,37 @@ impl WatchApiApp {
     }
 
     fn selected_provider_value(&self) -> Option<&Value> {
+        let index = provider_indices_for_agent(&self.provider_json, &self.provider_agent_driver)
+            .get(self.selected_provider)
+            .copied()?;
         self.provider_json
             .get("providers")
             .and_then(Value::as_array)
-            .and_then(|items| items.get(self.selected_provider))
+            .and_then(|items| items.get(index))
     }
 
     fn selected_provider_value_mut(&mut self) -> Option<&mut Value> {
+        let index = provider_indices_for_agent(&self.provider_json, &self.provider_agent_driver)
+            .get(self.selected_provider)
+            .copied()?;
         self.provider_json
             .get_mut("providers")
             .and_then(Value::as_array_mut)
-            .and_then(|items| items.get_mut(self.selected_provider))
+            .and_then(|items| items.get_mut(index))
     }
 
-    fn selected_provider_value_mut_in(
-        provider_json: &mut Value,
+    fn selected_provider_value_mut_in<'a>(
+        provider_json: &'a mut Value,
         selected_provider: usize,
-    ) -> Option<&mut Value> {
+        agent_driver: &watchapi_core::AgentDriver,
+    ) -> Option<&'a mut Value> {
+        let index = provider_indices_for_agent(provider_json, agent_driver)
+            .get(selected_provider)
+            .copied()?;
         provider_json
             .get_mut("providers")
             .and_then(Value::as_array_mut)
-            .and_then(|items| items.get_mut(selected_provider))
+            .and_then(|items| items.get_mut(index))
     }
 
     fn commit_selected_provider_library_update(
@@ -10359,9 +10467,11 @@ impl WatchApiApp {
         update: impl FnOnce(&mut Value),
     ) -> bool {
         let mut next_provider_json = self.provider_json.clone();
-        let Some(provider) =
-            Self::selected_provider_value_mut_in(&mut next_provider_json, self.selected_provider)
-        else {
+        let Some(provider) = Self::selected_provider_value_mut_in(
+            &mut next_provider_json,
+            self.selected_provider,
+            &self.provider_agent_driver,
+        ) else {
             return false;
         };
         update(provider);
@@ -10369,15 +10479,16 @@ impl WatchApiApp {
     }
 
     fn provider_names(&self) -> Vec<String> {
-        self.provider_json
-            .get("providers")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|item| item.get("name").and_then(Value::as_str))
-            .filter(|name| !name.trim().is_empty())
-            .map(str::to_string)
-            .collect()
+        provider_names_for_agent(&self.provider_json, &self.provider_agent_driver)
+    }
+
+    fn current_config_provider_names(&self) -> Vec<String> {
+        let driver = self
+            .config
+            .as_ref()
+            .map(|config| config.agent_driver.clone())
+            .unwrap_or_else(|| editor_agent_driver(&self.editor_json));
+        provider_names_for_agent(&self.provider_json, &driver)
     }
 
     fn provider_refs(&self) -> HashSet<String> {
@@ -10421,7 +10532,7 @@ impl WatchApiApp {
     fn add_all_missing_endpoint_refs(&mut self) {
         let refs = self.provider_refs();
         let missing = self
-            .provider_names()
+            .current_config_provider_names()
             .into_iter()
             .filter(|name| !refs.contains(&name.to_ascii_lowercase()))
             .collect::<Vec<_>>();
@@ -10462,7 +10573,10 @@ impl WatchApiApp {
         let mut paths = self.registry.paths.clone();
         let current_path = self.config_path_path();
         let provider_key = provider_name.to_ascii_lowercase();
-        if provider_name_set(&self.provider_json).contains(&provider_key) {
+        let provider_agent_driver = self.provider_agent_driver.clone();
+        if provider_name_set_for_agent(&self.provider_json, &provider_agent_driver)
+            .contains(&provider_key)
+        {
             if let Err(err) = save_global_provider_json(&self.provider_json) {
                 record_provider_ref_update_failure(
                     &mut result,
@@ -10486,6 +10600,10 @@ impl WatchApiApp {
 
         for path in paths {
             if !path.exists() {
+                continue;
+            }
+            let config_driver = load_agent_driver_for_path(&path);
+            if !provider_agent_applies_to_config(&provider_agent_driver, &config_driver) {
                 continue;
             }
             let mut editor_json = load_json_or_default(&path);
@@ -10610,6 +10728,7 @@ impl WatchApiApp {
         };
         let mut provider = blank_provider();
         provider["name"] = json!(name.clone());
+        provider["agent_driver"] = json!(provider_agent_driver_key(&self.provider_agent_driver));
         let mut next_provider_json = self.provider_json.clone();
         if !next_provider_json
             .get("providers")
@@ -10620,12 +10739,10 @@ impl WatchApiApp {
         if let Some(providers) = next_provider_json["providers"].as_array_mut() {
             providers.push(provider);
         }
-        let next_selected_provider = next_provider_json
-            .get("providers")
-            .and_then(Value::as_array)
-            .map(Vec::len)
-            .unwrap_or(0)
-            .saturating_sub(1);
+        let next_selected_provider =
+            provider_names_for_agent(&next_provider_json, &self.provider_agent_driver)
+                .len()
+                .saturating_sub(1);
         if let Err(err) = self.persist_provider_library_value(&next_provider_json) {
             self.status = format!("新增供应商失败，保存供应商库失败：{err}");
             return name;
@@ -10636,22 +10753,24 @@ impl WatchApiApp {
     }
 
     fn remove_selected_provider_from_library(&mut self) {
-        let Some(providers) = self
-            .provider_json
-            .get("providers")
-            .and_then(Value::as_array)
+        let Some(index) =
+            provider_indices_for_agent(&self.provider_json, &self.provider_agent_driver)
+                .get(self.selected_provider)
+                .copied()
         else {
             return;
         };
-        if providers.is_empty() {
-            return;
-        }
-        let index = self.selected_provider.min(providers.len() - 1);
-        let name = providers[index]
-            .get("name")
+        let Some(name) = self
+            .provider_json
+            .get("providers")
+            .and_then(Value::as_array)
+            .and_then(|providers| providers.get(index))
+            .and_then(|provider| provider.get("name"))
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+            .map(str::to_string)
+        else {
+            return;
+        };
         if name.trim().is_empty() {
             return;
         }
@@ -10662,7 +10781,11 @@ impl WatchApiApp {
         {
             providers.remove(index);
         }
-        let next_selected_provider = self.selected_provider.saturating_sub(1);
+        let next_selected_provider = self.selected_provider.saturating_sub(1).min(
+            provider_names_for_agent(&next_provider_json, &self.provider_agent_driver)
+                .len()
+                .saturating_sub(1),
+        );
         if let Err(err) = self.persist_provider_library_value(&next_provider_json) {
             self.status = format!("删除供应商失败，保存供应商库失败：{err}");
             return;
@@ -10686,7 +10809,17 @@ impl WatchApiApp {
         paths.dedup();
 
         let mut removed = 0;
+        let provider_key = provider_name.trim().to_ascii_lowercase();
         for path in paths {
+            let config_driver = load_agent_driver_for_path(&path);
+            if !provider_agent_applies_to_config(&self.provider_agent_driver, &config_driver) {
+                continue;
+            }
+            if provider_name_set_for_agent(&self.provider_json, &config_driver)
+                .contains(&provider_key)
+            {
+                continue;
+            }
             let mut editor_json = load_json_or_default(&path);
             let count = prune_endpoint_refs_by_name(&mut editor_json, provider_name);
             if count == 0 {
@@ -10931,11 +11064,13 @@ impl WatchApiApp {
         provider_json: &Value,
     ) -> Result<AppConfig, String> {
         let mut data = self.editor_json.clone();
-        data["providers"] = provider_json
+        let agent_driver = editor_agent_driver(&data);
+        let scoped_provider_json = provider_json_for_agent(provider_json, &agent_driver);
+        data["providers"] = scoped_provider_json
             .get("providers")
             .cloned()
             .unwrap_or_else(|| json!([]));
-        let valid_providers = provider_name_set(provider_json);
+        let valid_providers = provider_name_set_for_agent(provider_json, &agent_driver);
         prune_endpoint_refs_not_in_set(&mut data, &valid_providers);
         let text = serde_json::to_string(&data).map_err(|err| err.to_string())?;
         let mut config = AppConfig::from_json_str(&text).map_err(|err| err.to_string())?;
@@ -12551,8 +12686,8 @@ impl WatchApiApp {
                 &workspace_defaults_with_fallbacks(&workspace.config_defaults),
             );
         }
-        self.provider_json = load_global_provider_json();
-        align_default_endpoint_refs_to_provider_library(&mut self.editor_json, &self.provider_json);
+        self.provider_json = normalize_provider_library_data(&load_global_provider_json());
+        self.sync_editor_provider_scope_to_agent();
         self.editor_tab = EditorTab::Global;
         self.selected_endpoint = 0;
         self.editor_config_path = None;
@@ -13235,6 +13370,15 @@ impl WatchApiApp {
                 self.editor_json["agent_home"] = json!(home);
             }
         }
+    }
+
+    fn sync_editor_provider_scope_to_agent(&mut self) {
+        let agent_driver = editor_agent_driver(&self.editor_json);
+        self.provider_agent_driver = provider_library_agent_driver_for_config(&agent_driver);
+        align_endpoint_refs_to_provider_agent(&mut self.editor_json, &self.provider_json);
+        self.selected_endpoint = self
+            .selected_endpoint
+            .min(self.endpoint_names().len().saturating_sub(1));
     }
 
     fn save_current_auto_prompt(&mut self) {
@@ -20155,7 +20299,7 @@ const GLOBAL_AGENT_FIELDS: &[GlobalFieldSpec] = &[
 const GLOBAL_CODEX_FIELDS: &[GlobalFieldSpec] = &[GlobalFieldSpec {
     key: "codex_model_context_window",
     label: "上下文长度",
-    hint: "写入 Codex 的 model_context_window，并作为 OpenCode 自定义模型上下文；留空时使用 Agent 默认值。",
+    hint: "工作区级 Codex 回退值：仅当当前 Codex 供应商的最大上下文留空时使用；再留空则使用 Agent 默认值。",
 }];
 
 const GLOBAL_PROBE_FIELDS: &[GlobalFieldSpec] = &[
@@ -20235,8 +20379,44 @@ const WORKSPACE_DEFAULT_EXTRA_KEYS: &[&str] = &[
 
 const AGENT_DRIVER_OPTIONS: &[&str] = &["codex", "claude-code", "opencode", "generic"];
 const REASONING_EFFORT_OPTIONS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+const CODEX_REASONING_EFFORT_OPTIONS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+const CLAUDE_REASONING_EFFORT_OPTIONS: &[&str] = &["minimal", "low", "medium", "high", "max"];
+const OPENCODE_REASONING_EFFORT_OPTIONS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
 const SERVICE_TIER_OPTIONS: &[&str] = &["", "auto", "default", "flex", "priority", "fast"];
 const PROMPT_SUBMIT_SEQUENCE_OPTIONS: &[&str] = &["control-m", "cr", "crlf", "lf"];
+const CODEX_MODEL_OPTIONS: &[&str] = &[
+    "gpt-5.6",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.4-nano",
+    "gpt-5.3-codex",
+    "gpt-5.2",
+];
+const CLAUDE_MODEL_OPTIONS: &[&str] = &[
+    "claude-opus-4-6",
+    "claude-opus-4-5",
+    "claude-opus-4-1",
+    "claude-opus-4",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5",
+    "claude-sonnet-4",
+    "claude-haiku-4-5",
+];
+const OPENCODE_MODEL_OPTIONS: &[&str] = &[
+    "gpt-5.6",
+    "gpt-5.5",
+    "gpt-5.4",
+    "claude-opus-4-6",
+    "claude-sonnet-4-5",
+    "gemini-3-pro",
+    "gemini-3-flash",
+    "deepseek-v3.2",
+    "qwen3-coder-plus",
+];
 const MODEL_OPTIONS: &[&str] = &[
     "gpt-5.6",
     "gpt-5.6-sol",
@@ -20734,6 +20914,261 @@ fn workspace_default_keys() -> Vec<&'static str> {
     keys
 }
 
+fn provider_agent_driver_options() -> [watchapi_core::AgentDriver; 3] {
+    [
+        watchapi_core::AgentDriver::Codex,
+        watchapi_core::AgentDriver::ClaudeCode,
+        watchapi_core::AgentDriver::OpenCode,
+    ]
+}
+
+fn provider_model_options(driver: &watchapi_core::AgentDriver) -> &'static [&'static str] {
+    match driver {
+        watchapi_core::AgentDriver::Codex => CODEX_MODEL_OPTIONS,
+        watchapi_core::AgentDriver::ClaudeCode => CLAUDE_MODEL_OPTIONS,
+        watchapi_core::AgentDriver::OpenCode => OPENCODE_MODEL_OPTIONS,
+        watchapi_core::AgentDriver::Generic => MODEL_OPTIONS,
+    }
+}
+
+fn provider_reasoning_effort_options(
+    driver: &watchapi_core::AgentDriver,
+) -> &'static [&'static str] {
+    match driver {
+        watchapi_core::AgentDriver::Codex => CODEX_REASONING_EFFORT_OPTIONS,
+        watchapi_core::AgentDriver::ClaudeCode => CLAUDE_REASONING_EFFORT_OPTIONS,
+        watchapi_core::AgentDriver::OpenCode => OPENCODE_REASONING_EFFORT_OPTIONS,
+        watchapi_core::AgentDriver::Generic => REASONING_EFFORT_OPTIONS,
+    }
+}
+
+fn provider_agent_driver_key(driver: &watchapi_core::AgentDriver) -> &'static str {
+    match driver {
+        watchapi_core::AgentDriver::Codex => "codex",
+        watchapi_core::AgentDriver::ClaudeCode => "claude-code",
+        watchapi_core::AgentDriver::OpenCode => "opencode",
+        watchapi_core::AgentDriver::Generic => "generic",
+    }
+}
+
+fn provider_agent_driver_label(driver: &watchapi_core::AgentDriver) -> &'static str {
+    agent_driver_label(driver)
+}
+
+fn provider_library_agent_driver_for_config(
+    driver: &watchapi_core::AgentDriver,
+) -> watchapi_core::AgentDriver {
+    match driver {
+        watchapi_core::AgentDriver::Generic => watchapi_core::AgentDriver::Codex,
+        driver => driver.clone(),
+    }
+}
+
+fn editor_agent_driver(editor_json: &Value) -> watchapi_core::AgentDriver {
+    agent_driver_from_config_json(editor_json).unwrap_or(watchapi_core::AgentDriver::Codex)
+}
+
+fn provider_agent_driver_from_value(provider: &Value) -> Option<watchapi_core::AgentDriver> {
+    let value = provider.get("agent_driver").and_then(Value::as_str)?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "codex" => Some(watchapi_core::AgentDriver::Codex),
+        "claude" | "claude-code" | "claudecode" | "claude_code" => {
+            Some(watchapi_core::AgentDriver::ClaudeCode)
+        }
+        "opencode" | "open-code" | "open_code" => Some(watchapi_core::AgentDriver::OpenCode),
+        "generic" | "generic-cli" | "custom" | "custom-cli" => {
+            Some(watchapi_core::AgentDriver::Generic)
+        }
+        _ => None,
+    }
+}
+
+fn provider_scope_is_explicit(provider: &Value) -> bool {
+    provider
+        .get("agent_driver")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn provider_match_priority(
+    provider: &Value,
+    agent_driver: &watchapi_core::AgentDriver,
+) -> Option<u8> {
+    if !provider_scope_is_explicit(provider) {
+        return Some(0);
+    }
+    match provider_agent_driver_from_value(provider) {
+        Some(scope) if scope == *agent_driver => Some(2),
+        Some(watchapi_core::AgentDriver::Codex)
+            if *agent_driver == watchapi_core::AgentDriver::Generic =>
+        {
+            Some(1)
+        }
+        _ => None,
+    }
+}
+
+fn provider_identity_key(provider: &Value) -> String {
+    let scope = provider_agent_driver_from_value(provider)
+        .as_ref()
+        .map(provider_agent_driver_key)
+        .map(str::to_string)
+        .or_else(|| {
+            provider
+                .get("agent_driver")
+                .and_then(Value::as_str)
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "shared".to_string());
+    let name = value_to_string(provider.get("name"))
+        .trim()
+        .to_ascii_lowercase();
+    format!("{scope}\u{0}{name}")
+}
+
+fn provider_indices_for_agent(
+    provider_json: &Value,
+    agent_driver: &watchapi_core::AgentDriver,
+) -> Vec<usize> {
+    let Some(providers) = provider_json.get("providers").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut selected = HashMap::<String, (u8, usize)>::new();
+    for (index, provider) in providers.iter().enumerate() {
+        let Some(name) = provider.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = name.trim();
+        let Some(priority) = provider_match_priority(provider, agent_driver) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let key = name.to_ascii_lowercase();
+        let replace = selected
+            .get(&key)
+            .is_none_or(|(existing_priority, _)| priority > *existing_priority);
+        if replace {
+            selected.insert(key, (priority, index));
+        }
+    }
+
+    providers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, provider)| {
+            let name = provider.get("name").and_then(Value::as_str)?.trim();
+            let (_, selected_index) = selected.get(&name.to_ascii_lowercase())?;
+            (*selected_index == index).then_some(index)
+        })
+        .collect()
+}
+
+fn provider_index_for_name(
+    provider_json: &Value,
+    agent_driver: &watchapi_core::AgentDriver,
+    provider_name: &str,
+) -> Option<usize> {
+    let wanted = provider_name.trim();
+    provider_indices_for_agent(provider_json, agent_driver)
+        .into_iter()
+        .find(|index| {
+            provider_json
+                .get("providers")
+                .and_then(Value::as_array)
+                .and_then(|providers| providers.get(*index))
+                .and_then(|provider| provider.get("name"))
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.eq_ignore_ascii_case(wanted))
+        })
+}
+
+fn provider_names_for_agent(
+    provider_json: &Value,
+    agent_driver: &watchapi_core::AgentDriver,
+) -> Vec<String> {
+    provider_indices_for_agent(provider_json, agent_driver)
+        .into_iter()
+        .filter_map(|index| {
+            provider_json
+                .get("providers")
+                .and_then(Value::as_array)
+                .and_then(|providers| providers.get(index))
+                .and_then(|provider| provider.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn provider_name_set_for_agent(
+    provider_json: &Value,
+    agent_driver: &watchapi_core::AgentDriver,
+) -> HashSet<String> {
+    provider_names_for_agent(provider_json, agent_driver)
+        .into_iter()
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+fn provider_json_for_agent(
+    provider_json: &Value,
+    agent_driver: &watchapi_core::AgentDriver,
+) -> Value {
+    let providers = provider_indices_for_agent(provider_json, agent_driver)
+        .into_iter()
+        .filter_map(|index| {
+            provider_json
+                .get("providers")
+                .and_then(Value::as_array)
+                .and_then(|items| items.get(index))
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+    json!({"providers": providers})
+}
+
+fn provider_agent_applies_to_config(
+    provider_agent: &watchapi_core::AgentDriver,
+    config_agent: &watchapi_core::AgentDriver,
+) -> bool {
+    provider_agent == config_agent
+        || (*provider_agent == watchapi_core::AgentDriver::Codex
+            && *config_agent == watchapi_core::AgentDriver::Generic)
+}
+
+fn normalize_provider_library_data(value: &Value) -> Value {
+    let mut normalized = json!({"providers": []});
+    let Some(source) = value.get("providers").and_then(Value::as_array) else {
+        return normalized;
+    };
+
+    for provider in source {
+        if provider_scope_is_explicit(provider) {
+            continue;
+        }
+        for driver in provider_agent_driver_options() {
+            let mut scoped = provider.clone();
+            scoped["agent_driver"] = json!(provider_agent_driver_key(&driver));
+            upsert_provider_json(&mut normalized, scoped);
+        }
+    }
+    for provider in source {
+        if !provider_scope_is_explicit(provider) {
+            continue;
+        }
+        let mut scoped = provider.clone();
+        if let Some(driver) = provider_agent_driver_from_value(provider) {
+            scoped["agent_driver"] = json!(provider_agent_driver_key(&driver));
+        }
+        upsert_provider_json(&mut normalized, scoped);
+    }
+    normalized
+}
+
 fn default_provider_library_data() -> Value {
     json!({
         "providers": [blank_provider()]
@@ -20749,6 +21184,8 @@ fn blank_provider() -> Value {
         "probe_model": "",
         "reasoning_effort": "high",
         "service_tier": "fast",
+        "model_context_window": null,
+        "model_auto_compact_token_limit": null,
         "weight": 100,
         "guard_proxy": default_guard_proxy_json()
     })
@@ -21066,18 +21503,17 @@ fn migrate_legacy_endpoints_to_provider_refs(
 }
 
 fn upsert_provider_json(provider_json: &mut Value, provider: Value) {
-    let name = value_to_string(provider.get("name"));
+    let identity = provider_identity_key(&provider);
     let Some(providers) = provider_json
         .get_mut("providers")
         .and_then(Value::as_array_mut)
     else {
         return;
     };
-    if let Some(existing) = providers.iter_mut().find(|item| {
-        item.get("name")
-            .and_then(Value::as_str)
-            .is_some_and(|item_name| item_name.eq_ignore_ascii_case(&name))
-    }) {
+    if let Some(existing) = providers
+        .iter_mut()
+        .find(|item| provider_identity_key(item) == identity)
+    {
         *existing = provider;
     } else {
         providers.push(provider);
@@ -21163,7 +21599,8 @@ fn save_global_provider_json(value: &Value) -> Result<(), String> {
 
 fn merge_provider_json_for_config(config_path: &Path, source: &Value) -> Result<(), String> {
     validate_provider_json(source)?;
-    let mut target = load_provider_json_for_config(config_path);
+    let source = normalize_provider_library_data(source);
+    let mut target = normalize_provider_library_data(&load_provider_json_for_config(config_path));
     if !target.get("providers").is_some_and(Value::is_array) {
         target["providers"] = json!([]);
     }
@@ -21180,7 +21617,10 @@ fn merge_provider_json_for_config(config_path: &Path, source: &Value) -> Result<
 
 fn merge_global_provider_json_for_config(config_path: &Path, source: &Value) -> Result<(), String> {
     validate_provider_json(source)?;
-    let mut target = load_global_provider_json_with_config_fallback(config_path);
+    let source = normalize_provider_library_data(source);
+    let mut target = normalize_provider_library_data(
+        &load_global_provider_json_with_config_fallback(config_path),
+    );
     if !target.get("providers").is_some_and(Value::is_array) {
         target["providers"] = json!([]);
     }
@@ -21194,18 +21634,6 @@ fn merge_global_provider_json_for_config(config_path: &Path, source: &Value) -> 
     }
     save_global_provider_json(&target)?;
     save_provider_json_for_config(config_path, &target)
-}
-
-fn provider_name_set(provider_json: &Value) -> HashSet<String> {
-    provider_json
-        .get("providers")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|provider| provider.get("name").and_then(Value::as_str))
-        .map(|name| name.trim().to_ascii_lowercase())
-        .filter(|name| !name.is_empty())
-        .collect()
 }
 
 fn record_provider_ref_update_failure(result: &mut ProviderRefUpdateResult, error: String) {
@@ -21289,20 +21717,32 @@ fn prune_endpoint_refs_not_in_set(
     items.len() != before
 }
 
+fn align_endpoint_refs_to_provider_agent(editor_json: &mut Value, provider_json: &Value) {
+    let agent_driver = editor_agent_driver(editor_json);
+    let valid_providers = provider_name_set_for_agent(provider_json, &agent_driver);
+    prune_endpoint_refs_not_in_set(editor_json, &valid_providers);
+    align_default_endpoint_refs_to_provider_library(editor_json, provider_json);
+}
+
 fn align_default_endpoint_refs_to_provider_library(editor_json: &mut Value, provider_json: &Value) {
+    let agent_driver = editor_agent_driver(editor_json);
+    let provider_indices = provider_indices_for_agent(provider_json, &agent_driver);
     let Some(first_provider) = provider_json
         .get("providers")
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|provider| provider.get("name").and_then(Value::as_str))
+        .and_then(|providers| {
+            provider_indices
+                .first()
+                .and_then(|index| providers.get(*index))
+        })
+        .and_then(|provider| provider.get("name").and_then(Value::as_str))
         .map(str::trim)
-        .find(|name| !name.is_empty())
+        .filter(|name| !name.is_empty())
         .map(str::to_string)
     else {
         return;
     };
-    let valid_providers = provider_name_set(provider_json);
+    let valid_providers = provider_name_set_for_agent(provider_json, &agent_driver);
     let has_valid_ref = editor_json
         .get("endpoint_refs")
         .and_then(Value::as_array)
@@ -21458,6 +21898,14 @@ fn set_optional_json_scalar(root: &mut Value, key: &str, text: &str) {
 
 fn set_object_scalar(object: &mut Value, key: &str, text: &str) {
     object[key] = parse_scalar(text);
+}
+
+fn set_optional_object_scalar(object: &mut Value, key: &str, text: &str) {
+    if text.trim().is_empty() {
+        object[key] = Value::Null;
+    } else {
+        object[key] = parse_scalar(text);
+    }
 }
 
 fn set_guard_scalar(map: &mut serde_json::Map<String, Value>, key: &str, text: &str) {
@@ -22230,6 +22678,8 @@ fn endpoint_field_label(key: &str) -> String {
         "probe_model" => "探测模型".to_string(),
         "reasoning_effort" => "思考等级".to_string(),
         "service_tier" => "服务档位".to_string(),
+        "model_context_window" => "最大上下文".to_string(),
+        "model_auto_compact_token_limit" => "自动压缩阈值".to_string(),
         "weight" => "权重".to_string(),
         "probe_url" => "探测 URL".to_string(),
         _ => key.to_string(),
@@ -22405,6 +22855,12 @@ fn endpoint_field_hint(key: &str) -> &'static str {
             "模型思考等级，可直接输入自定义值；会原样写入 Agent 启动参数，不支持时由上游忽略或报错。"
         }
         "service_tier" => "Codex/OpenAI 服务档位；fast 会写入 service_tier，留空会清除旧档位。",
+        "model_context_window" => {
+            "Codex 的 model_context_window。填写上游模型实际支持的最大 token 数；留空时回退到配置级“上下文长度”，再使用 Codex 默认值。"
+        }
+        "model_auto_compact_token_limit" => {
+            "Codex 的 model_auto_compact_token_limit。达到此 token 数时自动压缩上下文；留空使用 Codex 默认策略，通常应小于最大上下文。"
+        }
         "weight" => "权重越高优先级越高；正常策略只探测比当前更高权重的接口。",
         "probe_url" => "单独指定探测地址；留空时使用 URL + 公共探测路径。",
         "enabled" => "关闭后该接口组不参与启动、探测和切换。",
@@ -22778,6 +23234,30 @@ fn validate_provider_json(value: &Value) -> Result<(), String> {
         .and_then(Value::as_array)
         .ok_or_else(|| "供应商库 providers 必须是数组".to_string())?;
     for provider in providers {
+        if let Some(agent_driver) = provider.get("agent_driver") {
+            let value = agent_driver
+                .as_str()
+                .ok_or_else(|| "供应商 agent_driver 必须是字符串".to_string())?
+                .trim()
+                .to_ascii_lowercase();
+            if !matches!(
+                value.as_str(),
+                "codex"
+                    | "claude"
+                    | "claude-code"
+                    | "claudecode"
+                    | "claude_code"
+                    | "opencode"
+                    | "open-code"
+                    | "open_code"
+                    | "generic"
+                    | "generic-cli"
+                    | "custom"
+                    | "custom-cli"
+            ) {
+                return Err(format!("供应商 agent_driver 无效：{value}"));
+            }
+        }
         for key in ["name", "base_url", "api_key", "model", "reasoning_effort"] {
             if provider
                 .get(key)
@@ -22791,6 +23271,14 @@ fn validate_provider_json(value: &Value) -> Result<(), String> {
         }
         if provider.get("weight").and_then(Value::as_i64).is_none() {
             return Err("供应商 weight 必须是整数".to_string());
+        }
+        for key in ["model_context_window", "model_auto_compact_token_limit"] {
+            let Some(value) = provider.get(key) else {
+                continue;
+            };
+            if !value.is_null() && value.as_u64().is_none() {
+                return Err(format!("供应商 {key} 必须是非负整数或留空"));
+            }
         }
     }
     Ok(())
@@ -31645,6 +32133,38 @@ mod tests {
     }
 
     #[test]
+    fn provider_model_and_reasoning_presets_follow_agent_scope() {
+        assert!(provider_model_options(&watchapi_core::AgentDriver::Codex).contains(&"gpt-5.6"));
+        assert!(
+            provider_model_options(&watchapi_core::AgentDriver::ClaudeCode)
+                .contains(&"claude-opus-4-6")
+        );
+        assert!(
+            provider_model_options(&watchapi_core::AgentDriver::OpenCode).contains(&"gemini-3-pro")
+        );
+        assert!(
+            provider_reasoning_effort_options(&watchapi_core::AgentDriver::Codex)
+                .contains(&"ultra")
+        );
+        assert!(
+            provider_reasoning_effort_options(&watchapi_core::AgentDriver::ClaudeCode)
+                .contains(&"max")
+        );
+        assert!(
+            provider_reasoning_effort_options(&watchapi_core::AgentDriver::OpenCode)
+                .contains(&"xhigh")
+        );
+
+        let mut providers = default_provider_library_data();
+        providers["providers"][0]["model_context_window"] = Value::Null;
+        providers["providers"][0]["model_auto_compact_token_limit"] = Value::Null;
+        assert!(validate_provider_json(&providers).is_ok());
+        providers["providers"][0]["model_context_window"] = json!(128000);
+        providers["providers"][0]["model_auto_compact_token_limit"] = json!(112000);
+        assert!(validate_provider_json(&providers).is_ok());
+    }
+
+    #[test]
     fn red_parameter_hints_are_left_aligned() {
         let source = include_str!("app.rs");
         let helper_block = source
@@ -32260,6 +32780,7 @@ mod tests {
     fn connection_test_config_preserves_provider_probe_model() {
         let app = WatchApiApp::new(None);
         let mut provider = provider_named("probe");
+        provider["agent_driver"] = json!("claude-code");
         provider["probe_model"] = json!("gpt-4.1-mini");
 
         let (endpoint, config) = app
@@ -32267,6 +32788,7 @@ mod tests {
             .expect("temporary connection test config should parse");
 
         assert_eq!(endpoint.name, "probe");
+        assert_eq!(config.agent_driver, watchapi_core::AgentDriver::ClaudeCode);
         assert_eq!(endpoint.probe_model.as_deref(), Some("gpt-4.1-mini"));
         assert_eq!(
             config
@@ -32377,14 +32899,17 @@ mod tests {
         let config_path = temp.path().join("target.json");
         let mut existing = blank_provider();
         existing["name"] = json!("existing");
+        existing["agent_driver"] = json!("codex");
         existing["base_url"] = json!("https://existing.example/v1");
         save_provider_json_for_config(&config_path, &json!({"providers": [existing]})).unwrap();
 
         let mut updated_existing = blank_provider();
         updated_existing["name"] = json!("existing");
+        updated_existing["agent_driver"] = json!("codex");
         updated_existing["base_url"] = json!("https://updated.example/v1");
         let mut source = blank_provider();
         source["name"] = json!("source");
+        source["agent_driver"] = json!("codex");
         source["base_url"] = json!("https://source.example/v1");
 
         merge_provider_json_for_config(
@@ -32405,6 +32930,128 @@ mod tests {
             provider["name"] == json!("source")
                 && provider["base_url"] == json!("https://source.example/v1")
         }));
+    }
+
+    #[test]
+    fn legacy_shared_provider_is_normalized_for_each_supported_agent() {
+        let mut legacy = provider_named("legacy");
+        legacy.as_object_mut().unwrap().remove("agent_driver");
+
+        let normalized = normalize_provider_library_data(&json!({"providers": [legacy]}));
+        let providers = normalized["providers"].as_array().unwrap();
+        let scopes = providers
+            .iter()
+            .filter_map(|provider| provider.get("agent_driver").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(scopes, vec!["codex", "claude-code", "opencode"]);
+        for driver in provider_agent_driver_options() {
+            assert_eq!(
+                provider_names_for_agent(&normalized, &driver),
+                vec!["legacy"]
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_provider_wins_over_legacy_shared_provider_in_any_order() {
+        let mut shared = provider_named("same-name");
+        shared["base_url"] = json!("https://shared.example/v1");
+        let mut codex = provider_named("same-name");
+        codex["agent_driver"] = json!("codex");
+        codex["base_url"] = json!("https://codex.example/v1");
+
+        for providers in [
+            vec![codex.clone(), shared.clone()],
+            vec![shared.clone(), codex.clone()],
+        ] {
+            let normalized = normalize_provider_library_data(&json!({"providers": providers}));
+            let codex_index = provider_index_for_name(
+                &normalized,
+                &watchapi_core::AgentDriver::Codex,
+                "same-name",
+            )
+            .unwrap();
+            let claude_index = provider_index_for_name(
+                &normalized,
+                &watchapi_core::AgentDriver::ClaudeCode,
+                "same-name",
+            )
+            .unwrap();
+            let normalized_providers = normalized["providers"].as_array().unwrap();
+
+            assert_eq!(
+                normalized_providers[codex_index]["base_url"],
+                json!("https://codex.example/v1")
+            );
+            assert_eq!(
+                normalized_providers[claude_index]["base_url"],
+                json!("https://shared.example/v1")
+            );
+        }
+    }
+
+    #[test]
+    fn merge_keeps_same_provider_name_separate_across_agents() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("target.json");
+        let mut codex = provider_named("same-name");
+        codex["agent_driver"] = json!("codex");
+        codex["base_url"] = json!("https://codex.example/v1");
+        save_provider_json_for_config(&config_path, &json!({"providers": [codex]})).unwrap();
+
+        let mut claude = provider_named("same-name");
+        claude["agent_driver"] = json!("claude");
+        claude["base_url"] = json!("https://claude.example/v1");
+        merge_provider_json_for_config(&config_path, &json!({"providers": [claude]})).unwrap();
+
+        let merged = load_provider_json_for_config(&config_path);
+        let codex_index =
+            provider_index_for_name(&merged, &watchapi_core::AgentDriver::Codex, "SAME-NAME")
+                .unwrap();
+        let claude_index = provider_index_for_name(
+            &merged,
+            &watchapi_core::AgentDriver::ClaudeCode,
+            "same-name",
+        )
+        .unwrap();
+        let providers = merged["providers"].as_array().unwrap();
+
+        assert_eq!(providers.len(), 2);
+        assert_ne!(codex_index, claude_index);
+        assert_eq!(
+            providers[codex_index]["base_url"],
+            json!("https://codex.example/v1")
+        );
+        assert_eq!(
+            providers[claude_index]["base_url"],
+            json!("https://claude.example/v1")
+        );
+        assert_eq!(
+            providers[claude_index]["agent_driver"],
+            json!("claude-code")
+        );
+    }
+
+    #[test]
+    fn switching_editor_agent_realigns_endpoint_refs() {
+        let mut codex = provider_named("codex-only");
+        codex["agent_driver"] = json!("codex");
+        let mut claude = provider_named("claude-only");
+        claude["agent_driver"] = json!("claude-code");
+        let mut app = WatchApiApp::new(None);
+        app.provider_json = json!({"providers": [codex, claude]});
+        app.editor_json = default_config_data();
+        app.editor_json["endpoint_refs"] = json!([{"provider": "codex-only"}]);
+        app.editor_json["agent_driver"] = json!("claude-code");
+
+        app.sync_editor_provider_scope_to_agent();
+
+        assert_eq!(
+            app.provider_agent_driver,
+            watchapi_core::AgentDriver::ClaudeCode
+        );
+        assert_eq!(endpoint_ref_names(&app.editor_json), vec!["claude-only"]);
     }
 
     #[test]
@@ -33342,8 +33989,9 @@ mod tests {
             .and_then(|tail| tail.split("fn render_session_binding_tab").next())
             .expect("provider selector block should be discoverable");
 
-        assert!(provider_editor.contains("const LIST_W: f32 = 240.0;"));
-        assert!(provider_editor.contains("clamp(184.0, LIST_W)"));
+        assert!(provider_editor.contains("const AGENT_LIST_W: f32 = 142.0;"));
+        assert!(provider_editor.contains("const PROVIDER_LIST_W: f32 = 224.0;"));
+        assert!(provider_editor.contains("clamp(180.0, PROVIDER_LIST_W)"));
         assert!(provider_list.contains("ui.horizontal_centered(|ui|"));
         assert!(provider_list.contains("layout_no_wrap("));
         assert!(provider_list.contains("name.to_string()"));

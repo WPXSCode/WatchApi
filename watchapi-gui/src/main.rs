@@ -21,6 +21,8 @@ mod litellm_proxy;
 mod remote_bridge;
 mod tray;
 
+const EMBEDDED_ICON_PNG: &[u8] = include_bytes!("../assets/watchapi.png");
+
 #[cfg(windows)]
 static MAIN_WINDOW_HANDLE: AtomicIsize = AtomicIsize::new(0);
 
@@ -168,9 +170,9 @@ fn load_first_existing_font(paths: &[&str]) -> Option<Vec<u8>> {
 fn load_window_icon() -> Option<Arc<egui::IconData>> {
     let icon_path = app_root().join("assets").join("watchapi.png");
     let image = image::ImageReader::open(icon_path)
-        .ok()?
-        .decode()
-        .ok()?
+        .ok()
+        .and_then(|reader| reader.decode().ok())
+        .or_else(|| image::load_from_memory(EMBEDDED_ICON_PNG).ok())?
         .into_rgba8();
     let (width, height) = image.dimensions();
     Some(Arc::new(egui::IconData {

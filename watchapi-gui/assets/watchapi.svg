@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">WatchApi Agent Monitor</title>
+  <desc id="desc">A minimal command prompt with an online monitoring indicator.</desc>
+
+  <rect x="64" y="64" width="896" height="896" rx="224" fill="#12161C"/>
+  <rect x="76" y="76" width="872" height="872" rx="212" fill="none" stroke="#2A313B" stroke-width="24"/>
+
+  <path
+    d="M278 350L434 512L278 674"
+    fill="none"
+    stroke="#F4F7FA"
+    stroke-width="76"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <path
+    d="M492 674H662"
+    fill="none"
+    stroke="#F4F7FA"
+    stroke-width="76"
+    stroke-linecap="round"
+  />
+
+  <circle cx="742" cy="350" r="82" fill="#12161C"/>
+  <circle cx="742" cy="350" r="58" fill="#42D985"/>
+</svg>
